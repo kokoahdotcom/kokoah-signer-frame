@@ -126,13 +126,6 @@ export class MarketData {
     });
   }
 
-  /** Drops every cached value (e.g. after the network or key changed). */
-  clear(): void {
-    this.dexCache.clear();
-    this.leverageCache.clear();
-    this.perpDexsCache = undefined;
-  }
-
   private async perpDexs(): Promise<ReadonlyArray<PerpDexLike>> {
     const now = this.opts.now();
     if (this.perpDexsCache && now - this.perpDexsCache.at < this.opts.dexListTtlMs) return await this.perpDexsCache.value;

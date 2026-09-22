@@ -172,20 +172,3 @@ export class WebAuthnPasskeyProvider implements PasskeyProvider {
     return { prfFirst: first };
   }
 }
-
-/** Provider for environments without WebAuthn. */
-export class UnavailablePasskeyProvider implements PasskeyProvider {
-  private readonly reason: string;
-  constructor(reason = "WebAuthn is not available") {
-    this.reason = reason;
-  }
-  async support(): Promise<PasskeySupport> {
-    return { available: false, prf: "unknown", reason: this.reason };
-  }
-  async create(): Promise<PasskeyCreateResult> {
-    throw new PasskeyError("unsupported", this.reason);
-  }
-  async get(): Promise<{ prfFirst: Uint8Array }> {
-    throw new PasskeyError("unsupported", this.reason);
-  }
-}
