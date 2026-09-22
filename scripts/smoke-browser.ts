@@ -8,7 +8,8 @@
  * - HTML sinks, eval and fetches to other hosts are blocked inside the frame;
  * - `frame-ancestors` stops an unlisted origin from embedding the frame;
  * - the parent ↔ frame protocol across two real origins (cross-site iframe), IndexedDB persistence of the device key
- *   (non-extractable CryptoKey) across a reload, Web Locks;
+ *   (non-extractable CryptoKey) across a reload, Web Locks, and the client's re-handshake (`reconnected`) when only the
+ *   iframe reloads;
  * - the signer's real `public/_headers` Permissions-Policy (served unchanged) allows WebAuthn: the full passkey flow
  *   with a **virtual authenticator that supports PRF**: create → sign → lock → unlock (passkey assertion) → sign; after
  *   a reload the key is locked;
@@ -161,7 +162,7 @@ async function main(): Promise<number> {
       "/": ["text/html; charset=utf-8", '<!doctype html><html><head><meta charset="utf-8"><title>smoke parent</title><script type="module" src="/parent.js"></script></head><body><div id="slot"></div></body></html>'],
       "/parent.js": [
         "text/javascript",
-        'import { KokoahSignerClient } from "/client/index.js";\nconst frameUrl = new URL(location.href).searchParams.get("frame");\nwindow.signer = new KokoahSignerClient({ frameUrl, container: document.getElementById("slot"), helloTimeoutMs: 20000 });\nwindow.smokeReady = true;\n',
+        'import { KokoahSignerClient } from "/client/index.js";\nconst frameUrl = new URL(location.href).searchParams.get("frame");\nwindow.signer = new KokoahSignerClient({ frameUrl, container: document.getElementById("slot"), helloTimeoutMs: 20000 });\nwindow.reconnects = [];\nwindow.signer.on("reconnected", (h) => window.reconnects.push(h));\nwindow.smokeReady = true;\n',
       ],
       "/evil": ["text/html; charset=utf-8", "<!doctype html><html><body><iframe id=f></iframe><script type=module src=/evil.js></script></body></html>"],
     };
@@ -409,6 +410,17 @@ async function main(): Promise<number> {
     check("device key survives a reload (IndexedDB) and stays unlocked", afterReload.hasKey && afterReload.keyState === "active" && !afterReload.locked && afterReload.agentAddress === createdA.agentAddress, afterReload);
     const signed2 = await evaluate<{ status: string }>(`signer.signAndSubmit({ requestId: crypto.randomUUID(), intent: ${intent()} })`);
     check("signing after reload", signed2.status === "ok" && mock.state.exchangeCount === 2, signed2);
+    // Reload only the iframe: the client re-handshakes on the new ready and emits reconnected (never on the first ready).
+    const before = await evaluate<number>("window.reconnects.length");
+    await evaluate("signer.iframe.src = signer.iframe.src; true");
+    await waitUntil("window.reconnects.length === 1");
+    const reconnected = await evaluate<{ status: { agentAddress: string; keyState: string } }>("window.reconnects[0]");
+    const afterFrameReload = await evaluate<{ agentAddress: string; locked: boolean }>("signer.getStatus()");
+    check(
+      "an iframe reload triggers one reconnected (new hello) and requests keep working",
+      before === 0 && reconnected.status.agentAddress === createdA.agentAddress && reconnected.status.keyState === "active" && afterFrameReload.agentAddress === createdA.agentAddress,
+      { before, reconnected: reconnected.status, afterFrameReload },
+    );
     check("no CSP/SRI/console errors during normal operation (frame A)", problems.length === 0, problems);
 
     // ---------------------------------------------------------------- frame-ancestors.

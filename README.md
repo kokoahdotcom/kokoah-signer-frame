@@ -238,12 +238,13 @@ Ports can be changed with `DEV_HARNESS_PORT` and `DEV_FRAME_PORT`; `0` picks fre
 
 Two more suites run on demand:
 - `test/integration/` is **read-only** HL testnet `/info` and is skipped unless `HL_INTEGRATION=testnet`.
-- `pnpm smoke:browser` drives headless Chromium over the DevTools protocol, with 25 checks listed in [`scripts/smoke-browser.ts`](scripts/smoke-browser.ts):
+- `pnpm smoke:browser` drives headless Chromium over the DevTools protocol, with 26 checks listed in [`scripts/smoke-browser.ts`](scripts/smoke-browser.ts):
   - the real CSP, Trusted Types and SRI with no violations;
   - HTML sinks and foreign `fetch` blocked;
   - `frame-ancestors` enforced;
   - cross-site `postMessage`;
   - IndexedDB persistence with a non-extractable key;
+  - the client's automatic re-handshake (`reconnected`) when only the iframe reloads;
   - the signer's real `Permissions-Policy` (served unchanged) allowing WebAuthn, and the passkey fallback when the app doesn't delegate it;
   - the full WebAuthn **PRF** flow with a virtual authenticator when WebAuthn is allowed.
 
