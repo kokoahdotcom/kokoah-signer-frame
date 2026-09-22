@@ -2,7 +2,7 @@
 
 This repo never modifies `kokoah-shared`. Problems found while integrating it are recorded here with the workaround the frame uses. Each workaround is in one place, so it can be removed when shared fixes the issue.
 
-Integrated against: `@kokoah/shared` **0.1.1** (`link:../kokoah-shared`, prebuilt `dist/`).
+Integrated against: `@kokoah/shared` **0.1.2** (`link:../kokoah-shared`, prebuilt `dist/`).
 
 | # | Issue | Impact | Workaround in the frame | Suggested fix |
 |---|---|---|---|---|
@@ -21,3 +21,4 @@ Integrated against: `@kokoah/shared` **0.1.1** (`link:../kokoah-shared`, prebuil
 |---|---|---|
 | `MarketRegistry.fromInfo` threw on unparseable coin names found on live testnet (`VOLMEX:$EVIV`, `tndex:A B:C`, …), so no registry could be built for those dexes | 0.1.1 (entries skipped, positional ids kept) | None needed: the frame never expected a throw. Added `test/sign.test.ts` "live testnet metadata quirks", using the live `tndex` dex: `tndex:ADLT` is traded with asset id 530002 and the unparseable names are rejected |
 | `prepareL1Request` needed a cast for `compileAction`'s `HlAction` | 0.1.1 | Cast removed (`src/frame/core.ts`) |
+| `marketTriggerLimitPrice` rounded trigger ± 10% back onto the trigger when the tick is coarser than 10% of the price, so a market stop had no room to fill | 0.1.2 (one tick away, like market orders) | None needed. On such markets the frame's price band now denies the leg (`PRICE_OUTSIDE_BAND`) instead of signing an unfillable stop |
