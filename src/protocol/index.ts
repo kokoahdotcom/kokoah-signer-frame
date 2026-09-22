@@ -105,7 +105,7 @@ export type NetworkName = "testnet" | "mainnet";
 
 /**
  * How the agent key is kept on this device.
- * - `passkey`: encrypted with a key derived from a WebAuthn PRF secret; unlocking needs user presence.
+ * - `passkey`: encrypted with a key derived from a WebAuthn PRF secret; unlocking needs user verification.
  * - `device`: encrypted with a non-extractable AES-GCM key stored in IndexedDB; survives reloads without a prompt.
  * - `session`: memory only; gone when the frame reloads.
  */

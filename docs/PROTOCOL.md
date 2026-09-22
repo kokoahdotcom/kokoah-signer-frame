@@ -560,7 +560,7 @@ Denials come back as `POLICY_DENIED` with every violation, for example:
 
 | Mode | At rest | After a reload | Protects against | Doesn't protect against |
 |---|---|---|---|---|
-| `passkey` | Key encrypted with AES-GCM; the wrapping key is `HKDF(WebAuthn PRF output)`; non-extractable | **Locked** until the user unlocks with the passkey (user presence) | Stolen disk or profile copy; silent use of the stored key by code that runs later | Script running on the signer origin **after** unlock (the key is in memory) |
+| `passkey` | Key encrypted with AES-GCM; the wrapping key is `HKDF(WebAuthn PRF output)`; non-extractable | **Locked** until the user unlocks with the passkey (user verification) | Stolen disk or profile copy; silent use of the stored key by code that runs later | Script running on the signer origin **after** unlock (the key is in memory) |
 | `device` | Key encrypted with a **non-extractable** AES-GCM `CryptoKey` stored in IndexedDB | Unlocked automatically | Offline theft of the storage files | **Any script running on the signer origin** (it can call `decrypt`). That is why the frame's origin, CSP, SRI and deploy integrity matter |
 | `session` | Nothing stored | Gone (create a new key) | Anything at rest | Script on the signer origin while the tab is open |
 
@@ -569,6 +569,7 @@ Denials come back as `POLICY_DENIED` with every violation, for example:
 - The frame emits `promptChanged {visible: true}`, shows a short text and two buttons ("Create passkey"/"Unlock with passkey", and "Cancel"), and hides them afterwards.
 - Some authenticators return the PRF secret only on an assertion. The frame then asks for a second click ("Confirm your passkey").
 - Renewing a passkey key reuses the existing passkey credential.
+- Both ceremonies use `userVerification: "required"` (device PIN or biometric, not just a touch). Authenticators derive the PRF output from different secrets with and without user verification, so the frame never lets the browser choose. An authenticator that can't verify the user fails the ceremony.
 - The WebAuthn RP ID is the signer's host (e.g. `signer.kokoah.example`).
 
 **Requirements:**
