@@ -9,7 +9,7 @@ This repo also ships **`KokoahSignerClient`**, the typed, dependency-free client
 - Protocol spec with examples: [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
 - Threat model: [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)
 - Issues found in `@kokoah/shared`: [`docs/SHARED_ISSUES.md`](docs/SHARED_ISSUES.md)
-- Where it fits: `kokoah-frontend/FRONTEND_SPEC.md` §2, `FRONTEND_IMPLEMENTATION.md` §B6.3; kokoah-infra [`README`](../kokoah-infra/README.md), [`headers/`](../kokoah-infra/headers/README.md) and [`docs/SECURITY_BASELINE.md`](../kokoah-infra/docs/SECURITY_BASELINE.md) §3.
+- Where it fits: `kokoah-dev/specs/FRONTEND_SPEC.md` §2, `FRONTEND_IMPLEMENTATION.md` §B6.3; kokoah-infra [`README`](../kokoah-infra/README.md), [`headers/`](../kokoah-infra/headers/README.md) and [`docs/SECURITY_BASELINE.md`](../kokoah-infra/docs/SECURITY_BASELINE.md) §3.
 
 ```
  app.kokoah.example (frontend)                  signer.kokoah.example (this repo)             Hyperliquid
