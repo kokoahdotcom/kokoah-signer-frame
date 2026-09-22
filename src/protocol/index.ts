@@ -349,9 +349,18 @@ export interface RevokeParams {
   signatureChainId?: Hex;
 }
 export interface RevokeResult {
-  /** True when a local key was wiped. */
+  /**
+   * True when this device's key with that name was wiped from memory and storage. False when there was none, or when
+   * its stored copy could not be deleted (then `wipeError` is set).
+   */
   wiped: boolean;
-  /** The wiped key's address (never reuse it). */
+  /**
+   * Set (with `wiped: false`) when this device's key matched but its stored copy could not be deleted. The key is out
+   * of memory in this tab but would come back after a reload: post `revokeAgent` anyway (HL then rejects the key), and
+   * call `revoke` again to delete the stored copy.
+   */
+  wipeError?: string;
+  /** The wiped (or, with `wipeError`, the matched) key's address (never reuse it). Null when no local key matched. */
   agentAddress: Hex | null;
   agentName: string;
   /** From `@kokoah/shared` `buildRevokeAgent`: the main wallet signs `typedData`; the parent posts `action`. */

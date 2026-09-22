@@ -34,6 +34,53 @@ describe("revoke", () => {
     expect((await again.ok("getStatus")).hasKey).toBe(false);
   });
 
+  it("reports wiped: false with wipeError when the stored copy can't be deleted, and a second revoke deletes it", async () => {
+    const idb = new IDBFactory();
+    const store = await IdbSignerStore.open(idb);
+    let failDelete = false;
+    const realDelete = store.deleteKeyRecord.bind(store);
+    store.deleteKeyRecord = async () => {
+      if (failDelete) throw new DOMException("quota", "QuotaExceededError");
+      await realDelete();
+    };
+    const h = await frame({ idb, store });
+    const { address } = await h.activeAgent("device");
+    failDelete = true;
+    const r = await h.ok("revoke", {});
+    expect(r).toMatchObject({ wiped: false, agentAddress: address, agentName: "kokoah-web", status: { hasKey: false } });
+    expect(r.wipeError).toMatch(/could not be deleted/);
+    // The typed data is still returned: deregistering on HL makes the stored copy useless.
+    expect(r.revokeAgent).toEqual(buildRevokeAgent({ agentName: "kokoah-web", nonce: T0, network: testConfig().network }));
+    // Out of memory in this tab.
+    expect((await h.fail("signAndSubmit", { requestId: "after", intent: limitOrder() })).code).toBe("NO_KEY");
+    // Honest about what a reload would do: the stored copy is still there.
+    const reloaded = await frame({ idb, clock: h.clock, hl: h.hl });
+    await reloaded.ok("hello", { protocolVersion: 1 });
+    expect(await reloaded.ok("getStatus")).toMatchObject({ hasKey: true, agentAddress: address });
+    reloaded.destroy();
+
+    // Revoking again (storage works now) deletes the stored copy although the key is no longer in memory.
+    failDelete = false;
+    const again = await h.ok("revoke", {});
+    expect(again).toMatchObject({ wiped: true, agentAddress: address, agentName: "kokoah-web" });
+    expect(again.wipeError).toBeUndefined();
+    expect(await (await IdbSignerStore.open(idb)).getKeyRecord()).toBeUndefined();
+    const later = await frame({ idb, clock: h.clock, hl: h.hl });
+    await later.ok("hello", { protocolVersion: 1 });
+    expect((await later.ok("getStatus")).hasKey).toBe(false);
+  });
+
+  it("revoking a session key needs no storage", async () => {
+    const idb = new IDBFactory();
+    const store = await IdbSignerStore.open(idb);
+    store.deleteKeyRecord = async () => {
+      throw new Error("must not be called");
+    };
+    const h = await frame({ idb, store });
+    const { address } = await h.activeAgent("session");
+    expect(await h.ok("revoke", {})).toMatchObject({ wiped: true, agentAddress: address, status: { hasKey: false } });
+  });
+
   it("revoking another name returns its typed data without touching this device's key", async () => {
     const h = await frame();
     const { address } = await h.activeAgent("device");

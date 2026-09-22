@@ -14,6 +14,7 @@ export type LogEvent =
   | "key.unlocked"
   | "key.locked"
   | "key.revoked"
+  | "key.revoke_failed"
   | "key.expired"
   | "key.reloaded"
   | "key.unlock_failed"

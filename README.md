@@ -189,7 +189,7 @@ These aren't in this repo's power; they are for the kokoah-infra owners.
    if (r.status === "unknown") pollOrderStatusByCloid(r.cloids[0]);  // never resubmit with a new requestId
    ```
    Show `r.marketOrder` (mid and IOC price signed) for market orders, `r.outcome.statuses` for `ok`, and `r.error` for `rejected`. The final state comes from the WebSocket.
-7. **Security center (J11):** `revoke()` → sign `revokeAgent.typedData` → post it like step 5.
+7. **Security center (J11):** `revoke()` → sign `revokeAgent.typedData` → post it like step 5. If the result has `wipeError` (`wiped: false`), the stored copy couldn't be deleted: still post `revokeAgent`, tell the user, and call `revoke()` again.
 8. **Settings (§B11.4):** `setLimits({...})` after every `hello`. Loosening fails with `LIMIT_LOOSENING_REJECTED`.
 9. **Errors:** `SignerRequestError.code` is one of the `SignerErrorCode`s in [PROTOCOL §6](docs/PROTOCOL.md#6-errors), with recommended handling.
 

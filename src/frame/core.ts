@@ -981,21 +981,39 @@ export class FrameCore {
     return await this.withState(async () => {
       const key = this.key;
       const agentName = p.agentName ?? key?.meta.agentName ?? this.config.defaultAgentName;
+      const inMemory = key !== null && key.meta.agentName === agentName ? key : null;
+      // The stored copy with this name: normally the in-memory key's, or one an earlier revoke could not delete.
+      let stored: StoredKeyRecord | undefined;
+      try {
+        const rec = await this.deps.store.getKeyRecord();
+        if (rec && rec.network === this.config.network.name && rec.agentName === agentName) stored = rec;
+      } catch {
+        stored = undefined;
+      }
+      const agentAddress: Hex | null = inMemory?.meta.agentAddress ?? stored?.agentAddress ?? null;
       let wiped = false;
-      let agentAddress: Hex | null = null;
-      if (key && key.meta.agentName === agentName) {
-        agentAddress = key.meta.agentAddress;
-        if (key.meta.storageMode !== "session") {
+      let wipeError: string | undefined;
+      if (inMemory || stored) {
+        // Out of memory first: this tab stops signing with it whatever happens to storage.
+        if (inMemory) this.setKey(null);
+        let deleted = true;
+        if (stored || inMemory?.meta.storageMode !== "session") {
           try {
             await this.deps.store.deleteKeyRecord();
           } catch {
-            // Memory is wiped below either way; the record is unusable without its address match.
+            deleted = false;
           }
         }
-        this.setKey(null);
-        wiped = true;
-        this.log("key.revoked", { agent: agentAddress });
-        this.notifyOtherTabs();
+        if (deleted) {
+          wiped = true;
+          this.log("key.revoked", { agent: agentAddress ?? "none" });
+          this.notifyOtherTabs();
+        } else {
+          // Not wiped: the stored copy would come back (as it was) after a reload.
+          wipeError =
+            "The trading key was removed from memory, but its stored copy could not be deleted from this device and would come back after a reload. Post revokeAgent anyway, then call revoke again.";
+          this.log("key.revoke_failed", { agent: agentAddress ?? "none" });
+        }
       }
       const revokeAgent = buildRevokeAgent({
         agentName,
@@ -1003,8 +1021,8 @@ export class FrameCore {
         network: this.config.network,
         ...(p.signatureChainId !== undefined ? { signatureChainId: p.signatureChainId } : {}),
       });
-      if (wiped) this.statusChanged();
-      return { wiped, agentAddress, agentName, revokeAgent, status: this.status() };
+      if (inMemory || wiped) this.statusChanged();
+      return { wiped, agentAddress, agentName, revokeAgent, ...(wipeError !== undefined ? { wipeError } : {}), status: this.status() };
     });
   }
 
