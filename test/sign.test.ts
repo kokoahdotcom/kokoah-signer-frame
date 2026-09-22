@@ -189,6 +189,31 @@ describe("requestId idempotency", () => {
     expect(e.code).toBe("REQUEST_ID_REUSED");
   });
 
+  it("rejects request ids with a run of 64 hex digits before signing (the outgoing guard would block the result)", async () => {
+    h = await FrameHarness.create();
+    await h.activeAgent("device");
+    const hex64 = "ab".repeat(32);
+    for (const requestId of [hex64, `0x${hex64}`, `order-${hex64}`, `${hex64.toUpperCase()}:1`, `${"f".repeat(64)}${"0".repeat(64)}`]) {
+      const e = await h.fail("signAndSubmit", { requestId, intent: limitOrder() });
+      expect(e.code, requestId).toBe("INVALID_REQUEST");
+      expect(e.details?.issues?.[0]?.path).toBe("requestId");
+    }
+    // Same for the envelope id, which every response echoes: such a request is dropped, never signed.
+    const before = h.parent.posted.length;
+    await h.post({ protocol: "kokoah-signer", version: 1, kind: "request", id: hex64, method: "signAndSubmit", params: { requestId: "env-hex", intent: limitOrder() } });
+    expect(h.parent.posted.length).toBe(before);
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    // Up to 63 hex digits in a row are fine, and so are UUIDs; the results pass the outgoing guard.
+    for (const requestId of ["a".repeat(63), `${"a".repeat(63)}-${"b".repeat(63)}`, crypto.randomUUID()]) {
+      const r = await h.request("signAndSubmit", { requestId, intent: limitOrder() });
+      expect(r.ok ? r.result.status : r.error.code, requestId).toBe("ok");
+    }
+    const id63 = "c".repeat(63);
+    await h.post({ protocol: "kokoah-signer", version: 1, kind: "request", id: id63, method: "signAndSubmit", params: { requestId: "env-63", intent: limitOrder() } });
+    expect(h.parent.posted.find((p) => p.message.kind === "response" && p.message.id === id63)?.message).toMatchObject({ ok: true, result: { status: "ok" } });
+    expect(h.hl.exchangeCalls).toHaveLength(4);
+  });
+
   it("a request denied before signing does not consume its requestId", async () => {
     h = await FrameHarness.create();
     await h.activeAgent("device");

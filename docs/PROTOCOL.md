@@ -32,7 +32,7 @@ All messages are plain, structured-clone-safe JSON-like objects sent with `windo
 | frame → parent | `{ protocol: "kokoah-signer", version: 1, kind: "response", id, method, ok: false, error }` |
 | frame → parent | `{ protocol: "kokoah-signer", version: 1, kind: "event", event, data }` |
 
-**`id`** is 1–64 characters of `A–Z a–z 0–9 _ . : -`, unique per request, and echoed in the response. Responses can arrive in any order.
+**`id`** is 1–64 characters of `A–Z a–z 0–9 _ . : -`, unique per request, and echoed in the response. It must not be 64 hex digits (see the outgoing guard below); such a request is dropped. Responses can arrive in any order.
 
 **What the frame accepts.** The frame processes a message only when all of these hold:
 - `event.source === window.parent`;
@@ -50,7 +50,7 @@ Anything else (other windows, other origins, wallet-extension chatter) is **drop
 
 A request whose `id` can be read gets an error response. One whose header can't be read is dropped.
 
-**Outgoing guard.** Before posting, the frame checks that the message contains no binary data, no key objects and no 64-hex-digit value (the shape of a private key or of a signature's `r`/`s`). A message that fails is replaced by an `INTERNAL_ERROR` response. 64-hex values inside data relayed from Hyperliquid (for example a transaction hash) are replaced with `[redacted]`.
+**Outgoing guard.** Before posting, the frame checks that the message contains no binary data, no key objects and no 64-hex-digit value (the shape of a private key or of a signature's `r`/`s`). A message that fails is replaced by an `INTERNAL_ERROR` response. 64-hex values inside data relayed from Hyperliquid (for example a transaction hash) are replaced with `[redacted]`. Strings the frame echoes back from the parent (`id`, `requestId`, `setLimits.allowedCoins`) are validated so they can't contain one.
 
 ## 2. Lifecycle
 
@@ -346,7 +346,7 @@ The frame itself asks Hyperliquid (`info extraAgents` for `userAddress`) whether
   ```json
   "marketOrder": { "midPrice": "2500", "limitPrice": "2512.5", "slippageBps": 50 }
   ```
-- **Idempotency.** `requestId` (1–128 of `A–Z a–z 0–9 _ . : -`) is the idempotency key for the frame's session.
+- **Idempotency.** `requestId` (1–128 of `A–Z a–z 0–9 _ . : -`) is the idempotency key for the frame's session. It must not contain a run of 64 hex digits (`INVALID_REQUEST`, before anything is signed): the id is echoed in the result, and the outgoing guard would otherwise replace the answer to an order that already reached Hyperliquid with `INTERNAL_ERROR`. A UUID (`crypto.randomUUID()`) is fine.
   - The same `requestId` with the same intent returns the first result with `replayed: true`, while in flight or after. The frame never signs twice for one id.
   - The same `requestId` with a different intent gives `REQUEST_ID_REUSED`.
   - A request refused **before** it was sent (validation, policy, locked, market data) doesn't use up its id; the parent may retry it.

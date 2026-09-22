@@ -82,6 +82,8 @@ describe("message validation", () => {
     expect((await h.fail("createAgent", { userAddress: "0x1111111111111111111111111111111111111111", validForDays: 3, storageMode: "device", agentName: "a valid_until 1" })).code).toBe("INVALID_REQUEST");
     expect((await h.fail("signAndSubmit", { requestId: "has spaces", intent: {} })).code).toBe("INVALID_REQUEST");
     expect((await h.fail("signAndSubmit", { requestId: "x".repeat(129), intent: {} })).code).toBe("INVALID_REQUEST");
+    // Echoed in every status afterwards: a 64-hex coin would make every status fail the outgoing guard.
+    expect((await h.fail("setLimits", { allowedCoins: ["ETH", `xyz:${"0".repeat(64)}`] })).code).toBe("INVALID_REQUEST");
     expect((await h.fail("confirmAgent", { timeoutMs: 60_001 })).code).toBe("INVALID_REQUEST");
     expect((await h.fail("setTheme", { variables: { "--evil": "red" } })).code).toBe("INVALID_REQUEST");
     const theme = await h.fail("setTheme", { variables: { "--ks-bg": "url(https://evil.example/x)" } });
@@ -120,6 +122,8 @@ describe("message validation", () => {
     expect(classifyMessage({ protocol: PROTOCOL_NAME, version: 1, kind: "request", id: "a", method: "getStatus", params: {} })).toMatchObject({ kind: "request", method: "getStatus" });
     expect(classifyMessage({ protocol: PROTOCOL_NAME, version: 1, kind: "request", id: "a", method: "getStatus", params: { pad: "x".repeat(100) } }, 50)).toMatchObject({ kind: "invalid", code: "PAYLOAD_TOO_LARGE" });
     expect(classifyMessage({ protocol: PROTOCOL_NAME, version: 1, kind: "request", id: "bad id!", method: "getStatus" })).toMatchObject({ kind: "ignore" });
+    expect(classifyMessage({ protocol: PROTOCOL_NAME, version: 1, kind: "request", id: "9".repeat(64), method: "getStatus" })).toMatchObject({ kind: "ignore" });
+    expect(classifyMessage({ protocol: PROTOCOL_NAME, version: 1, kind: "request", id: "9".repeat(63), method: "getStatus" })).toMatchObject({ kind: "request" });
     expect(classifyMessage({ protocol: PROTOCOL_NAME, version: 1, kind: "response", id: "a", method: "getStatus" })).toMatchObject({ kind: "ignore" });
   });
 });

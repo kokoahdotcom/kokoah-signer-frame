@@ -260,7 +260,10 @@ export type LockParams = Record<string, never>;
 export type LockResult = SignerStatus;
 
 export interface SignAndSubmitParams {
-  /** Idempotency key (1–128 of `A–Z a–z 0–9 _ . : -`). Reusing it returns the first result instead of re-signing. */
+  /**
+   * Idempotency key (1–128 of `A–Z a–z 0–9 _ . : -`, with no run of 64 hex digits; a UUID is fine). Reusing it returns
+   * the first result instead of re-signing. See {@link REQUEST_ID_PATTERN}.
+   */
   requestId: string;
   /** A Kokoah action intent (`@kokoah/shared/intents`). Prices, registries and builder are never taken from the parent. */
   intent: ActionIntentInput;
@@ -460,7 +463,10 @@ interface EnvelopeBase {
 
 export interface RequestMessage<M extends MethodName = MethodName> extends EnvelopeBase {
   kind: "request";
-  /** Unique per request (1–64 of `A–Z a–z 0–9 _ . : -`); echoed in the response. */
+  /**
+   * Unique per request (1–64 of `A–Z a–z 0–9 _ . : -`, not 64 hex digits); echoed in the response. See
+   * {@link ID_PATTERN}.
+   */
   id: string;
   method: M;
   params: MethodParams[M];
@@ -478,9 +484,14 @@ export interface EventMessage<E extends EventName = EventName> extends EnvelopeB
 
 export type FrameToParentMessage = ResponseMessage | EventMessage;
 
-/** Request ids and `signAndSubmit.requestId` character sets. */
-export const ID_PATTERN = /^[A-Za-z0-9_.:-]{1,64}$/;
-export const REQUEST_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
+/**
+ * Request ids (`id`) and `signAndSubmit.requestId`: 1–64 (resp. 1–128) of `A–Z a–z 0–9 _ . : -`, and **no run of 64
+ * hex digits**. Both are echoed in the response, and the frame refuses to post any message containing 64 hex digits in
+ * a row (the shape of a private key or a signature half). An id of that shape would turn the answer to an order that
+ * already reached Hyperliquid into an `INTERNAL_ERROR`, so such ids are rejected up front, before anything is signed.
+ */
+export const ID_PATTERN = /^(?!.*[0-9A-Fa-f]{64})[A-Za-z0-9_.:-]{1,64}$/;
+export const REQUEST_ID_PATTERN = /^(?!.*[0-9A-Fa-f]{64})[A-Za-z0-9_.:-]{1,128}$/;
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null && !Array.isArray(x);

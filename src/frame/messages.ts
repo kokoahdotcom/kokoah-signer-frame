@@ -41,7 +41,8 @@ const AgentName = v.pipe(
 );
 const Empty = v.strictObject({});
 const PositiveFinite = v.pipe(v.number(), v.finite(), v.minValue(0));
-const Coin = v.pipe(v.string(), v.minLength(1), v.maxLength(80), v.regex(/^\S+$/));
+// Echoed in every status: no run of 64 hex digits, which the outgoing guard would refuse to post (no HL coin has one).
+const Coin = v.pipe(v.string(), v.minLength(1), v.maxLength(80), v.regex(/^(?!.*[0-9A-Fa-f]{64})\S+$/, "Coin must be an HL coin name (no spaces, no run of 64 hex digits)"));
 
 /** Per-method params schemas. */
 export const PARAMS_SCHEMAS = {
@@ -64,7 +65,7 @@ export const PARAMS_SCHEMAS = {
   unlock: Empty,
   lock: Empty,
   signAndSubmit: v.strictObject({
-    requestId: v.pipe(v.string(), v.regex(REQUEST_ID_PATTERN, "requestId must be 1-128 of A-Z a-z 0-9 _ . : -")),
+    requestId: v.pipe(v.string(), v.regex(REQUEST_ID_PATTERN, "requestId must be 1-128 of A-Z a-z 0-9 _ . : - with no run of 64 hex digits")),
     // Validated (strictly) by @kokoah/shared safeParseActionIntent.
     intent: v.unknown(),
   }),
