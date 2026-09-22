@@ -83,22 +83,9 @@ export class PromptUi {
     root.append(this.idle, this.panel);
   }
 
-  /** True while a prompt is shown. */
-  get busy(): boolean {
-    return this.active !== null;
-  }
-
   /** Updates the idle status line (network, key state). */
   setIdleText(text: string): void {
     this.idleText.textContent = text;
-  }
-
-  /** The prompt's primary button (tests click it). */
-  get primaryButton(): HTMLButtonElement {
-    return this.primary;
-  }
-  get cancelButton(): HTMLButtonElement {
-    return this.secondary;
   }
 
   /**

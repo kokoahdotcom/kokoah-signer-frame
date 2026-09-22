@@ -108,22 +108,17 @@ export class SigningCoordinator {
     const mine = new Promise<void>((r) => (release = r));
     const tail = previous.then(() => mine);
     this.tails.set(name, tail);
-    let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
         previous,
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            timedOut = true;
-            reject(new SignerBusyError());
-          }, this.lockTimeoutMs);
+          timer = setTimeout(() => reject(new SignerBusyError()), this.lockTimeoutMs);
         }),
       ]);
     } catch (e) {
       // Our slot still has to be released once the previous holder finishes.
       release();
-      if (timedOut) throw e;
       throw e;
     } finally {
       clearTimeout(timer);

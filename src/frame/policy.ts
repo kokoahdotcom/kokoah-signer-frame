@@ -143,17 +143,6 @@ export function intentCoins(compiled: Pick<CompiledAction, "intent">): string[] 
   }
 }
 
-/** Coins of a raw (unvalidated) intent, for fetching market data before compiling. Invalid input yields []. */
-export function rawIntentCoins(intent: unknown): string[] {
-  if (typeof intent !== "object" || intent === null) return [];
-  const i = intent as { kind?: unknown; coin?: unknown; order?: { coin?: unknown }; cancels?: unknown };
-  const out = new Set<string>();
-  if (typeof i.coin === "string") out.add(i.coin);
-  if (typeof i.order === "object" && i.order !== null && typeof i.order.coin === "string") out.add(i.order.coin);
-  if (Array.isArray(i.cancels)) for (const c of i.cancels.slice(0, 1000)) if (typeof c === "object" && c !== null && typeof (c as { coin?: unknown }).coin === "string") out.add((c as { coin: string }).coin);
-  return [...out];
-}
-
 interface WireOrder {
   a?: unknown;
   b?: unknown;
