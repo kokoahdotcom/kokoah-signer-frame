@@ -13,27 +13,42 @@ afterEach(() => {
 /** Connects a real client (parent side) to a real FrameCore (frame side) through jsdom message events. */
 async function connected(options: { passkeys?: MockPasskeys; harness?: HarnessOptions; clientOptions?: Partial<ConstructorParameters<typeof KokoahSignerClient>[0]> } = {}) {
   const appOrigin = window.location.origin;
-  const h = await FrameHarness.create({ config: appConfig(), ...options.harness, ...(options.passkeys ? { passkeys: options.passkeys } : {}) });
+  const harnessOptions: HarnessOptions = { config: appConfig(), ...options.harness, ...(options.passkeys ? { passkeys: options.passkeys } : {}) };
   const client = new KokoahSignerClient({ frameUrl: FRAME_URL, helloTimeoutMs: 3_000, ...options.clientOptions });
   const frameWindow = client.iframe.contentWindow as Window;
   const sentByClient: Array<{ message: unknown; targetOrigin: string }> = [];
+  /** The frame document currently loaded in the iframe. */
+  const frame = { h: await FrameHarness.create(harnessOptions) };
+  const attach = (h: FrameHarness) => {
+    h.parent.postMessage.mockImplementation((message: unknown, targetOrigin: string) => {
+      h.parent.posted.push({ message: structuredClone(message) as never, targetOrigin });
+      if (targetOrigin === appOrigin && frame.h === h) window.dispatchEvent(new MessageEvent("message", { data: structuredClone(message), origin: FRAME_ORIGIN, source: frameWindow }));
+    });
+  };
+  attach(frame.h);
   Object.defineProperty(frameWindow, "postMessage", {
     configurable: true,
     value: (message: unknown, targetOrigin: string) => {
       sentByClient.push({ message, targetOrigin });
-      if (targetOrigin === FRAME_ORIGIN) void h.core.handleMessage({ data: structuredClone(message), origin: appOrigin, source: h.parent });
+      if (targetOrigin === FRAME_ORIGIN) void frame.h.core.handleMessage({ data: structuredClone(message), origin: appOrigin, source: frame.h.parent });
     },
   });
-  h.parent.postMessage.mockImplementation((message: unknown, targetOrigin: string) => {
-    h.parent.posted.push({ message: structuredClone(message) as never, targetOrigin });
-    if (targetOrigin === appOrigin) window.dispatchEvent(new MessageEvent("message", { data: structuredClone(message), origin: FRAME_ORIGIN, source: frameWindow }));
-  });
+  /** Simulates a reload of the iframe: a new frame document on the same storage, which announces ready (unless told not to). */
+  const reload = async (o: { announce?: boolean } = {}): Promise<FrameHarness> => {
+    const old = frame.h;
+    const next = await FrameHarness.create({ ...harnessOptions, idb: old.idb, clock: old.clock, hl: old.hl });
+    old.destroy();
+    frame.h = next;
+    attach(next);
+    if (o.announce !== false) next.core.announceReady();
+    return next;
+  };
   cleanups.push(() => {
     client.destroy();
-    h.destroy();
+    frame.h.destroy();
   });
-  h.core.announceReady();
-  return { h, client, sentByClient, frameWindow };
+  frame.h.core.announceReady();
+  return { h: frame.h, frame, reload, client, sentByClient, frameWindow };
 }
 
 describe("KokoahSignerClient", () => {
@@ -130,6 +145,76 @@ describe("KokoahSignerClient", () => {
     // And the hello result carries the same state for an app that subscribes later.
     expect(hello.status).toMatchObject({ agentAddress: address, keyState: "active", expiringSoon: true, expired: false, expiresAt: validUntil - 15_000 });
     expect((await client.getStatus()).expiringSoon).toBe(true);
+  });
+
+  it("re-handshakes with the same params when the frame reloads and emits reconnected with the new hello result", async () => {
+    const { client, reload, sentByClient } = await connected({ clientOptions: { clientInfo: { name: "kokoah-frontend", version: "1.2.3" } } });
+    const created = await client.createAgent({ userAddress: USER, validForDays: 5, storageMode: "device" });
+    const first = client.connection;
+    expect(first).not.toBeNull();
+    const reconnected: Array<{ status: { agentAddress: string | null } }> = [];
+    const expiring: unknown[] = [];
+    client.on("reconnected", (hello) => reconnected.push(hello));
+    client.on("keyExpiringSoon", (e) => expiring.push(e));
+    await client.setLimits({ maxOrdersPerMinute: 5 });
+
+    const next = await reload();
+    await waitFor(() => reconnected.length === 1);
+    expect(reconnected[0]).toMatchObject({ frameOrigin: FRAME_ORIGIN, network: "testnet", status: { agentAddress: created.agentAddress, keyState: "pending" } });
+    expect(client.connection).toEqual(reconnected[0]);
+    expect(client.connection).not.toBe(first);
+    const hellos = sentByClient.map((s) => s.message as { method: string; params: unknown }).filter((m) => m.method === "hello");
+    expect(hellos).toHaveLength(2);
+    expect(hellos[1]?.params).toEqual(hellos[0]?.params);
+    expect(hellos[1]?.params).toEqual({ protocolVersion: 1, client: { name: "kokoah-frontend", version: "1.2.3" } });
+    // The new frame forgot the user limits (the app re-applies them on reconnected), but it answers again.
+    const status = await client.getStatus();
+    expect(status.agentAddress).toBe(created.agentAddress);
+    expect(status.policy.userLimits).toBeNull();
+    expect(next.parent.posted.some((p) => p.message.kind === "response" && !p.message.ok)).toBe(false);
+    // Listeners registered long before still get the events the new frame emits right after the new hello.
+    expect(expiring).toHaveLength(1);
+    // A second reload works too.
+    await reload();
+    await waitFor(() => reconnected.length === 2);
+    expect((await client.getStatus()).agentAddress).toBe(created.agentAddress);
+  });
+
+  it("requests made while reconnecting wait, and go out after what reconnected listeners send", async () => {
+    const { client, reload, sentByClient } = await connected();
+    await client.hello();
+    client.on("reconnected", () => {
+      void client.setLimits({ maxOrdersPerMinute: 3 });
+    });
+    await reload();
+    // The ready is handled; the new handshake is in flight.
+    expect(client.connection).toBeNull();
+    const status = client.getStatus();
+    expect((await status).policy.maxOrdersPerMinute).toBe(3);
+    const methods = sentByClient.map((s) => (s.message as { method: string }).method);
+    expect(methods.slice(-3)).toEqual(["hello", "setLimits", "getStatus"]);
+  });
+
+  it("recovers when the reloaded frame answers NOT_CONNECTED before its ready arrives", async () => {
+    const { client, reload } = await connected();
+    await client.hello();
+    const reconnected = vi.fn();
+    client.on("reconnected", reconnected);
+    await reload({ announce: false });
+    const status = await client.getStatus();
+    expect(status.hasKey).toBe(false);
+    expect(reconnected).toHaveBeenCalledTimes(1);
+  });
+
+  it("the frame can't fire the client's reconnected event", async () => {
+    const { client, frameWindow } = await connected();
+    await client.hello();
+    const listener = vi.fn();
+    client.on("reconnected", listener);
+    window.dispatchEvent(new MessageEvent("message", { origin: FRAME_ORIGIN, source: frameWindow, data: { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, kind: "event", event: "reconnected", data: {} } }));
+    expect(listener).not.toHaveBeenCalled();
+    // The initial ready (before or during the first handshake) is not a reconnect either.
+    expect(client.connection).not.toBeNull();
   });
 
   it("ignores messages from other origins or windows", async () => {

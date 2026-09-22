@@ -67,6 +67,7 @@ parent                                     frame (iframe, other origin)
 - Until `hello` succeeds, every other method answers `NOT_CONNECTED`.
 - `hello` may be repeated; it is idempotent.
 - The frame buffers messages that arrive while it is still starting, so sending `hello` right after the iframe's `load` event is safe. `KokoahSignerClient` also retries `hello`.
+- The frame posts `ready` before it answers any `hello`. A `ready` **after** a completed handshake therefore means the iframe reloaded: the new frame document has forgotten the handshake (every method answers `NOT_CONNECTED`), user limits, theme, remembered `requestId`s and an unlocked passkey key. `KokoahSignerClient` then re-runs `hello` with the same params and emits its own `reconnected` event ([§3](#3-the-client)); re-apply `setLimits` and `setTheme` there.
 - After `hello`, the frame immediately emits `keyExpiringSoon` or `keyExpired` if they apply. These are emitted once per key per frame load, so **register listeners before calling `hello`** (`client.on()` works before the handshake). The same state is in `hello.status` and `getStatus` (`expiringSoon`, `expired`, `expiresAt`): an app that subscribed late reads it from there.
 
 ## 3. The client
@@ -92,13 +93,29 @@ store.setSignerStatus(hello.status);                 // includes expiringSoon / 
 | `new KokoahSignerClient(options)` | `frameUrl` (required; https, or http for localhost). Optional: `container` (default `document.body`), `requestTimeoutMs` (30 s), `interactiveTimeoutMs` (300 s, used by `unlock` and passkey `createAgent`), `helloTimeoutMs` (15 s), `autoShowOnPrompt` (true), `iframeTitle`, `clientInfo`. |
 | `iframe` | The `<iframe data-kokoah-signer>`. Hidden (`hidden` attribute) except while the frame shows a prompt. Style it in the app. |
 | `frameOrigin` | The only origin the client sends to and accepts messages from. |
-| `hello()` | Handshake; cached. Called automatically before the first other request. |
+| `hello(params?)` | Handshake; cached. Called automatically before the first other request. Repeated automatically, with the same params, when the frame reloads (see `reconnected`). |
 | `getStatus()`, `createAgent(p)`, `confirmAgent(p?)`, `unlock()`, `lock()`, `signAndSubmit(p)`, `setLimits(p)`, `revoke(p?)`, `setTheme(p)` | One typed method per protocol method. |
 | `request(method, params, timeoutMs?)` | Low-level typed request. |
-| `on(event, listener)` → unsubscribe; `off(event, listener)` | Events of [§5](#5-events). |
+| `on(event, listener)` → unsubscribe; `off(event, listener)` | Events of [§5](#5-events), plus the client's `reconnected`. Works before `hello()`: subscribe first, because the frame emits `keyExpiringSoon`/`keyExpired` right after the handshake. |
 | `setFrameVisible(visible)` | Manual control of the iframe's visibility. |
-| `connection` | The last `hello` result, or `null`. |
+| `connection` | The last `hello` result, or `null` (before the handshake and while reconnecting). |
 | `destroy()` | Removes the iframe; pending requests fail with `DESTROYED`. |
+
+**Reconnecting.** When the frame reloads (a `ready` after a completed handshake, or a `NOT_CONNECTED` answer), the client re-runs `hello` with the params of the first `hello` and, once it succeeds, emits the client-side event **`reconnected`** with the new `HelloResult` (`ClientEventData["reconnected"]`). The frame can't send this event; it isn't part of the wire protocol.
+
+```ts
+signer.on("reconnected", (hello) => {
+  if (!helloMatchesConfig(hello)) blockTrading();      // same checks as after the first hello
+  void signer.setLimits(userLimits);                   // the new frame runs the baseline policy until then
+  void signer.setTheme(theme);
+  store.setSignerStatus(hello.status);                 // e.g. a passkey key is locked again
+});
+```
+
+- Requests made while reconnecting wait for the new handshake. They are sent **after** the requests that `reconnected` listeners start synchronously, so limits re-applied in the listener are in place first.
+- A request that the reloaded frame answers with `NOT_CONNECTED` (it did nothing for it) is sent once more after the new handshake.
+- Requests that were in flight in the old frame document get no answer (`TIMEOUT`). For `signAndSubmit`, the new frame doesn't know their `requestId`: query `orderStatus` by cloid.
+- If the new handshake fails, the next request retries it; `reconnected` is emitted when one succeeds.
 
 **Errors.** Every failure is a `SignerRequestError` with:
 - `code`: a `SignerErrorCode` ([§6](#6-errors)), or one of the client codes `TIMEOUT`, `DESTROYED`, `HANDSHAKE_FAILED`;
@@ -410,7 +427,7 @@ Personal limits (Settings, §B11.4). They can only **tighten** the frame's basel
 | `requireStopLossForNewEntries` | `true` tightens; `false` is a no-op |
 | `allowedActionTypes` | A subset of the baseline action types |
 
-- User limits live in the frame's memory: re-apply them after `hello` on every load (store them in settings).
+- User limits live in the frame's memory: re-apply them after `hello` on every load and on `reconnected` (store them in settings).
 - Errors:
   - `LIMIT_LOOSENING_REJECTED`, with `details.fields` listing the fields that would loosen;
   - `INVALID_REQUEST`.
@@ -458,6 +475,7 @@ Allowed variables:
 | `keyExpiringSoon` | `{ agentAddress, validUntil, msRemaining }` | Once per key per frame load, when it expires within 7 days (right after `hello`, and on a timer). Show the renew banner. Also in `status.expiringSoon` |
 | `keyExpired` | `{ agentAddress, validUntil }` | Once per key per frame load, at `validUntil − 15 s`. The frame refuses to sign from then on. Also in `status.expired` |
 | `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true** |
+| `reconnected` (client-side, not sent by the frame) | `HelloResult` | `KokoahSignerClient` re-ran `hello` after the frame reloaded ([§3](#3-the-client)). Re-apply `setLimits` and `setTheme` |
 
 Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event": "promptChanged", "data": { "visible": true, "kind": "passkey-unlock" } }`
 
@@ -573,7 +591,7 @@ Denials come back as `POLICY_DENIED` with every violation, for example:
 - Don't send prices, registries, nonces or builders; the frame ignores or rejects them. The ticket's own numbers are for display and risk estimates only.
 - The main wallet signs only readable typed data: `approveAgent`, `revokeAgent`, builder fee. **Never** an L1 action.
 - Never log or forward signatures, and never ask for a seed phrase.
-- Re-apply `setLimits` and `setTheme` after each `hello`.
+- Re-apply `setLimits` and `setTheme` after each `hello` and on `reconnected`.
 
 ## 11. Versioning
 

@@ -61,6 +61,7 @@ async function start(): Promise<void> {
   $("env").textContent = `frame ${cfg.frameUrl} · HL mode ${cfg.hlMode}`;
   const client = new KokoahSignerClient({ frameUrl: cfg.frameUrl, container: $("frame-slot"), clientInfo: { name: "kokoah-dev-harness", version: "dev" } });
   for (const e of EVENTS) client.on(e, (data) => log(`event ${e}`, data));
+  client.on("reconnected", (hello) => log("event reconnected (client)", hello));
   $<HTMLInputElement>("always-show").addEventListener("change", (ev) => client.setFrameVisible((ev.target as HTMLInputElement).checked));
 
   const actions: Record<string, () => Promise<unknown>> = {

@@ -170,6 +170,10 @@ These aren't in this repo's power; they are for the kokoah-infra owners.
      ```css
      iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min(420px, 92vw); height: 240px; border: 0; border-radius: 12px; z-index: 1000; box-shadow: 0 10px 40px rgb(0 0 0 / 0.5); }
      ```
+   - `reconnected` (client-side, payload: the new `HelloResult`): the frame reloaded and the client re-ran `hello` with the same params. The new frame has forgotten user limits, theme, remembered `requestId`s and an unlocked passkey key. Re-check `network`/`builder`, re-apply `setLimits` and `setTheme` in the listener (requests the listener starts synchronously go out before requests that waited for the reconnect), and refresh the status from `hello.status`:
+     ```ts
+     signer.on("reconnected", (hello) => { checkHello(hello); void signer.setLimits(limits); void signer.setTheme(theme); setSignerStatus(hello.status); });
+     ```
    - Call `setTheme({ variables: { "--ks-accent": … }, colorScheme })` to match the app.
 5. **Enable trading (J3):**
    ```ts
@@ -190,7 +194,7 @@ These aren't in this repo's power; they are for the kokoah-infra owners.
    ```
    Show `r.marketOrder` (mid and IOC price signed) for market orders, `r.outcome.statuses` for `ok`, and `r.error` for `rejected`. The final state comes from the WebSocket.
 7. **Security center (J11):** `revoke()` → sign `revokeAgent.typedData` → post it like step 5. If the result has `wipeError` (`wiped: false`), the stored copy couldn't be deleted: still post `revokeAgent`, tell the user, and call `revoke()` again.
-8. **Settings (§B11.4):** `setLimits({...})` after every `hello`. Loosening fails with `LIMIT_LOOSENING_REJECTED`.
+8. **Settings (§B11.4):** `setLimits({...})` after every `hello` and on every `reconnected`. Loosening fails with `LIMIT_LOOSENING_REJECTED`.
 9. **Errors:** `SignerRequestError.code` is one of the `SignerErrorCode`s in [PROTOCOL §6](docs/PROTOCOL.md#6-errors), with recommended handling.
 
 ## Dev harness
@@ -271,6 +275,6 @@ Two more suites run on demand:
 - **In-frame confirmation for large or out-of-policy orders** (SECURITY_BASELINE §3 asks for it). v1 denies instead.
 - **Tune the baseline limits.** $1M per order, $25M per day and a 10% band are wide backstops.
 - **Clickjacking hardening of the in-frame prompt** (IntersectionObserver v2 visibility checks).
-- **User limits aren't persisted by the frame**; the parent re-applies them after each `hello`.
+- **User limits aren't persisted by the frame**; the parent re-applies them after each `hello` and on `reconnected`.
 - **Spot and outcome markets aren't supported** (`UNSUPPORTED_MARKET`).
 - **The shared-library workarounds** listed in `docs/SHARED_ISSUES.md`.

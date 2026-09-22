@@ -9,9 +9,10 @@
  * import { KokoahSignerClient } from "@kokoah/signer-frame/client";
  *
  * const signer = new KokoahSignerClient({ frameUrl: import.meta.env.VITE_SIGNER_FRAME_URL });
- * const hello = await signer.hello();          // check hello.network and hello.builder against public-config
- * signer.on("statusChanged", (s) => …);
+ * signer.on("statusChanged", (s) => …);           // subscribe before hello: some events follow it immediately
  * signer.on("promptChanged", ({ visible }) => …);  // show the iframe while visible (passkey ceremonies)
+ * signer.on("reconnected", (hello) => { void signer.setLimits(limits); });  // the frame reloaded: re-apply
+ * const hello = await signer.hello();          // check hello.network and hello.builder against public-config
  * const r = await signer.signAndSubmit({ requestId: crypto.randomUUID(), intent });
  * ```
  *
@@ -25,7 +26,6 @@ import {
   type CreateAgentParams,
   type CreateAgentResult,
   type EventData,
-  type EventName,
   type FrameToParentMessage,
   type HelloParams,
   type HelloResult,
@@ -47,6 +47,22 @@ import {
 } from "../protocol/index.js";
 
 export * from "../protocol/index.js";
+
+/**
+ * Events a listener can subscribe to with {@link KokoahSignerClient.on}: the frame's events (`EventData`) plus the
+ * client's own `reconnected`.
+ */
+export interface ClientEventData extends EventData {
+  /**
+   * The frame reloaded (it announced `ready` again after a completed handshake, or answered `NOT_CONNECTED`) and the
+   * client re-ran `hello` with the same params. The payload is the new `hello` result. The frame lost everything it
+   * held only in memory (user limits, theme, remembered `requestId`s, an unlocked passkey key), so re-apply
+   * `setLimits` and `setTheme` here. Requests made while reconnecting wait for the new handshake and are sent after
+   * the requests these listeners start synchronously.
+   */
+  reconnected: HelloResult;
+}
+export type ClientEventName = keyof ClientEventData;
 
 /** Errors raised by the client itself (in addition to the frame's `SignerErrorCode`s). */
 export type ClientErrorCode =
@@ -104,7 +120,7 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
 }
 
-type Listener<E extends EventName> = (data: EventData[E]) => void;
+type Listener<E extends ClientEventName> = (data: ClientEventData[E]) => void;
 
 const INTERACTIVE_TIMEOUT_MS = 300_000;
 const HELLO_ATTEMPT_MS = 1_500;
@@ -119,10 +135,14 @@ export class KokoahSignerClient {
   private readonly options: Required<Pick<KokoahSignerClientOptions, "requestTimeoutMs" | "interactiveTimeoutMs" | "helloTimeoutMs" | "autoShowOnPrompt">> &
     KokoahSignerClientOptions;
   private readonly pending = new Map<string, Pending>();
-  private readonly listeners = new Map<EventName, Set<Listener<EventName>>>();
+  private readonly listeners = new Map<ClientEventName, Set<Listener<ClientEventName>>>();
   private readonly onMessage: (ev: MessageEvent) => void;
   private helloPromise: Promise<HelloResult> | null = null;
   private helloResult: HelloResult | null = null;
+  /** Params of the first `hello`, repeated when the frame reloads. */
+  private helloParams: HelloParams | null = null;
+  /** The frame reloaded after a completed handshake; the next successful handshake emits `reconnected`. */
+  private reconnectPending = false;
   private readyWaiters: Array<() => void> = [];
   private loaded = false;
   private destroyed = false;
@@ -166,25 +186,39 @@ export class KokoahSignerClient {
   // -------------------------------------------------------------------------------------------
 
   /**
-   * Handshake. Waits for the frame, checks the protocol version and origin, and returns the frame's network, builder
-   * and capabilities. Compare `network` and `builder` with the app's own configuration and refuse to trade on a
-   * mismatch. Called automatically before the first other request; calling it again returns the cached result.
+   * Handshake. Waits for the frame, checks the protocol version and origin, and returns the frame's network, builder,
+   * capabilities and status. Compare `network` and `builder` with the app's own configuration and refuse to trade on a
+   * mismatch. Called automatically before the first other request; calling it again returns the cached result. When
+   * the frame reloads, the client repeats it with the same params and emits `reconnected`.
    */
-  hello(params: Omit<HelloParams, "protocolVersion"> = {}): Promise<HelloResult> {
+  hello(params?: Omit<HelloParams, "protocolVersion">): Promise<HelloResult> {
     if (this.helloPromise) return this.helloPromise;
-    const client = params.client ?? this.options.clientInfo;
-    const p = this.handshake(client !== undefined ? { protocolVersion: PROTOCOL_VERSION, client } : { protocolVersion: PROTOCOL_VERSION });
-    this.helloPromise = p;
-    p.then(
-      (r) => (this.helloResult = r),
-      () => {
+    if (params !== undefined || this.helloParams === null) {
+      const client = params?.client ?? this.options.clientInfo;
+      this.helloParams = client !== undefined ? { protocolVersion: PROTOCOL_VERSION, client } : { protocolVersion: PROTOCOL_VERSION };
+    }
+    const p: Promise<HelloResult> = this.handshake(this.helloParams).then(
+      (r) => {
+        if (this.helloPromise === p && !this.destroyed) {
+          this.helloResult = r;
+          if (this.reconnectPending) {
+            this.reconnectPending = false;
+            // Before `p` resolves: requests these listeners start (setLimits…) go out before requests that waited.
+            this.dispatch("reconnected", r);
+          }
+        }
+        return r;
+      },
+      (e: unknown) => {
         if (this.helloPromise === p) this.helloPromise = null;
+        throw e;
       },
     );
+    this.helloPromise = p;
     return p;
   }
 
-  /** The last `hello` result, or null before the handshake completed. */
+  /** The last `hello` result, or null before the handshake completed (and while reconnecting). */
   get connection(): HelloResult | null {
     return this.helloResult;
   }
@@ -237,29 +271,44 @@ export class KokoahSignerClient {
     return this.request("setTheme", params);
   }
 
-  /** Low-level typed request. Sends `hello` first if needed. */
+  /**
+   * Low-level typed request. Sends `hello` first if needed. A `NOT_CONNECTED` answer means the frame reloaded (it
+   * does nothing else for such a request): the client re-handshakes and sends the request once more.
+   */
   async request<M extends MethodName>(method: M, params: MethodParams[M], timeoutMs?: number): Promise<MethodResults[M]> {
-    if (method !== "hello") await this.hello();
-    return await this.send(method, params, timeoutMs ?? this.options.requestTimeoutMs);
+    const timeout = timeoutMs ?? this.options.requestTimeoutMs;
+    if (method === "hello") return await this.send(method, params, timeout);
+    if (this.helloResult === null) await this.hello();
+    try {
+      return await this.send(method, params, timeout);
+    } catch (e) {
+      if (!(e instanceof SignerRequestError) || e.code !== "NOT_CONNECTED" || this.destroyed) throw e;
+      if (this.helloResult !== null) this.reconnect();
+      await this.hello();
+      return await this.send(method, params, timeout);
+    }
   }
 
   // -------------------------------------------------------------------------------------------
   // Events
   // -------------------------------------------------------------------------------------------
 
-  /** Subscribes to a frame event. Returns an unsubscribe function. */
-  on<E extends EventName>(event: E, listener: Listener<E>): () => void {
+  /**
+   * Subscribes to a frame event, or to the client's `reconnected`. Returns an unsubscribe function. Works before
+   * `hello()`: subscribe first, because the frame emits `keyExpiringSoon`/`keyExpired` right after the handshake.
+   */
+  on<E extends ClientEventName>(event: E, listener: Listener<E>): () => void {
     let set = this.listeners.get(event);
     if (!set) {
       set = new Set();
       this.listeners.set(event, set);
     }
-    set.add(listener as Listener<EventName>);
+    set.add(listener as Listener<ClientEventName>);
     return () => this.off(event, listener);
   }
 
-  off<E extends EventName>(event: E, listener: Listener<E>): void {
-    this.listeners.get(event)?.delete(listener as Listener<EventName>);
+  off<E extends ClientEventName>(event: E, listener: Listener<E>): void {
+    this.listeners.get(event)?.delete(listener as Listener<ClientEventName>);
   }
 
   /** Shows or hides the iframe (the client does this itself on `promptChanged` unless `autoShowOnPrompt` is false). */
@@ -285,6 +334,28 @@ export class KokoahSignerClient {
   // -------------------------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------------------------
+
+  /** The frame reloaded after a completed handshake: forget it and handshake again (`reconnected` on success). */
+  private reconnect(): void {
+    if (this.destroyed || this.helloResult === null) return;
+    this.helloResult = null;
+    this.helloPromise = null;
+    this.reconnectPending = true;
+    // Failures surface on the next request, which retries the handshake (and still emits `reconnected`).
+    this.hello().catch(() => {});
+  }
+
+  private dispatch<E extends ClientEventName>(event: E, data: ClientEventData[E]): void {
+    const set = this.listeners.get(event);
+    if (!set) return;
+    for (const listener of [...set]) {
+      try {
+        listener(data);
+      } catch {
+        // A listener's error must not break the client.
+      }
+    }
+  }
 
   private async handshake(params: HelloParams): Promise<HelloResult> {
     const deadline = Date.now() + this.options.helloTimeoutMs;
@@ -375,6 +446,9 @@ export class KokoahSignerClient {
     if (msg.event === "ready") {
       this.loaded = true;
       this.wakeReadyWaiters();
+      // A frame answers hello only after announcing ready, so a ready after a completed handshake is a new frame
+      // document (reload): it has forgotten the handshake. During a handshake, its retries reach the new frame.
+      this.reconnect();
     }
     if (msg.event === "promptChanged" && this.options.autoShowOnPrompt) {
       const data = msg.data as EventData["promptChanged"];
@@ -382,14 +456,6 @@ export class KokoahSignerClient {
       if (data.kind) this.iframe.setAttribute("data-kokoah-signer-prompt", data.kind);
       else this.iframe.removeAttribute("data-kokoah-signer-prompt");
     }
-    const set = this.listeners.get(msg.event);
-    if (!set) return;
-    for (const listener of [...set]) {
-      try {
-        listener(msg.data);
-      } catch {
-        // A listener's error must not break the client.
-      }
-    }
+    this.dispatch(msg.event, msg.data);
   }
 }
