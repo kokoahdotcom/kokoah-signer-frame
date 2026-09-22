@@ -6,7 +6,7 @@
  *   is structured-cloneable and stays non-extractable). A copy of the IndexedDB files is useless without the browser
  *   profile's key store; but any script running on the signer origin can call `decrypt` with it.
  * - `passkey` mode: `HKDF-SHA-256(PRF output, salt) → AES-GCM-256` (non-extractable). The PRF output only exists after
- *   a WebAuthn assertion with user presence, so the key can't be unwrapped silently.
+ *   a WebAuthn assertion with user verification, so the key can't be unwrapped silently.
  *
  * The ciphertext is bound to its metadata with AES-GCM additional data (network, storage mode, agent address).
  *

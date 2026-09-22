@@ -5,7 +5,12 @@
  * them on the signer origin).
  *
  * The frame never verifies an assertion signature (there is no server); it uses WebAuthn only to obtain the PRF
- * secret, which the authenticator releases after user presence.
+ * secret, which the authenticator releases after user verification.
+ *
+ * Both ceremonies use `userVerification: "required"`: authenticators derive the PRF output from different secrets with
+ * and without user verification (CTAP2 `hmac-secret`), so letting the browser choose ("preferred") could make an
+ * unlock produce another secret than the one the key was wrapped with. Requiring it also means unlocking needs the
+ * device PIN or biometric, not just a touch.
  *
  * @module
  */
@@ -125,7 +130,7 @@ export class WebAuthnPasskeyProvider implements PasskeyProvider {
             { type: "public-key", alg: -7 },
             { type: "public-key", alg: -257 },
           ],
-          authenticatorSelection: { residentKey: "preferred", userVerification: "preferred" },
+          authenticatorSelection: { residentKey: "preferred", userVerification: "required" },
           attestation: "none",
           timeout: o.timeoutMs,
           extensions: { prf: { eval: { first: bytes(o.prfSalt) } } } as AuthenticationExtensionsClientInputs,
@@ -152,7 +157,7 @@ export class WebAuthnPasskeyProvider implements PasskeyProvider {
           challenge: randomBytes(this.win.crypto, 32),
           rpId: o.rpId,
           allowCredentials: [{ type: "public-key", id: bytes(o.credentialId) }],
-          userVerification: "preferred",
+          userVerification: "required",
           timeout: o.timeoutMs,
           extensions: { prf: { eval: { first: bytes(o.prfSalt) } } } as AuthenticationExtensionsClientInputs,
         },

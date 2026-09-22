@@ -1,7 +1,8 @@
 import { webcrypto } from "node:crypto";
 import { recoverL1Signer } from "@kokoah/shared/signing";
 import { privateKeyToAccount } from "viem/accounts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { WebAuthnPasskeyProvider } from "../src/frame/passkey.js";
 import { IdbSignerStore, MemorySignerStore } from "../src/frame/storage.js";
 import { FrameHarness, limitOrder, MockPasskeys, testConfig, USER, waitFor } from "./helpers.js";
 
@@ -147,7 +148,7 @@ describe("passkey storage (mocked WebAuthn PRF)", () => {
     expect((await a.ok("signAndSubmit", { requestId: "p0", intent: limitOrder() })).status).toBe("ok");
     a.destroy();
 
-    // Reload: locked until the user unlocks with the passkey (user presence).
+    // Reload: locked until the user unlocks with the passkey (user verification).
     const b = await frame({ idb: a.idb, clock: a.clock, hl: a.hl, passkeys });
     await b.ok("hello", { protocolVersion: 1 });
     expect(await b.ok("getStatus")).toMatchObject({ hasKey: true, locked: true, storageMode: "passkey", keyState: "active" });
@@ -268,5 +269,32 @@ describe("passkey storage (mocked WebAuthn PRF)", () => {
     expect((await first).ok).toBe(true);
     expect((await second).ok).toBe(true);
     expect(a.events("promptChanged").filter((e) => e.visible)).toHaveLength(2);
+  });
+});
+
+describe("WebAuthnPasskeyProvider", () => {
+  /** A window whose navigator.credentials records the options it receives. */
+  function fakeWindow() {
+    const prf = new Uint8Array(32).fill(5);
+    const credential = { rawId: new Uint8Array([1, 2, 3]).buffer, getClientExtensionResults: () => ({ prf: { enabled: true, results: { first: prf.buffer.slice(0) } } }) };
+    const create = vi.fn(async (_o: CredentialCreationOptions) => credential);
+    const get = vi.fn(async (_o: CredentialRequestOptions) => credential);
+    const win = { isSecureContext: true, crypto: webcrypto, document, PublicKeyCredential: function PublicKeyCredential() {}, navigator: { credentials: { create, get } } };
+    return { win: win as unknown as Window, create, get, prf };
+  }
+
+  it("requires user verification for both ceremonies (PRF output differs with and without UV)", async () => {
+    const { win, create, get, prf } = fakeWindow();
+    const provider = new WebAuthnPasskeyProvider(win);
+    const prfSalt = new Uint8Array(32).fill(9);
+    const created = await provider.create({ rpId: "signer.kokoah.example", rpName: "Kokoah signer", userId: new Uint8Array(16), userName: "u", userDisplayName: "U", prfSalt, timeoutMs: 1_000 });
+    expect(created).toEqual({ credentialId: new Uint8Array([1, 2, 3]), prfEnabled: true, prfFirst: prf });
+    const createOptions = create.mock.calls[0]?.[0].publicKey;
+    expect(createOptions?.authenticatorSelection?.userVerification).toBe("required");
+    const got = await provider.get({ rpId: "signer.kokoah.example", credentialId: new Uint8Array([1, 2, 3]), prfSalt, timeoutMs: 1_000 });
+    expect(got.prfFirst).toEqual(prf);
+    const getOptions = get.mock.calls[0]?.[0].publicKey;
+    expect(getOptions?.userVerification).toBe("required");
+    expect(getOptions?.rpId).toBe("signer.kokoah.example");
   });
 });

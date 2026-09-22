@@ -463,7 +463,7 @@ async function main(): Promise<number> {
       await open(`${frameB.origin}/`);
       await evaluate("signer.hello()");
       const st = await evaluate<{ locked: boolean; storageMode: string; hasKey: boolean }>("signer.getStatus()");
-      check("after a reload the passkey key is locked (needs user presence)", st.hasKey && st.locked && st.storageMode === "passkey", st);
+      check("after a reload the passkey key is locked (needs user verification)", st.hasKey && st.locked && st.storageMode === "passkey", st);
     }
     check("no CSP/SRI/console errors during the passkey flow (frame B)", problems.length === 0, problems);
   } catch (e) {
