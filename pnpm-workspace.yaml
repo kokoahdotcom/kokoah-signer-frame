@@ -1,0 +1,28 @@
+# pnpm settings for pnpm 10.34.5. Copied from kokoah-infra/pnpm-workspace.yaml (docs/ENGINEERING_CONVENTIONS.md §4);
+# every key is documented at https://pnpm.io/10.x/settings.
+# This file holds settings only; the repo is a single package, not a workspace.
+
+# Do not install any version published less than 1 day (1440 minutes) ago,
+# including transitive dependencies. (v10.16.0+)
+minimumReleaseAge: 1440
+
+# Fail if a package's trust evidence (trusted publisher / provenance) is weaker
+# than an earlier release of the same package. (v10.21.0+)
+trustPolicy: no-downgrade
+
+# Only direct dependencies may come from git repositories or tarball URLs. (v10.26.0+)
+blockExoticSubdeps: true
+
+# pnpm 10 never runs dependency install scripts unless allowed. strictDepBuilds turns
+# an unreviewed build script into an install error instead of a warning. (v10.3.0+)
+strictDepBuilds: true
+
+# Reviewed decisions about dependency build scripts go in allowBuilds (v10.26.0+).
+# This repo currently has no dependency with an install script, so the map is empty.
+# Example, after a human has reviewed the script:
+# allowBuilds:
+#   esbuild@0.25.10: true   # run it (pin the version you reviewed)
+#   core-js: false          # reviewed, not needed: skip without failing
+
+# Save exact versions (no ^ or ~ range) when adding dependencies.
+savePrefix: ''

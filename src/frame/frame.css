@@ -1,0 +1,136 @@
+/*
+ * Kokoah signer frame styles. The parent can theme the frame with setTheme, which sets the --ks-* custom properties
+ * below on the root element (validated values only). No inline styles anywhere: the CSP has style-src 'self'.
+ */
+:root {
+  --ks-bg: #0f1115;
+  --ks-fg: #f2f3f5;
+  --ks-muted: #a6acb8;
+  --ks-accent: #3ecf8e;
+  --ks-accent-fg: #0b0d10;
+  --ks-danger: #ff6b6b;
+  --ks-border: #2a2f38;
+  --ks-focus: #7cc4ff;
+  --ks-radius: 10px;
+  --ks-font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --ks-font-size: 15px;
+  --ks-padding: 16px;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --ks-bg: #ffffff;
+    --ks-fg: #14161a;
+    --ks-muted: #5b6270;
+    --ks-accent: #0f8a5f;
+    --ks-accent-fg: #ffffff;
+    --ks-danger: #b3261e;
+    --ks-border: #d9dde3;
+    --ks-focus: #1463ff;
+    color-scheme: light;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--ks-bg);
+  color: var(--ks-fg);
+  font-family: var(--ks-font);
+  font-size: var(--ks-font-size);
+  line-height: 1.45;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.ks-root {
+  padding: var(--ks-padding);
+}
+
+.ks-idle-text {
+  margin: 0;
+  color: var(--ks-muted);
+  font-size: 0.85em;
+}
+
+.ks-prompt {
+  border: 1px solid var(--ks-border);
+  border-radius: var(--ks-radius);
+  padding: var(--ks-padding);
+}
+
+.ks-title {
+  margin: 0 0 0.4em;
+  font-size: 1.1em;
+  font-weight: 600;
+}
+
+.ks-body {
+  margin: 0 0 1em;
+  color: var(--ks-muted);
+}
+
+.ks-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6em;
+}
+
+.ks-button {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0.6em 1.1em;
+  border-radius: var(--ks-radius);
+  border: 1px solid var(--ks-border);
+  font: inherit;
+  cursor: pointer;
+}
+
+.ks-primary {
+  background: var(--ks-accent);
+  color: var(--ks-accent-fg);
+  border-color: var(--ks-accent);
+  font-weight: 600;
+}
+
+.ks-secondary {
+  background: transparent;
+  color: var(--ks-fg);
+}
+
+.ks-button:focus-visible {
+  outline: 3px solid var(--ks-focus);
+  outline-offset: 2px;
+}
+
+.ks-button:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.ks-status {
+  min-height: 1.4em;
+  margin: 0.8em 0 0;
+  color: var(--ks-muted);
+  font-size: 0.9em;
+}
+
+.ks-fatal {
+  margin: 0;
+  color: var(--ks-danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

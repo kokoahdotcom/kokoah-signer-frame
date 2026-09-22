@@ -1,0 +1,186 @@
+# Copied from kokoah-infra/ci/workflows/static-site.yml (2026-09-22), unchanged apart from this header.
+# Deploy builds must set the VITE_* build variables (README.md, .env.example); without them the build uses the
+# placeholder .env.production (testnet, placeholder builder), which the frontend refuses to trade with.
+# The real-browser smoke test (pnpm smoke:browser) needs Chromium and is run manually, not here.
+# Kokoah CI template: static site (kokoah-frontend, kokoah-signer-frame).
+# Source of truth: kokoah-infra/ci/workflows/static-site.yml. Copy it to
+# .github/workflows/ci.yml in the site repo; see kokoah-infra/ci/README.md.
+#
+# 1. build: install, typecheck, test, build, then generate an SRI-checked release
+#    manifest (fails if any script or style lacks correct integrity) and upload the
+#    site tarball, manifest and SHA256SUMS as a workflow artifact.
+# 2. attest (main and tags): sign the tarball and manifest with a Sigstore-backed
+#    SLSA build-provenance attestation. This job runs no repo or dependency code.
+# 3. publish-hashes (tags only): attach the manifest and SHA256SUMS to the GitHub
+#    release, the public hash list that deploy monitors compare against.
+#
+# Deploying is NOT part of this workflow (see docs/SECURITY_BASELINE.md §5).
+#
+# Requires in the repo:
+#   - tools/kokoah-infra/ vendored from kokoah-infra/scripts/src/ (see ci/README.md)
+#   - repository variable SITE_ORIGIN, e.g. https://app.kokoah.example
+#   - the build writes to dist/ (change DIST_DIR otherwise)
+#
+# Third-party actions are pinned to full commit SHAs (verified 2026-09-21).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+  DIST_DIR: dist
+  # Tests never write to Hyperliquid mainnet (docs/ENGINEERING_CONVENTIONS.md §7). The
+  # production network of the *built site* is chosen by the build's own variables.
+  HL_NETWORK: testnet
+  ALLOW_MAINNET_WRITES: "false"
+
+jobs:
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: low
+          show-openssf-scorecard: true
+
+  build:
+    name: build and release manifest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      SITE_ORIGIN: ${{ vars.SITE_ORIGIN }}
+      RELEASE: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Enable pnpm via corepack
+        run: corepack enable pnpm
+
+      - name: Check SITE_ORIGIN is set
+        run: |
+          if [ -z "${SITE_ORIGIN}" ]; then
+            echo "::error::Set the repository variable SITE_ORIGIN (e.g. https://app.kokoah.example)"
+            exit 1
+          fi
+
+      # Reproducible timestamps: tools that honour SOURCE_DATE_EPOCH use the commit time.
+      - name: Set SOURCE_DATE_EPOCH
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "${GITHUB_ENV}"
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm run build
+
+      # Hashes every file with SHA-384 and fails if any <script>/<link> in index.html
+      # lacks a matching integrity attribute, loads from another origin, or if the HTML
+      # has an inline script (--no-inline; the CSP allows none).
+      - name: Generate release manifest
+        run: |
+          node tools/kokoah-infra/release-manifest.ts \
+            --dir "${DIST_DIR}" \
+            --site "${SITE_ORIGIN}" \
+            --release "${RELEASE}" \
+            --commit "${GITHUB_SHA}" \
+            --out release-manifest.json \
+            --no-inline
+
+      - name: Package site and checksums
+        run: |
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${SOURCE_DATE_EPOCH}" \
+            -C "${DIST_DIR}" -cf - . | gzip -n > site.tar.gz
+          sha256sum site.tar.gz release-manifest.json | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: site-${{ github.sha }}
+          path: |
+            site.tar.gz
+            release-manifest.json
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  attest:
+    name: attest build provenance
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # mint the OIDC token for the Sigstore signing certificate
+      attestations: write # store the attestation
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: site-${{ github.sha }}
+
+      - name: Verify checksums
+        run: sha256sum --check SHA256SUMS
+
+      # Verify later with:
+      #   gh attestation verify release-manifest.json --repo <owner>/<repo>
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            site.tar.gz
+            release-manifest.json
+
+  publish-hashes:
+    name: publish hash list to the GitHub release
+    needs: attest
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # create or update the release for this tag
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: site-${{ github.sha }}
+
+      - name: Attach manifest and SHA256SUMS to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag --title "${TAG}" \
+              --notes "Release manifest and checksums. Verify: gh attestation verify release-manifest.json --repo ${GITHUB_REPOSITORY}"
+          fi
+          # No --clobber: a published hash list is never silently replaced. A re-run fails
+          # instead, and a human decides.
+          gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" release-manifest.json SHA256SUMS

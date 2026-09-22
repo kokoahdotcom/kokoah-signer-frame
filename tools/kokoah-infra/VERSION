@@ -1,0 +1,16 @@
+Vendored from kokoah-infra/scripts/src (see kokoah-infra/ci/README.md, "Vendoring the scripts").
+kokoah-infra had no commits yet when copied (2026-09-22), so each file's SHA-256 is recorded instead of a commit.
+Do not edit these files here; change them in kokoah-infra and copy them again.
+
+dd145554730c7841c793b49f91173f1bb591848d670a12dc5142335f5317f262  check-domain.ts
+515625cc058fe89eac5c12b7a063fbc972483dc9f0cf80d2b693746f565f164d  hl-status.ts
+526c0a41a757557297ccfa727f345578203257ebcc952debedb50689bea1494e  monitor-deploy.ts
+1d1aff02db65a0c2f7939098b74003ec134146408987a159ecdf47685d92ac1c  release-manifest.ts
+59e9f1587605d818b39f2b2bfa4627c47f85275756a5c49db311213f2f74af18  lib/cli.ts
+f200f18c391353830d099d04c9aba6a663d7b229ef181e9e90b46abfacefac17  lib/dns.ts
+1e7e44a6fc13e098c6fafdd7f8c582b685d013babb7bef647bb0d5375d42f3eb  lib/html.ts
+22ee2fa8d6747f18ef41b0c47b26381bd9e479c00eb58c0cdfa3f7a879d9725b  lib/http.ts
+7b09f1fe5b32e65984745bb1bd6d9986a9c5af10ef259215926384dd57adf069  lib/manifest.ts
+1795faadf0c40d836d7592f0440c489646d7b713302a6cd5fe8bf478ce2056c2  lib/security-headers.ts
+b5a9f374a4454596c34805cc6b3f0d9e9b6ca8ce9f2138973202c3d2203071dc  lib/sri.ts
+fa8996cc60d04c222b9882db699d3c9c268695e67e8f28fcaa6cdb5e2fc5d544  lib/table.ts

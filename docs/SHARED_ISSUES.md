@@ -1,0 +1,23 @@
+# Issues found in `@kokoah/shared`
+
+This repo never modifies `kokoah-shared`. Problems found while integrating it are recorded here with the workaround the frame uses. Each workaround is in one place, so it can be removed when shared fixes the issue.
+
+Integrated against: `@kokoah/shared` **0.1.1** (`link:../kokoah-shared`, prebuilt `dist/`).
+
+| # | Issue | Impact | Workaround in the frame | Suggested fix |
+|---|---|---|---|---|
+| 1 | **No per-market leverage cap in `Policy`.** `maxLeverage` is a single number. The frame's rule is "each market's own maximum, optionally tightened by the user". Separately, `compileAction` rejects leverage above the market maximum with `CompileError("LEVERAGE_ABOVE_MAX")`, which is a compile error, not a policy violation | Can't express the baseline as a `Policy`; denials surface as two different error types | Baseline `maxLeverage` is a sentinel (1000 = "market"). Each evaluation copies the policy with `maxLeverage = min(user limit, market max)` for the coins involved (`src/frame/policy.ts` `leverageCapFor`). `LEVERAGE_ABOVE_MAX` is reported as `POLICY_DENIED` / `LEVERAGE_EXCEEDED` | Allow `maxLeverage: "market"` (or `null`) and apply `min(policy, registry.maxLeverage)` inside `evaluatePolicy` |
+| 2 | **No helper for the notional that `evaluatePolicy` counts.** Signers must pass `dailyNotionalUsedUsd` but have to compute the action's notional themselves. Shared values trigger legs at `max(limit, trigger, mark)` and exempts reduce-only orders | The frame's daily accounting can drift from the policy's own valuation | `actionNotionalUsd()` in `src/frame/policy.ts` mirrors the documented rule (size × max(limit, trigger, mark), reduce-only exempt) | Return `notionalUsd` and `orderCount` in `PolicyDecision`, or export the valuation function |
+| 3 | **Same for the order count** used by `ordersInLastMinute` (legs, including TP/SL children; cancels exempt) | Same drift risk | `orderCount()` counts wire orders (`order.orders`, `modify` = 1, `batchModify.modifies`) | As #2 |
+| 4 | **`NonceManager` is synchronous and in-memory.** Browsers with several tabs need a persisted, atomic reservation (the shared docs say so, but there's no interface for it) | Every browser signer re-implements persistence | `MonotonicNonceManager` is used *inside* a single IndexedDB read-write transaction: a fresh manager, `observe(last)`, `next()`, write (`src/frame/nonces.ts` `nextUsage`). Far-future `last` values are ignored before `observe` (0.1.1's bounded `observe` would throw on them) | An async `NonceStore` interface (`reserve(key, now) → Promise<number>`) with a documented cross-tab pattern |
+| 5 | **No input path for `metaAndAssetCtxs`** (`[meta, assetCtxs]`) in `MarketRegistry.fromInfo`, and no helper to read mark/mid prices by coin | Signers parse asset contexts by position themselves | `src/frame/market-data.ts` validates `ctxs.length === universe.length` and builds `markPrices`/`midPrices` keyed by `universe[i].name`; the registry comes from `meta` + `dexMetas` + `perpDexs` | `MarketRegistry.fromInfo({ metaAndAssetCtxs: { [dex]: … } })` and `assetCtxsByCoin()` |
+| 6 | **`buildRevokeAgent` uses the zero address for named agents, which is inferred** (shared's own note: verify with the testnet spike) | If HL expects something else, the revoke the frame returns wouldn't deregister the agent | None: the frame returns `buildRevokeAgent` as the contract requires, and wipes the local key regardless | Run spike 01/02 on testnet and record the result |
+| 7 | **`summarizePolicy` returns a string** | The frame needs a structured summary for `getStatus` | `summarizeFramePolicy()` in `src/frame/policy.ts` | Export a structured summary |
+| 8 | `parseExchangeResponse` copies HL's raw text into `error.raw` | Harmless today. A relaying signer must still make sure nothing sensitive or long-hex passes through | Every 64-hex run in relayed HL data is redacted before posting (`redactHex64`) | Optional: document that `raw` is untrusted text |
+
+## Resolved
+
+| Issue | Fixed in | Frame change |
+|---|---|---|
+| `MarketRegistry.fromInfo` threw on unparseable coin names found on live testnet (`VOLMEX:$EVIV`, `tndex:A B:C`, …), so no registry could be built for those dexes | 0.1.1 (entries skipped, positional ids kept) | None needed: the frame never expected a throw. Added `test/sign.test.ts` "live testnet metadata quirks", using the live `tndex` dex: `tndex:ADLT` is traded with asset id 530002 and the unparseable names are rejected |
+| `prepareL1Request` needed a cast for `compileAction`'s `HlAction` | 0.1.1 | Cast removed (`src/frame/core.ts`) |

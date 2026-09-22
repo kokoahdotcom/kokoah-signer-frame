@@ -1,0 +1,56 @@
+# Kokoah Dependabot template. Copy to .github/dependabot.yml in each repo and delete
+# the ecosystems the repo does not use. See kokoah-infra/ci/README.md.
+#
+# Principles (docs/ENGINEERING_CONVENTIONS.md §4-5):
+#   - Updates are delayed ("cooldown") so a malicious release is usually caught and
+#     unpublished before we ever see it. The cooldown must be at least pnpm's
+#     minimumReleaseAge (1 day), or Dependabot's PRs would fail to install.
+#   - Low-risk updates are grouped to cut noise; production dependency minor/major
+#     updates stay one-per-PR so a human reviews each one.
+#   - Cooldown does not apply to security updates; see the conventions for the
+#     emergency-patch procedure (minimumReleaseAgeExclude for one exact version).
+version: 2
+updates:
+  # pnpm projects use the "npm" ecosystem (Dependabot supports pnpm v7-v10 lockfiles).
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    cooldown:
+      default-days: 7
+      semver-patch-days: 3
+      semver-minor-days: 7
+      semver-major-days: 30
+    # Exact pins stay exact; the lockfile is updated with them.
+    versioning-strategy: increase
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+    commit-message:
+      prefix: deps
+      prefix-development: deps-dev
+    groups:
+      dev-minor-and-patch:
+        dependency-type: development
+        update-types: [minor, patch]
+      prod-patch:
+        dependency-type: production
+        update-types: [patch]
+
+  # Keeps the SHA-pinned actions current (Dependabot updates the SHA and the
+  # "# vX.Y.Z" comment together).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    cooldown:
+      default-days: 7
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        patterns: ["*"]

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kokoah signer frame · dev harness</title>
+    <link rel="stylesheet" href="./harness.css" />
+    <script type="module" src="./harness.ts"></script>
+  </head>
+  <body>
+    <header>
+      <h1>Kokoah signer frame · dev harness</h1>
+      <p class="warn">DEV ONLY. Throwaway keys. <code>/exchange</code> is answered by a local mock and never reaches Hyperliquid.</p>
+      <p id="env"></p>
+    </header>
+    <main>
+      <section class="controls">
+        <h2>Connection</h2>
+        <div class="row">
+          <button data-action="hello">hello</button>
+          <button data-action="getStatus">getStatus</button>
+          <label><input type="checkbox" id="always-show" /> always show the frame</label>
+        </div>
+
+        <h2>Enable trading</h2>
+        <p>Main wallet (throwaway, in memory): <code id="main-wallet"></code></p>
+        <div class="row">
+          <label>storage
+            <select id="storage-mode"><option>device</option><option>passkey</option><option>session</option></select>
+          </label>
+          <label>days <input id="valid-days" type="number" min="1" max="30" value="30" /></label>
+          <label><input type="checkbox" id="replace-existing" /> replaceExisting</label>
+          <button data-action="createAgent">createAgent</button>
+        </div>
+        <div class="row">
+          <button data-action="approve">main wallet: sign + post approveAgent (mock)</button>
+          <button data-action="confirmAgent">confirmAgent</button>
+        </div>
+        <div class="row">
+          <button data-action="unlock">unlock</button>
+          <button data-action="lock">lock</button>
+          <button data-action="revoke">revoke (+ sign and post revoke to the mock)</button>
+        </div>
+
+        <h2>Trade</h2>
+        <div class="row">
+          <label>template
+            <select id="template"></select>
+          </label>
+          <button data-action="newRequestId">new requestId</button>
+          <code id="request-id"></code>
+        </div>
+        <textarea id="intent" rows="9" spellcheck="false" aria-label="Intent JSON"></textarea>
+        <div class="row"><button data-action="signAndSubmit">signAndSubmit</button></div>
+
+        <h2>Limits and theme</h2>
+        <textarea id="limits" rows="3" spellcheck="false" aria-label="setLimits JSON">{ "maxOrdersPerMinute": 10, "maxLeverage": 5 }</textarea>
+        <div class="row"><button data-action="setLimits">setLimits</button><button data-action="resetLimits">setLimits({})</button></div>
+        <textarea id="theme" rows="3" spellcheck="false" aria-label="setTheme JSON">{ "variables": { "--ks-accent": "#ff9f1c", "--ks-radius": "4px" }, "colorScheme": "dark" }</textarea>
+        <div class="row"><button data-action="setTheme">setTheme</button></div>
+
+        <h2>Mock market</h2>
+        <div class="row">
+          <label>ETH mark <input id="eth-mark" value="2000" size="8" /></label>
+          <button data-action="setMark">set</button>
+        </div>
+      </section>
+      <section class="output">
+        <h2>Signer frame</h2>
+        <div id="frame-slot"></div>
+        <h2>Log</h2>
+        <button data-action="clearLog">clear</button>
+        <pre id="log" aria-live="polite"></pre>
+      </section>
+    </main>
+  </body>
+</html>

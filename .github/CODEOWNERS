@@ -1,0 +1,43 @@
+# Kokoah CODEOWNERS template. Copy to .github/CODEOWNERS in each repo.
+#
+# PLACEHOLDERS: replace @OWNER-ORG/kokoah-maintainers and @OWNER-ORG/kokoah-security
+# with real GitHub teams (each team needs write access to the repo). Then turn on
+# branch protection for main (a ruleset): "Require a pull request", "Require review
+# from Code Owners", 2 approvals where the team is big enough, "Dismiss stale
+# approvals", and "Require approval of the most recent push".
+#
+# The last matching pattern wins, so the general rule comes first.
+
+# Everything: at least one maintainer.
+*                                   @OWNER-ORG/kokoah-maintainers
+
+# Supply chain: any dependency change needs the security owners. This enforces the
+# rule that a human reviews every new or AI-suggested dependency.
+/package.json                       @OWNER-ORG/kokoah-security
+/pnpm-lock.yaml                     @OWNER-ORG/kokoah-security
+/pnpm-workspace.yaml                @OWNER-ORG/kokoah-security
+/.npmrc                             @OWNER-ORG/kokoah-security
+/.nvmrc                             @OWNER-ORG/kokoah-security
+/Dockerfile                         @OWNER-ORG/kokoah-security
+/.dockerignore                      @OWNER-ORG/kokoah-security
+
+# CI and repository settings: a change here can leak secrets or skip checks.
+/.github/                           @OWNER-ORG/kokoah-security
+
+# Security headers and CSP (static sites): public/_headers, header policy code.
+/public/_headers                    @OWNER-ORG/kokoah-security
+
+# Security-critical code paths. Adjust to each repo's layout, for example:
+#   kokoah-signer-frame:   /src/                  (the whole frame)  <- applied below
+#   kokoah-signer-service: /src/                  (the whole service)
+#   kokoah-backend:        /src/signer-client/ /src/auth/ /src/guardians/
+#   kokoah-shared:         /src/signing/ /src/policy/ /src/intents/
+#   kokoah-infra:          /headers/ /scripts/src/ /docs/SECURITY_BASELINE.md
+
+# kokoah-signer-frame: the whole frame, the protocol, the build and its integrity checks are security-critical.
+/src/                               @OWNER-ORG/kokoah-security
+/scripts/                           @OWNER-ORG/kokoah-security
+/vite.config.ts                     @OWNER-ORG/kokoah-security
+/index.html                         @OWNER-ORG/kokoah-security
+/.env.production                    @OWNER-ORG/kokoah-security
+/tools/                             @OWNER-ORG/kokoah-security

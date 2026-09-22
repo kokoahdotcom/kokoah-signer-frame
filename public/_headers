@@ -1,0 +1,27 @@
+# Kokoah signer frame (signer.kokoah.example): security headers for Cloudflare Pages or Workers static assets.
+# Put this file in the site's build output directory (Vite: public/_headers).
+#
+# PLACEHOLDER DOMAINS: app.kokoah.example, signer.kokoah.example and api.kokoah.example
+# must be replaced with the real origins before use. Every directive is explained in
+# headers/README.md. Keep this file in sync with ../../cloudfront/signer.response-headers-policy.json
+# (the tests in scripts/test/headers.test.ts compare them).
+#
+# Cloudflare limits: 100 rules, 2,000 characters per line. A header set by two matching
+# rules is comma-joined, so each header name appears in only one rule for a given path.
+
+/*
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src https://api.hyperliquid.xyz https://api.hyperliquid-testnet.xyz; worker-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors https://app.kokoah.example; require-trusted-types-for 'script'; trusted-types 'none'; report-to csp; report-uri https://api.kokoah.example/v1/csp-reports
+  Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Permissions-Policy: accelerometer=(), autoplay=(), bluetooth=(), browsing-topics=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-create=(), publickey-credentials-get=(), serial=(), usb=()
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Resource-Policy: same-origin
+  Origin-Agent-Cluster: ?1
+  Reporting-Endpoints: csp="https://api.kokoah.example/v1/csp-reports"
+  X-XSS-Protection: 0
+
+# Content-hashed build assets never change: cache them for a year.
+# HTML, sw.js and the web app manifest keep Cloudflare's default revalidating cache policy.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
