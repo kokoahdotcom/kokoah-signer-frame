@@ -6,8 +6,10 @@
  * 2. Checks the build and fails on any problem:
  *    - no inline scripts, no inline styles, no `style=` attributes, no third-party resources;
  *    - the CSP `<meta>` is the first element of `<head>` and equals `buildMetaCsp(config)`;
- *    - `dist/_headers` (copied from public/) sets `frame-ancestors` to exactly the allowed parent origins, and its
- *      `connect-src` covers the HL API origin; it is compared with kokoah-infra's copy when that repo is next to this one;
+ *    - `dist/_headers` (copied from public/) sets `frame-ancestors` to exactly the allowed parent origins, its
+ *      `connect-src` covers the HL API origin and its Permissions-Policy allows WebAuthn for `self`; when kokoah-infra
+ *      is next to this repo, any difference from its signer `_headers` other than deployment-specific origins
+ *      (`frame-ancestors`, the CSP report endpoint) fails the build;
  *    - no `eval(`/`new Function(` in the JavaScript, no source maps, nothing from the dev harness;
  *    - a mainnet build never uses the placeholder builder address.
  * 3. Writes `release-manifest.json` (kokoah.release-manifest/v1, kokoah-infra/docs/RELEASE_MANIFEST.md) next to
@@ -117,10 +119,99 @@ export function headersCsp(headers: string): Map<string, string[]> | null {
   return null;
 }
 
+/** Rules of a Cloudflare `_headers` file: path → lower-cased header name → value (whitespace-normalized). */
+export function parseHeadersFile(text: string): Map<string, Map<string, string>> {
+  const rules = new Map<string, Map<string, string>>();
+  let current: Map<string, string> | null = null;
+  for (const line of text.split(/\r?\n/)) {
+    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
+    if (/^\S/.test(line)) {
+      const path = line.trim();
+      current = rules.get(path) ?? new Map<string, string>();
+      rules.set(path, current);
+      continue;
+    }
+    const m = /^\s+([^:]+):\s*(.*)$/.exec(line);
+    if (m && current) current.set((m[1] as string).trim().toLowerCase(), (m[2] as string).trim().replace(/\s+/g, " "));
+  }
+  return rules;
+}
+
+/** `feature=(allowlist)` entries of a Permissions-Policy header value. */
+export function parsePermissionsPolicy(value: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const m of value.matchAll(/([a-z0-9-]+)=\(([^)]*)\)/gi)) out.set((m[1] as string).toLowerCase(), (m[2] as string).split(/\s+/).filter((x) => x !== ""));
+  return out;
+}
+
+/** WebAuthn features the frame needs on its own origin for `passkey` storage. */
+const WEBAUTHN_FEATURES = ["publickey-credentials-create", "publickey-credentials-get"] as const;
+
+/**
+ * Values that legitimately differ between the frame's `_headers` and kokoah-infra's copy (another deployment's
+ * origins): `frame-ancestors` (checked against VITE_ALLOWED_PARENT_ORIGINS by {@link checkHeaders}) and the CSP report
+ * endpoint (`report-uri`, `Reporting-Endpoints`). Everything else must be identical.
+ */
+const DEPLOYMENT_SPECIFIC_CSP = new Set(["frame-ancestors", "report-uri"]);
+const DEPLOYMENT_SPECIFIC_HEADERS = new Set(["reporting-endpoints"]);
+
+function cspDirectives(value: string): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const d of value.split(";")) {
+    const [k, ...v] = d.trim().split(/\s+/);
+    if (k) map.set(k.toLowerCase(), v.join(" "));
+  }
+  return map;
+}
+
+/**
+ * Differences between the frame's `_headers` and kokoah-infra's `headers/cloudflare/signer/_headers` that matter:
+ * any path, header or CSP directive added, removed or changed, except the deployment-specific origins above.
+ * Comments and whitespace are ignored.
+ */
+export function headersDrift(frameHeaders: string, infraHeaders: string): string[] {
+  const problems: string[] = [];
+  const ours = parseHeadersFile(frameHeaders);
+  const theirs = parseHeadersFile(infraHeaders);
+  for (const path of new Set([...ours.keys(), ...theirs.keys()])) {
+    const a = ours.get(path);
+    const b = theirs.get(path);
+    if (!a || !b) {
+      problems.push(`_headers rule ${path} is ${a ? "not in" : "missing from"} kokoah-infra's signer _headers`);
+      continue;
+    }
+    for (const name of new Set([...a.keys(), ...b.keys()])) {
+      const va = a.get(name);
+      const vb = b.get(name);
+      if (va === undefined || vb === undefined) {
+        problems.push(`_headers ${path} ${name} is ${va === undefined ? "missing (kokoah-infra sets it)" : "not set by kokoah-infra"}`);
+        continue;
+      }
+      if (DEPLOYMENT_SPECIFIC_HEADERS.has(name) || va === vb) continue;
+      if (name !== "content-security-policy") {
+        problems.push(`_headers ${path} ${name} differs from kokoah-infra: "${va}" vs "${vb}"`);
+        continue;
+      }
+      const da = cspDirectives(va);
+      const db = cspDirectives(vb);
+      for (const d of new Set([...da.keys(), ...db.keys()])) {
+        if (da.has(d) && db.has(d) && (DEPLOYMENT_SPECIFIC_CSP.has(d) || da.get(d) === db.get(d))) continue;
+        problems.push(`_headers ${path} CSP ${d} differs from kokoah-infra: "${da.get(d) ?? "(absent)"}" vs "${db.get(d) ?? "(absent)"}"`);
+      }
+    }
+  }
+  return problems;
+}
+
 export function checkHeaders(headers: string, config: FrameConfig): string[] {
   const problems: string[] = [];
+  const pp = parseHeadersFile(headers).get("/*")?.get("permissions-policy");
+  const features = parsePermissionsPolicy(pp ?? "");
+  for (const f of WEBAUTHN_FEATURES) {
+    if (!(features.get(f) ?? []).includes("self")) problems.push(`_headers Permissions-Policy must allow ${f}=(self) on the signer origin (passkeys need it)`);
+  }
   const csp = headersCsp(headers);
-  if (!csp) return ["_headers has no Content-Security-Policy for /*"];
+  if (!csp) return [...problems, "_headers has no Content-Security-Policy for /*"];
   const ancestors = csp.get("frame-ancestors") ?? [];
   for (const o of config.allowedParentOrigins) {
     if (!ancestors.includes(o)) problems.push(`_headers frame-ancestors does not allow ${o} (VITE_ALLOWED_PARENT_ORIGINS); the app could not embed the frame`);
@@ -224,7 +315,12 @@ function main(): number {
     const headers = readFileSync(headersPath, "utf8");
     problems.push(...checkHeaders(headers, config));
     const infraCopy = resolve(root, "../kokoah-infra/headers/cloudflare/signer/_headers");
-    if (existsSync(infraCopy) && readFileSync(infraCopy, "utf8") !== headers) warnings.push("public/_headers differs from kokoah-infra/headers/cloudflare/signer/_headers");
+    if (!existsSync(infraCopy)) warnings.push("kokoah-infra is not next to this repo; public/_headers was not compared with its signer _headers");
+    else {
+      const infra = readFileSync(infraCopy, "utf8");
+      problems.push(...headersDrift(headers, infra));
+      if (infra !== headers) warnings.push("public/_headers differs from kokoah-infra/headers/cloudflare/signer/_headers in deployment-specific origins or comments only");
+    }
   }
 
   if (problems.length > 0) {

@@ -69,7 +69,7 @@ corepack pnpm smoke:browser    # real-browser checks in headless Chromium (needs
 1. `vite build`: static output with content-hashed assets, a CSP `<meta>` and no inline script.
 2. [`scripts/postbuild.ts`](scripts/postbuild.ts), which:
    - adds `integrity="sha384-…"` to every script and stylesheet;
-   - fails on inline scripts or styles, third-party resources, `eval`/`new Function`, source maps, dev-harness code, a CSP `<meta>` that differs from the configuration, or `_headers` whose `frame-ancestors`/`connect-src` don't match the configuration;
+   - fails on inline scripts or styles, third-party resources, `eval`/`new Function`, source maps, dev-harness code, a CSP `<meta>` that differs from the configuration, `_headers` whose `frame-ancestors`/`connect-src` don't match the configuration or whose `Permissions-Policy` doesn't allow WebAuthn for `self`, or (when kokoah-infra is checked out next to this repo) `_headers` that differ from kokoah-infra's signer copy in anything but deployment-specific origins (`frame-ancestors`, the CSP report endpoint);
    - writes **`release-manifest.json`** (`kokoah.release-manifest/v1`, see kokoah-infra `docs/RELEASE_MANIFEST.md`). The output is byte-identical to kokoah-infra's own `release-manifest.ts` for the same inputs.
 3. `tsc -p tsconfig.client.json`: the client and protocol types into `dist-client/`.
 
@@ -129,7 +129,7 @@ Post-build variables (not in the bundle):
 
 These aren't in this repo's power; they are for the kokoah-infra owners.
 
-1. **Passkey mode needs WebAuthn on the signer origin. Done (2026-09-22).** kokoah-infra now sends `publickey-credentials-create=(self), publickey-credentials-get=(self)` on the signer, and the app delegates both to the signer origin (`(self "https://signer.kokoah.example")`). When replacing the placeholder domains, keep the app's delegation in sync with the real signer origin. `pnpm smoke:browser` verifies both states in Chromium: the fallback when WebAuthn is disabled, and the full PRF flow when it's allowed.
+1. **Passkey mode needs WebAuthn on the signer origin. Done (2026-09-22).** kokoah-infra now sends `publickey-credentials-create=(self), publickey-credentials-get=(self)` on the signer, and the app delegates both to the signer origin (`(self "https://signer.kokoah.example")`). When replacing the placeholder domains, keep the app's delegation in sync with the real signer origin. `public/_headers` is identical to kokoah-infra's copy, and `pnpm build` fails if it drifts or disables WebAuthn again. `pnpm smoke:browser` serves the real header and verifies both states in Chromium: the full PRF flow with the signer's own headers, and the fallback when the app doesn't delegate WebAuthn.
 2. Chrome for Testing 153 logs "Unrecognized feature: 'bluetooth'" and "'browsing-topics'" for the signer `Permissions-Policy`. This is harmless, but noisy in the console.
 3. A staging signer needs its own `_headers` (staging `frame-ancestors`).
 
@@ -231,13 +231,13 @@ Ports can be changed with `DEV_HARNESS_PORT` and `DEV_FRAME_PORT`; `0` picks fre
 
 Two more suites run on demand:
 - `test/integration/` is **read-only** HL testnet `/info` and is skipped unless `HL_INTEGRATION=testnet`.
-- `pnpm smoke:browser` drives headless Chromium over the DevTools protocol, with 24 checks listed in [`scripts/smoke-browser.ts`](scripts/smoke-browser.ts):
+- `pnpm smoke:browser` drives headless Chromium over the DevTools protocol, with 25 checks listed in [`scripts/smoke-browser.ts`](scripts/smoke-browser.ts):
   - the real CSP, Trusted Types and SRI with no violations;
   - HTML sinks and foreign `fetch` blocked;
   - `frame-ancestors` enforced;
   - cross-site `postMessage`;
   - IndexedDB persistence with a non-extractable key;
-  - the passkey fallback under today's headers;
+  - the signer's real `Permissions-Policy` (served unchanged) allowing WebAuthn, and the passkey fallback when the app doesn't delegate it;
   - the full WebAuthn **PRF** flow with a virtual authenticator when WebAuthn is allowed.
 
 ## Manual verification (can't be automated here)
@@ -268,7 +268,6 @@ Two more suites run on demand:
 - **In-frame confirmation for large or out-of-policy orders** (SECURITY_BASELINE §3 asks for it). v1 denies instead.
 - **Tune the baseline limits.** $1M per order, $25M per day and a 10% band are wide backstops.
 - **Clickjacking hardening of the in-frame prompt** (IntersectionObserver v2 visibility checks).
-- **Passkeys are off until kokoah-infra allows WebAuthn** on the signer origin.
 - **User limits aren't persisted by the frame**; the parent re-applies them after each `hello`.
 - **Spot and outcome markets aren't supported** (`UNSUPPORTED_MARKET`).
 - **The shared-library workarounds** listed in `docs/SHARED_ISSUES.md`.

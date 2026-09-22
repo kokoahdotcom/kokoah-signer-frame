@@ -544,7 +544,7 @@ Denials come back as `POLICY_DENIED` with every violation, for example:
 
 **Requirements:**
 - The iframe needs `allow="publickey-credentials-get; publickey-credentials-create"` (the client sets it).
-- The signer's `Permissions-Policy` header must allow those features for `self`. **The current kokoah-infra signer headers disable them**, so today `hello.capabilities.passkey.available` is `false` and `passkey` requests fall back to `device` with a `storageFallbackReason`. See the [README](../README.md#requested-kokoah-infra-changes).
+- The signer's `Permissions-Policy` header must allow those features for `self` (kokoah-infra's signer headers and `public/_headers` do; `pnpm build` fails otherwise), and the app's own `Permissions-Policy` must delegate them to the signer origin. When either is missing, `hello.capabilities.passkey.available` is `false` and `passkey` requests fall back to `device` with a `storageFallbackReason`. See the [README](../README.md#requested-kokoah-infra-changes).
 
 ## 9. Several tabs
 

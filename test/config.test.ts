@@ -1,8 +1,8 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildMetaCsp, FrameConfigError, parseFrameConfig } from "../src/frame/config.js";
-import { addSri, checkHeaders, headersCsp, serializeManifest, sri, validateManifest, type ReleaseManifest } from "../scripts/postbuild.js";
+import { addSri, checkHeaders, headersCsp, headersDrift, parsePermissionsPolicy, serializeManifest, sri, validateManifest, type ReleaseManifest } from "../scripts/postbuild.js";
 import { BUILDER, testConfig } from "./helpers.js";
 
 const base = { VITE_ALLOWED_PARENT_ORIGINS: "https://app.kokoah.example", VITE_BUILDER_ADDRESS: BUILDER, VITE_BUILDER_FEE_TENTHS_BPS: "25" };
@@ -87,6 +87,46 @@ describe("CSP consistency with kokoah-infra/headers", () => {
     expect(checkHeaders(headers, parseFrameConfig(base, { production: true }))).toEqual([]);
     const other = parseFrameConfig({ ...base, VITE_ALLOWED_PARENT_ORIGINS: "https://staging.kokoah.example" }, { production: true });
     expect(checkHeaders(headers, other).join()).toMatch(/does not allow https:\/\/staging/);
+  });
+
+  it("public/_headers allows WebAuthn on the signer origin (passkeys), and checkHeaders fails when it doesn't", () => {
+    const pp = /^\s+Permissions-Policy:\s*(.+)$/m.exec(headers)?.[1] ?? "";
+    const features = parsePermissionsPolicy(pp);
+    expect(features.get("publickey-credentials-create")).toEqual(["self"]);
+    expect(features.get("publickey-credentials-get")).toEqual(["self"]);
+    expect(features.get("camera")).toEqual([]);
+    const disabled = headers.replace("publickey-credentials-create=(self)", "publickey-credentials-create=()").replace("publickey-credentials-get=(self)", "publickey-credentials-get=()");
+    expect(disabled).not.toBe(headers);
+    const p = checkHeaders(disabled, parseFrameConfig(base, { production: true }));
+    expect(p).toHaveLength(2);
+    expect(p.join()).toMatch(/publickey-credentials-create=\(self\)/);
+    expect(p.join()).toMatch(/publickey-credentials-get=\(self\)/);
+  });
+
+  const infraPath = join(process.cwd(), "..", "kokoah-infra", "headers", "cloudflare", "signer", "_headers");
+  it.skipIf(!existsSync(infraPath))("public/_headers matches kokoah-infra's signer _headers", () => {
+    const infra = readFileSync(infraPath, "utf8");
+    expect(headersDrift(headers, infra)).toEqual([]);
+    expect(headers).toBe(infra);
+  });
+
+  it("headersDrift fails on any difference that matters and ignores deployment-specific origins and comments", () => {
+    expect(headersDrift(headers, headers)).toEqual([]);
+    // A staging copy: other app origin and report endpoint, other comments.
+    const staging = headers
+      .replace("frame-ancestors https://app.kokoah.example", "frame-ancestors https://staging.kokoah.example")
+      .replaceAll("https://api.kokoah.example/v1/csp-reports", "https://api.staging.kokoah.example/v1/csp-reports")
+      .replace(/^# .*$/m, "# staging copy");
+    expect(staging).not.toBe(headers);
+    expect(headersDrift(staging, headers)).toEqual([]);
+    // WebAuthn disabled again (the 0.1.0 frame copy): must fail.
+    const noPasskeys = headers.replace("publickey-credentials-get=(self)", "publickey-credentials-get=()");
+    expect(headersDrift(noPasskeys, headers).join()).toMatch(/permissions-policy differs/);
+    // A loosened CSP directive, a dropped header, an extra header, an extra rule.
+    expect(headersDrift(headers.replace("script-src 'self'", "script-src 'self' 'unsafe-eval'"), headers).join()).toMatch(/CSP script-src differs/);
+    expect(headersDrift(headers.replace(/^\s+X-Content-Type-Options: nosniff\n/m, ""), headers).join()).toMatch(/x-content-type-options is missing/);
+    expect(headersDrift(headers.replace("  X-XSS-Protection: 0", "  X-XSS-Protection: 0\n  X-Extra: 1"), headers).join()).toMatch(/x-extra is not set by kokoah-infra/);
+    expect(headersDrift(`${headers}\n/other\n  X-Frame-Options: DENY\n`, headers).join()).toMatch(/rule \/other is not in/);
   });
 });
 

@@ -9,10 +9,14 @@
  * - `frame-ancestors` stops an unlisted origin from embedding the frame;
  * - the parent ↔ frame protocol across two real origins (cross-site iframe), IndexedDB persistence of the device key
  *   (non-extractable CryptoKey) across a reload, Web Locks;
- * - with the infra headers as they are (Permissions-Policy disables WebAuthn) passkeys are reported unavailable and
- *   `passkey` falls back to `device`;
- * - with WebAuthn allowed on the signer origin, the full passkey flow with a **virtual authenticator that supports
- *   PRF**: create → sign → lock → unlock (passkey assertion) → sign; after a reload the key is locked.
+ * - the signer's real `public/_headers` Permissions-Policy (served unchanged) allows WebAuthn: the full passkey flow
+ *   with a **virtual authenticator that supports PRF**: create → sign → lock → unlock (passkey assertion) → sign; after
+ *   a reload the key is locked;
+ * - when the app doesn't delegate WebAuthn (its own Permissions-Policy disables it), passkeys are reported unavailable
+ *   and `passkey` falls back to `device`.
+ *
+ * The frame is served with `public/_headers` as built; the only changes are origins: `frame-ancestors` and
+ * `connect-src` name the local test origins instead of the production placeholders (and HSTS is dropped on http).
  *
  * Nothing talks to Hyperliquid: the frame is built with its HL API pointed at a local mock (dev/mock-hl.ts) that
  * verifies signatures. All servers listen on ephemeral 127.0.0.1/localhost ports and are closed at the end.
@@ -167,6 +171,10 @@ async function main(): Promise<number> {
         const path = (req.url ?? "/").split("?")[0] as string;
         const known = parentFiles[path];
         if (known) {
+          // An app that doesn't delegate WebAuthn to the signer (the fallback case): its own policy disables it.
+          if (path === "/" && new URL(req.url ?? "/", "http://x").searchParams.has("nowebauthn")) {
+            res.setHeader("permissions-policy", "publickey-credentials-create=(), publickey-credentials-get=()");
+          }
           res.setHeader("content-type", known[0]);
           res.end(known[1]);
           return;
@@ -185,7 +193,7 @@ async function main(): Promise<number> {
 
     // Build the frame for these origins (development-mode config: http loopback origins + HL API override).
     let frameDist = "";
-    const frameHandler = (webauthn: boolean) => (req: IncomingMessage, res: ServerResponse) => {
+    const frameHandler = (req: IncomingMessage, res: ServerResponse) => {
       const path = (req.url ?? "/").split("?")[0] as string;
       const file = join(frameDist, path === "/" ? "index.html" : path);
       if (!file.startsWith(frameDist) || !existsSync(file) || path.includes("..") || path.endsWith("_headers")) {
@@ -199,17 +207,15 @@ async function main(): Promise<number> {
           // Only substitutions: the smoke origins instead of the production placeholders.
           v = v.replace(/frame-ancestors [^;]+/, `frame-ancestors ${parent.origin}`).replace(/connect-src ([^;]+)/, `connect-src $1 ${parent.origin}`);
         }
-        if (k.toLowerCase() === "permissions-policy" && webauthn) {
-          v = v.replace("publickey-credentials-create=()", "publickey-credentials-create=(self)").replace("publickey-credentials-get=()", "publickey-credentials-get=(self)");
-        }
+        // Every other header (Permissions-Policy included) is served exactly as public/_headers has it.
         if (k.toLowerCase() === "strict-transport-security") continue; // meaningless on http://localhost
         res.setHeader(k, v);
       }
       res.setHeader("content-type", MIME[extname(file)] ?? "application/octet-stream");
       res.end(readFileSync(file));
     };
-    const frameA = await listen(frameHandler(false), "localhost");
-    const frameB = await listen(frameHandler(true), "localhost");
+    const frameA = await listen(frameHandler, "localhost");
+    const frameB = await listen(frameHandler, "localhost");
     servers.push(frameA.server, frameB.server);
     const evil = await listen((req, res) => {
       const path = (req.url ?? "/").split("?")[0] as string;
@@ -310,9 +316,10 @@ async function main(): Promise<number> {
       }
       throw new Error(`timeout waiting for ${expression}`);
     };
-    const open = async (frameUrl: string) => {
+    const open = async (frameUrl: string, options: { delegateWebAuthn?: boolean } = {}) => {
       problems.length = 0;
-      await c.send("Page.navigate", { url: `${parent.origin}/?frame=${encodeURIComponent(frameUrl)}` }, page);
+      const nowebauthn = options.delegateWebAuthn === false ? "&nowebauthn=1" : "";
+      await c.send("Page.navigate", { url: `${parent.origin}/?frame=${encodeURIComponent(frameUrl)}${nowebauthn}` }, page);
       await waitUntil("window.smokeReady === true");
     };
     const waitFrameSession = async (origin: string): Promise<string> => {
@@ -348,12 +355,19 @@ async function main(): Promise<number> {
     };
     const intent = (price = "1990") => JSON.stringify({ kind: "order", coin: "ETH", side: "buy", orderType: "limit", size: "0.01", price, origin: "manual" });
 
-    // ---------------------------------------------------------------- Frame A: infra headers as they are.
-    await open(`${frameA.origin}/`);
+    // ---------------------------------------------------------------- Frame A: an app that doesn't delegate WebAuthn.
+    const servedPolicy = (await fetch(`${frameA.origin}/`)).headers.get("permissions-policy") ?? "";
+    const filePolicy = /^\s+Permissions-Policy:\s*(.+)$/m.exec(readFileSync(join(root, "public", "_headers"), "utf8"))?.[1]?.trim() ?? "";
+    check(
+      "the signer serves public/_headers' Permissions-Policy unchanged, WebAuthn allowed for self",
+      servedPolicy === filePolicy && /publickey-credentials-create=\(self\)/.test(servedPolicy) && /publickey-credentials-get=\(self\)/.test(servedPolicy),
+      servedPolicy,
+    );
+    await open(`${frameA.origin}/`, { delegateWebAuthn: false });
     const hello = await evaluate<{ network: string; builder: { address: string }; frameOrigin: string; capabilities: { passkey: { available: boolean; reason?: string }; webLocks: boolean; indexedDB: boolean; storageModes: string[] } }>("signer.hello()");
     check("hello over a real cross-site iframe (network, builder, origin)", hello.network === "testnet" && hello.builder.address === BUILDER && hello.frameOrigin === frameA.origin, hello);
     check("Web Locks and IndexedDB available in the frame", hello.capabilities.webLocks && hello.capabilities.indexedDB, hello.capabilities);
-    check("infra Permissions-Policy (WebAuthn off) → passkey reported unavailable", !hello.capabilities.passkey.available && /Permissions-Policy/.test(hello.capabilities.passkey.reason ?? ""), hello.capabilities.passkey);
+    check("app Permissions-Policy without WebAuthn → passkey reported unavailable", !hello.capabilities.passkey.available && /Permissions-Policy/.test(hello.capabilities.passkey.reason ?? ""), hello.capabilities.passkey);
     const createdA = await evaluate<{ agentAddress: string; storageMode: string; storageFallbackReason?: string; approveAgent: { typedData: unknown } }>(
       `signer.createAgent({ userAddress: ${JSON.stringify(mainWallet.address)}, validForDays: 30, storageMode: "passkey" })`,
     );
@@ -389,7 +403,7 @@ async function main(): Promise<number> {
 
     // Reload: device key restored from IndexedDB.
     problems.length = 0;
-    await open(`${frameA.origin}/`);
+    await open(`${frameA.origin}/`, { delegateWebAuthn: false });
     await evaluate("signer.hello()");
     const afterReload = await evaluate<{ hasKey: boolean; keyState: string; locked: boolean; agentAddress: string }>("signer.getStatus()");
     check("device key survives a reload (IndexedDB) and stays unlocked", afterReload.hasKey && afterReload.keyState === "active" && !afterReload.locked && afterReload.agentAddress === createdA.agentAddress, afterReload);
@@ -409,11 +423,11 @@ async function main(): Promise<number> {
     check("frame-ancestors refuses an unlisted embedding origin", problems.some((p) => /frame-ancestors/.test(p)), problems);
     await c.send("Target.closeTarget", { targetId: evilTarget });
 
-    // ---------------------------------------------------------------- Frame B: WebAuthn allowed (requested infra change).
+    // ---------------------------------------------------------------- Frame B: the real headers, WebAuthn delegated by the app.
     problems.length = 0;
     await open(`${frameB.origin}/`);
     const helloB = await evaluate<{ capabilities: { passkey: { available: boolean; prf: string }; storageModes: string[] } }>("signer.hello()");
-    check("with WebAuthn allowed, passkey is available", helloB.capabilities.passkey.available && helloB.capabilities.storageModes[0] === "passkey", helloB.capabilities.passkey);
+    check("with the real signer headers, passkey is available", helloB.capabilities.passkey.available && helloB.capabilities.storageModes[0] === "passkey", helloB.capabilities.passkey);
     const fb = await waitFrameSession(frameB.origin);
     await evaluate(`window.creating = signer.createAgent({ userAddress: ${JSON.stringify(mainWallet.address)}, validForDays: 30, storageMode: "passkey" }).then((r) => ({ ok: r }), (e) => ({ err: e.code + ": " + e.message })); true`);
     await waitUntil("!signer.iframe.hidden");
