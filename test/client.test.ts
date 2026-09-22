@@ -1,18 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { KokoahSignerClient, SignerRequestError } from "../src/client/index.js";
 import { PROTOCOL_NAME, PROTOCOL_VERSION } from "../src/protocol/index.js";
-import { FRAME_ORIGIN, FrameHarness, limitOrder, MockPasskeys, testConfig, USER, waitFor } from "./helpers.js";
+import { DAY, FRAME_ORIGIN, FrameHarness, limitOrder, MockPasskeys, testConfig, USER, waitFor, type HarnessOptions } from "./helpers.js";
 
 const FRAME_URL = `${FRAME_ORIGIN}/`;
+const appConfig = () => testConfig({ VITE_ALLOWED_PARENT_ORIGINS: window.location.origin }, false);
 const cleanups: Array<() => void> = [];
 afterEach(() => {
   for (const c of cleanups.splice(0)) c();
 });
 
 /** Connects a real client (parent side) to a real FrameCore (frame side) through jsdom message events. */
-async function connected(options: { passkeys?: MockPasskeys; clientOptions?: Partial<ConstructorParameters<typeof KokoahSignerClient>[0]> } = {}) {
+async function connected(options: { passkeys?: MockPasskeys; harness?: HarnessOptions; clientOptions?: Partial<ConstructorParameters<typeof KokoahSignerClient>[0]> } = {}) {
   const appOrigin = window.location.origin;
-  const h = await FrameHarness.create({ config: testConfig({ VITE_ALLOWED_PARENT_ORIGINS: appOrigin }, false), ...(options.passkeys ? { passkeys: options.passkeys } : {}) });
+  const h = await FrameHarness.create({ config: appConfig(), ...options.harness, ...(options.passkeys ? { passkeys: options.passkeys } : {}) });
   const client = new KokoahSignerClient({ frameUrl: FRAME_URL, helloTimeoutMs: 3_000, ...options.clientOptions });
   const frameWindow = client.iframe.contentWindow as Window;
   const sentByClient: Array<{ message: unknown; targetOrigin: string }> = [];
@@ -114,6 +115,21 @@ describe("KokoahSignerClient", () => {
       { visible: true, kind: "passkey-create" },
       { visible: false, kind: null },
     ]);
+  });
+
+  it("listeners registered before hello() receive the events the frame emits right after hello", async () => {
+    // A device key that expires in 5 days, stored by an earlier frame load.
+    const first = await FrameHarness.create();
+    const { address, validUntil } = await first.activeAgent("device", 5);
+    first.destroy();
+    const { client } = await connected({ harness: { idb: first.idb, clock: first.clock, hl: first.hl } });
+    const expiring: unknown[] = [];
+    client.on("keyExpiringSoon", (e) => expiring.push(e));
+    const hello = await client.hello();
+    expect(expiring).toEqual([{ agentAddress: address, validUntil, msRemaining: 5 * DAY }]);
+    // And the hello result carries the same state for an app that subscribes later.
+    expect(hello.status).toMatchObject({ agentAddress: address, keyState: "active", expiringSoon: true, expired: false, expiresAt: validUntil - 15_000 });
+    expect((await client.getStatus()).expiringSoon).toBe(true);
   });
 
   it("ignores messages from other origins or windows", async () => {

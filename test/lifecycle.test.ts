@@ -121,6 +121,36 @@ describe("expiry", () => {
     expect(later.events("keyExpiringSoon")).toHaveLength(1);
   });
 
+  it("getStatus and hello expose the expiry state, so an app that missed the events still knows", async () => {
+    const h = await frame();
+    await h.ok("hello", { protocolVersion: 1 });
+    expect(await h.ok("getStatus")).toMatchObject({ hasKey: false, expiresAt: null, expiringSoon: false, expired: false });
+
+    const { validUntil } = await h.activeAgent("device", 5);
+    expect(await h.ok("getStatus")).toMatchObject({ keyState: "active", validUntil, expiresAt: validUntil - 15_000, expiringSoon: true, expired: false });
+
+    // A reload: the new frame emits keyExpiringSoon right after hello, before a late parent listens. The hello result
+    // and every later status still say so.
+    const again = await frame({ idb: h.idb, clock: h.clock, hl: h.hl });
+    const hello = await again.ok("hello", { protocolVersion: 1 });
+    expect(hello.status).toMatchObject({ hasKey: true, keyState: "active", expiresAt: validUntil - 15_000, expiringSoon: true, expired: false });
+    expect(again.events("keyExpiringSoon")).toHaveLength(1);
+    expect((await again.ok("getStatus")).expiringSoon).toBe(true);
+    expect((await again.ok("hello", { protocolVersion: 1 })).status.expiringSoon).toBe(true);
+
+    again.clock.advance(5 * DAY - 15_000);
+    const expired = await again.ok("getStatus");
+    expect(expired).toMatchObject({ keyState: "expired", expiringSoon: false, expired: true });
+    const helloExpired = await (await frame({ idb: h.idb, clock: h.clock, hl: h.hl })).ok("hello", { protocolVersion: 1 });
+    expect(helloExpired.status).toMatchObject({ keyState: "expired", expired: true, expiringSoon: false });
+
+    const fresh = await frame();
+    await fresh.activeAgent("device", 30);
+    expect(await fresh.ok("getStatus")).toMatchObject({ expiringSoon: false, expired: false });
+    fresh.clock.advance(23 * DAY + 1);
+    expect((await fresh.ok("getStatus")).expiringSoon).toBe(true);
+  });
+
   it("an expired key can be replaced without replaceExisting", async () => {
     const h = await frame();
     await h.activeAgent("device", 1);

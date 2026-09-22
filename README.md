@@ -153,16 +153,19 @@ These aren't in this repo's power; they are for the kokoah-infra owners.
    import { KokoahSignerClient, SignerRequestError } from "@kokoah/signer-frame/client";
    export const signer = new KokoahSignerClient({ frameUrl: import.meta.env.VITE_SIGNER_FRAME_URL });
    ```
-3. **Handshake and refuse to trade on any mismatch:**
+3. **Subscribe to events first, then handshake, and refuse to trade on any mismatch:**
    ```ts
+   signer.on("statusChanged", setSignerStatus);          // before hello: keyExpiringSoon/keyExpired fire right after it
+   signer.on("keyExpiringSoon", showRenewBanner);
    const hello = await signer.hello();
+   setSignerStatus(hello.status);                         // status.expiringSoon / status.expired / status.expiresAt
    const ok = hello.network === env.VITE_HL_NETWORK
      && hello.builder.address === publicConfig.builder.address.toLowerCase()
      && hello.builder.feeTenthsBps === publicConfig.builder.feeTenthsBps;
    ```
 4. **Events.**
    - `statusChanged`: key state for the banners in §B6.1.
-   - `keyExpiringSoon` / `keyExpired`: renew banner.
+   - `keyExpiringSoon` / `keyExpired`: renew banner. They fire once per key per frame load; `hello.status` and `getStatus()` carry the same state (`expiringSoon`, `expired`, `expiresAt`), so drive the banner from the status.
    - `promptChanged`: while `visible`, the iframe **must be shown and clickable**. The client unhides it and sets `data-kokoah-signer-prompt`; style it as a modal:
      ```css
      iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min(420px, 92vw); height: 240px; border: 0; border-radius: 12px; z-index: 1000; box-shadow: 0 10px 40px rgb(0 0 0 / 0.5); }

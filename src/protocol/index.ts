@@ -165,6 +165,18 @@ export interface SignerStatus {
   userAddress: Hex | null;
   /** Expiry of the agent (ms since epoch), as approved on Hyperliquid. */
   validUntil: number | null;
+  /**
+   * When the frame stops signing with this key (ms since epoch, on the frame's HL-corrected clock): `validUntil` minus
+   * the `expiresAfter` window (15 s). Null without a key.
+   */
+  expiresAt: number | null;
+  /**
+   * The key expires within 7 days and hasn't expired yet: show the renew banner. Same condition as the
+   * `keyExpiringSoon` event, which is emitted only once per key, so read this instead of relying on the event.
+   */
+  expiringSoon: boolean;
+  /** The key has expired (`keyState: "expired"`); the frame refuses to sign. Same condition as `keyExpired`. */
+  expired: boolean;
   storageMode: StorageMode | null;
   /** True when a key exists but is not in memory (passkey mode after a reload, or after `lock`). */
   locked: boolean;
@@ -208,6 +220,11 @@ export interface HelloResult {
     broadcastChannel: boolean;
   };
   builder: { address: Hex; feeTenthsBps: number };
+  /**
+   * The frame's status at the handshake (key state, `expiringSoon`/`expired`, policy), so the app knows the key's
+   * state without depending on events it may not have subscribed to yet.
+   */
+  status: SignerStatus;
   limits: {
     maxMessageBytes: number;
     minValidForDays: number;

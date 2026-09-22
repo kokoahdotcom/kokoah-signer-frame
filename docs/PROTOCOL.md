@@ -67,7 +67,7 @@ parent                                     frame (iframe, other origin)
 - Until `hello` succeeds, every other method answers `NOT_CONNECTED`.
 - `hello` may be repeated; it is idempotent.
 - The frame buffers messages that arrive while it is still starting, so sending `hello` right after the iframe's `load` event is safe. `KokoahSignerClient` also retries `hello`.
-- After `hello`, the frame immediately emits `keyExpiringSoon` or `keyExpired` if they apply.
+- After `hello`, the frame immediately emits `keyExpiringSoon` or `keyExpired` if they apply. These are emitted once per key per frame load, so **register listeners before calling `hello`** (`client.on()` works before the handshake). The same state is in `hello.status` and `getStatus` (`expiringSoon`, `expired`, `expiresAt`): an app that subscribed late reads it from there.
 
 ## 3. The client
 
@@ -75,13 +75,16 @@ parent                                     frame (iframe, other origin)
 import { KokoahSignerClient, SignerRequestError } from "@kokoah/signer-frame/client";
 
 const signer = new KokoahSignerClient({ frameUrl: import.meta.env.VITE_SIGNER_FRAME_URL }); // creates a hidden iframe
+// Subscribe first: the frame emits keyExpiringSoon / keyExpired right after hello.
+signer.on("statusChanged", (status) => store.setSignerStatus(status));
+signer.on("keyExpiringSoon", () => ui.showRenewBanner());
+signer.on("promptChanged", ({ visible, kind }) => ui.setSignerPromptOpen(visible, kind));
 const hello = await signer.hello();
 if (hello.network !== config.network || hello.builder.address !== publicConfig.builder.address
     || hello.builder.feeTenthsBps !== publicConfig.builder.feeTenthsBps) {
   // refuse to trade: configuration error
 }
-signer.on("statusChanged", (status) => store.setSignerStatus(status));
-signer.on("promptChanged", ({ visible, kind }) => ui.setSignerPromptOpen(visible, kind));
+store.setSignerStatus(hello.status);                 // includes expiringSoon / expired
 ```
 
 | Member | Notes |
@@ -144,6 +147,7 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
     "broadcastChannel": true
   },
   "builder": { "address": "0x…builder", "feeTenthsBps": 25 },
+  "status": { "hasKey": true, "keyState": "active", "expiringSoon": true, "expired": false, "…": "SignerStatus, see getStatus" },
   "limits": { "maxMessageBytes": 65536, "minValidForDays": 1, "maxValidForDays": 30, "expiresAfterMs": 15000, "maxAgentNameLength": 16 }
 }
 ```
@@ -151,6 +155,7 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
 - **Required check:** compare `network` with the app's network and `builder` with `public-config`. **Refuse to trade on any mismatch** (FRONTEND_IMPLEMENTATION §B3.1, §B6.3).
 - `capabilities.passkey.available` is false when WebAuthn is missing or blocked in the frame, with a `reason`, for example `"WebAuthn is blocked by Permissions-Policy in the signer frame"`. `prf` is `"unknown"` when the browser can't say without a ceremony.
 - `storageModes` lists what can work here. Offer only those, in that order of preference.
+- `status` is the frame's `SignerStatus` at the handshake (see `getStatus`), including the key's expiry state.
 - Errors: `UNSUPPORTED_VERSION`.
 
 ### `getStatus`
@@ -166,6 +171,9 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
   "agentName": "kokoah-web",
   "userAddress": "0x11…user",
   "validUntil": 1792670400000,
+  "expiresAt": 1792670385000,
+  "expiringSoon": false,
+  "expired": false,
   "storageMode": "device",
   "locked": false,
   "network": "testnet",
@@ -186,6 +194,8 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
 | `expired` | At or after `validUntil − 15 s` | Renew: `createAgent({ replaceExisting: true })` |
 
 - `locked` is true when a key exists but isn't in memory: a passkey key after a reload, or any stored key after `lock`.
+- `expiresAt` is when the frame stops signing with the key: `validUntil − 15 s` (the `expiresAfter` window), on the frame's HL-corrected clock. `null` without a key.
+- `expiringSoon` is true when the key expires within 7 days and hasn't expired: show the renew banner. `expired` is true when `keyState` is `expired`. They are the same conditions as the `keyExpiringSoon` and `keyExpired` events, which fire only once per key; use these fields as the source of truth.
 - `clockOffsetMs` is the HL server time minus the device time, measured by the frame with `exchangeStatus`. Show a clock-skew warning when it is large (spec §22.3).
 
 ### `createAgent`
@@ -444,8 +454,8 @@ Allowed variables:
 |---|---|---|
 | `ready` | `{ protocolVersion: 1 }` | Once, when the frame has started |
 | `statusChanged` | `SignerStatus` | Key created, confirmed, locked, unlocked, revoked, expired, changed in another tab; limits changed |
-| `keyExpiringSoon` | `{ agentAddress, validUntil, msRemaining }` | Once per key, when it expires within 7 days (after `hello`, and on a timer). Show the renew banner |
-| `keyExpired` | `{ agentAddress, validUntil }` | Once per key, at `validUntil − 15 s`. The frame refuses to sign from then on |
+| `keyExpiringSoon` | `{ agentAddress, validUntil, msRemaining }` | Once per key per frame load, when it expires within 7 days (right after `hello`, and on a timer). Show the renew banner. Also in `status.expiringSoon` |
+| `keyExpired` | `{ agentAddress, validUntil }` | Once per key per frame load, at `validUntil − 15 s`. The frame refuses to sign from then on. Also in `status.expired` |
 | `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true** |
 
 Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event": "promptChanged", "data": { "visible": true, "kind": "passkey-unlock" } }`

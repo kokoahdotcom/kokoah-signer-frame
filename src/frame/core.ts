@@ -374,16 +374,23 @@ export class FrameCore {
     return key.meta.keyState;
   }
 
-  /** Current status (also the `statusChanged` payload). */
+  /** Current status (also the `statusChanged` payload and part of the `hello` result). */
   status(): SignerStatus {
     const k = this.key;
+    const now = this.correctedNow();
+    const keyState = this.keyStateOf(k, now);
+    const expired = keyState === "expired";
     return {
       hasKey: k !== null,
-      keyState: this.keyStateOf(k),
+      keyState,
       agentAddress: k?.meta.agentAddress ?? null,
       agentName: k?.meta.agentName ?? null,
       userAddress: k?.meta.userAddress ?? null,
       validUntil: k?.meta.validUntil ?? null,
+      expiresAt: k ? k.meta.validUntil - EXPIRES_AFTER_MS : null,
+      // Same conditions as checkExpiry's keyExpiringSoon / keyExpired events.
+      expiringSoon: k !== null && !expired && k.meta.validUntil - now <= EXPIRING_SOON_MS,
+      expired,
       storageMode: k?.meta.storageMode ?? null,
       locked: k !== null && k.account === null,
       network: this.config.network.name,
@@ -601,6 +608,7 @@ export class FrameCore {
         broadcastChannel: Boolean(this.deps.broadcast),
       },
       builder: { address: this.config.builder.address, feeTenthsBps: this.config.builder.feeTenthsBps },
+      status: this.status(),
       limits: {
         maxMessageBytes: MAX_MESSAGE_BYTES,
         minValidForDays: MIN_VALID_FOR_DAYS,
