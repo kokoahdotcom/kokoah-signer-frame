@@ -37,6 +37,7 @@ import {
   type RevokeResult,
   type SetLimitsParams,
   type SetLimitsResult,
+  type SetStorageModeParams,
   type SetThemeParams,
   type SetThemeResult,
   type SignAndSubmitParams,
@@ -96,7 +97,7 @@ export interface KokoahSignerClientOptions {
   container?: HTMLElement;
   /** Default request timeout (ms). Default 30 000. */
   requestTimeoutMs?: number;
-  /** Timeout for requests that may wait for the user in the frame (`unlock`, passkey `createAgent`). Default 300 000. */
+  /** Timeout for requests that may wait for the user in the frame (`unlock`, `setStorageMode`, passkey `createAgent`). Default 300 000. */
   interactiveTimeoutMs?: number;
   /** How long `hello()` keeps trying to reach the frame (ms). Default 15 000. */
   helloTimeoutMs?: number;
@@ -264,6 +265,14 @@ export class KokoahSignerClient {
   /** Wipes this device's key and returns `revokeAgent` typed data for the main wallet to sign and the app to post. */
   revoke(params: RevokeParams = {}): Promise<RevokeResult> {
     return this.request("revoke", params);
+  }
+
+  /**
+   * Re-wraps the stored key under another mode (`passkey` ⇄ `device`) with no new wallet signature. The frame shows
+   * one passkey prompt either way: keep the iframe visible while `promptChanged.visible`.
+   */
+  setStorageMode(params: SetStorageModeParams): Promise<SignerStatus> {
+    return this.request("setStorageMode", params, this.options.interactiveTimeoutMs);
   }
 
   /** Sets the frame's CSS custom properties (`--ks-*`) and color scheme. */

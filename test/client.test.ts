@@ -95,6 +95,7 @@ describe("KokoahSignerClient", () => {
     expect((await client.setTheme({ variables: { "--ks-accent": "#00ff00" } })).applied).toEqual(["--ks-accent"]);
     expect((await client.lock()).locked).toBe(true);
     expect((await client.unlock()).locked).toBe(false);
+    expect((await client.setStorageMode({ to: "device" })).storageMode).toBe("device");
     const revoked = await client.revoke();
     expect(revoked.wiped).toBe(true);
     expect(revoked.revokeAgent.typedData.primaryType).toBe("HyperliquidTransaction:ApproveAgent");

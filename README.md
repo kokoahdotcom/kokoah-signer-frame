@@ -37,8 +37,8 @@ This repo also ships **`KokoahSignerClient`**, the typed, dependency-free client
   - 60 orders a minute (persisted);
   - `expiresAfter` = now + 15 s.
 - **Keys.**
-  - Named agent `kokoah-web` with `valid_until` ≤ 30 days; a fresh key every time, never reused.
-  - Stored as `session` (memory only), `device` (AES-GCM with a **non-extractable** key in IndexedDB) or `passkey` (WebAuthn PRF → HKDF → AES-GCM; unlocking needs user verification: the device PIN or biometric).
+  - A named agent (default `kokoah-web`; the app gives each device its own name, e.g. `kokoah-a1b2`) with `valid_until` ≤ 30 days; a fresh key every time, never reused.
+  - Stored as `device` (the default: AES-GCM with a **non-extractable** key in IndexedDB), `passkey` (WebAuthn PRF → HKDF → AES-GCM; unlocking needs user verification: the device PIN or biometric) or `session` (memory only). `setStorageMode` moves an existing key between `device` and `passkey` with no new approval.
   - `device` protects against offline theft of the storage files, **not** against script running on the signer origin. The origin's deploy integrity is the real trust anchor (see the threat model).
 - **Nonces.** `max(now + HL clock offset, last + 1)`, serialized per agent with Web Locks and reserved atomically in IndexedDB, so tabs can't collide.
 - **Hardening.**

@@ -83,6 +83,9 @@ export const PARAMS_SCHEMAS = {
     agentName: v.optional(AgentName),
     signatureChainId: v.optional(ChainIdHex),
   }),
+  setStorageMode: v.strictObject({
+    to: v.picklist(["passkey", "device"]),
+  }),
   setTheme: v.strictObject({
     variables: v.optional(v.record(v.picklist(THEME_VARIABLES), v.pipe(v.string(), v.maxLength(120)))),
     colorScheme: v.optional(v.picklist(["light", "dark", "light dark"])),
