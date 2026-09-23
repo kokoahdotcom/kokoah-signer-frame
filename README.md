@@ -32,7 +32,7 @@ This repo also ships **`KokoahSignerClient`**, the typed, dependency-free client
   - trading actions only;
   - builder required;
   - no `vaultAddress`;
-  - 10% price band against HL's mark;
+  - price band against HL's mark: 10% for orders that execute now (market, IOC, marketable limits), 50% for resting limits and untriggered triggers;
   - market-maximum leverage;
   - 60 orders a minute (persisted);
   - `expiresAfter` = now + 15 s.
