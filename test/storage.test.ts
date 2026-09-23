@@ -272,6 +272,80 @@ describe("passkey storage (mocked WebAuthn PRF)", () => {
   });
 });
 
+describe("setStorageMode (passkey protection without a new approveAgent)", () => {
+  it("device → passkey re-wraps the same key with one prompt; after a reload it is locked and unlocks with the passkey", async () => {
+    const passkeys = new MockPasskeys();
+    const a = await frame({ passkeys });
+    const { address, privateKey } = await a.activeAgent("device");
+    const approvals = a.hl.exchangeCalls.length;
+    const changing = a.ok("setStorageMode", { to: "passkey" });
+    await waitFor(() => a.events("promptChanged").some((e) => e.visible && e.kind === "passkey-create"));
+    await a.clickPrompt();
+    const status = await changing;
+    expect(status).toMatchObject({ storageMode: "passkey", keyState: "active", locked: false, agentAddress: address });
+    expect(passkeys.createCalls).toHaveLength(1);
+    expect(a.hl.exchangeCalls).toHaveLength(approvals);
+    const rec = await (await IdbSignerStore.open(a.idb)).getKeyRecord();
+    expect(rec).toMatchObject({ storageMode: "passkey", agentAddress: address, keyState: "active" });
+    expect(rec?.deviceKey).toBeUndefined();
+    expect(containsBytes(rec, Buffer.from(privateKey.slice(2), "hex"))).toBe(false);
+    // Still unlocked in this tab.
+    expect((await a.ok("signAndSubmit", { requestId: "s0", intent: limitOrder() })).status).toBe("ok");
+    a.destroy();
+
+    const b = await frame({ idb: a.idb, clock: a.clock, hl: a.hl, passkeys });
+    await b.ok("hello", { protocolVersion: 1 });
+    expect(await b.ok("getStatus")).toMatchObject({ locked: true, storageMode: "passkey", agentAddress: address });
+    const unlocking = b.ok("unlock");
+    await b.clickPrompt();
+    expect((await unlocking).locked).toBe(false);
+    expect((await b.ok("signAndSubmit", { requestId: "s1", intent: limitOrder() })).status).toBe("ok");
+  });
+
+  it("passkey → device removes the protection with one prompt; after a reload it unlocks silently", async () => {
+    const passkeys = new MockPasskeys();
+    const a = await frame({ passkeys });
+    const { address } = await a.activeAgent("passkey");
+    const changing = a.ok("setStorageMode", { to: "device" });
+    await waitFor(() => a.root?.querySelector(".ks-title")?.textContent === "Remove passkey protection");
+    await a.clickPrompt();
+    expect(await changing).toMatchObject({ storageMode: "device", locked: false, agentAddress: address });
+    a.destroy();
+    const b = await frame({ idb: a.idb, clock: a.clock, hl: a.hl, passkeys });
+    await b.ok("hello", { protocolVersion: 1 });
+    expect(await b.ok("getStatus")).toMatchObject({ locked: false, storageMode: "device", agentAddress: address, keyState: "active" });
+  });
+
+  it("is a no-op for the current mode, refuses session keys, and keeps the device key when the user cancels", async () => {
+    const passkeys = new MockPasskeys();
+    const a = await frame({ passkeys });
+    await a.activeAgent("device");
+    expect((await a.ok("setStorageMode", { to: "device" })).storageMode).toBe("device");
+    const cancelled = a.request("setStorageMode", { to: "passkey" });
+    await a.clickPrompt("cancel");
+    const r = await cancelled;
+    expect(!r.ok && r.error.code).toBe("USER_CANCELLED");
+    expect((await (await IdbSignerStore.open(a.idb)).getKeyRecord())?.storageMode).toBe("device");
+    expect((await a.ok("getStatus")).storageMode).toBe("device");
+
+    const s = await frame({ passkeys });
+    await s.activeAgent("session");
+    expect((await s.fail("setStorageMode", { to: "passkey" })).code).toBe("STORAGE_FAILED");
+    const none = await frame({ passkeys });
+    await none.ok("hello", { protocolVersion: 1 });
+    expect((await none.fail("setStorageMode", { to: "passkey" })).code).toBe("NO_KEY");
+    expect((await none.fail("setStorageMode", { to: "session" } as never)).code).toBe("INVALID_REQUEST");
+  });
+
+  it("reports PASSKEY_UNAVAILABLE when passkeys can't be used", async () => {
+    const passkeys = new MockPasskeys();
+    passkeys.supportResult = { available: false, prf: "unknown", reason: "WebAuthn is not available in this browser" };
+    const a = await frame({ passkeys });
+    await a.activeAgent("device");
+    expect((await a.fail("setStorageMode", { to: "passkey" })).code).toBe("PASSKEY_UNAVAILABLE");
+  });
+});
+
 describe("WebAuthnPasskeyProvider", () => {
   /** A window whose navigator.credentials records the options it receives. */
   function fakeWindow() {

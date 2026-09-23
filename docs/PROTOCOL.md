@@ -229,8 +229,8 @@ Creates a **fresh** key (never reused; the frame refuses an address it has gener
 |---|---|
 | `userAddress` | Master account (the main wallet), 20-byte hex |
 | `validForDays` | Integer 1–30 |
-| `storageMode` | `passkey` \| `device` \| `session` ([§8](#8-key-storage-and-passkeys)) |
-| `agentName` | Optional, 1–16 of `A–Z a–z 0–9 . _ -`, not containing `valid_until`. Default `kokoah-web` |
+| `storageMode` | `passkey` \| `device` \| `session` ([§8](#8-key-storage-and-passkeys)). `device` is the recommended default: it survives reloads with no prompt. Offer `passkey` as an opt-in upgrade (`setStorageMode`) |
+| `agentName` | Optional, 1–16 of `A–Z a–z 0–9 . _ -`, not containing `valid_until`. Default `kokoah-web`. Hyperliquid allows 3 named agents per account, and approving a name again replaces that agent: give each device its own name (e.g. `kokoah-a1b2`) so enabling a second device doesn't cut off the first |
 | `signatureChainId` | Optional hex chain id of the main wallet's current chain. Default: the network's default (`0x66eee` testnet, `0xa4b1` mainnet). Browser wallets usually want their connected chain |
 | `replaceExisting` | Required (`true`) when a non-expired key exists. The old key is **wiped** when the new one is created; trading resumes after the new one is confirmed |
 
@@ -315,6 +315,30 @@ The frame itself asks Hyperliquid (`info extraAgents` for `userAddress`) whether
 - Drops the key from memory. Stored keys stay stored.
 - A `session` key is **discarded** (it can't be unlocked again).
 - An in-flight `signAndSubmit` that hasn't signed yet fails with `KEY_CHANGED`.
+
+### `setStorageMode`
+
+Changes how the **existing** stored key is protected, with **no new `approveAgent`** (same key, same agent, no wallet
+signature). This is how the app offers passkey protection as an optional upgrade after enabling trading with `device`.
+
+→ `{ "to": "passkey" }` or `{ "to": "device" }`
+
+← `SignerStatus` with the new `storageMode`.
+
+- `device` → `passkey`: the frame decrypts the stored key with its device key, then shows its passkey prompt (one click,
+  one biometric), creates a passkey and re-encrypts the key under its PRF secret. The device-key record is replaced. A
+  key that is unlocked in this tab stays unlocked; after a reload it is locked until `unlock`.
+- `passkey` → `device`: the frame shows its prompt ("Remove passkey protection"), decrypts the key with the passkey and
+  re-encrypts it under a new non-extractable device key. After a reload it unlocks silently.
+- The secret is always read from the stored ciphertext, never from memory, and wiped after use. Other tabs get
+  `statusChanged` with the new mode.
+- Same mode: returns the status at once. Keep the iframe visible while `promptChanged.visible` is true.
+- Errors:
+  - `NO_KEY` (no key, or its stored copy is gone);
+  - `STORAGE_FAILED` (a `session` key, or no IndexedDB: create a new key instead);
+  - `PASSKEY_UNAVAILABLE` (WebAuthn blocked or no PRF), `PASSKEY_FAILED`, `UNLOCK_FAILED`;
+  - `USER_CANCELLED`, `USER_TIMEOUT`, `PROMPT_BUSY` (nothing changed);
+  - `KEY_CHANGED`.
 
 ### `signAndSubmit`
 
@@ -569,6 +593,7 @@ Denials come back as `POLICY_DENIED` with every violation, for example:
 - The frame emits `promptChanged {visible: true}`, shows a short text and two buttons ("Create passkey"/"Unlock with passkey", and "Cancel"), and hides them afterwards.
 - Some authenticators return the PRF secret only on an assertion. The frame then asks for a second click ("Confirm your passkey").
 - Renewing a passkey key reuses the existing passkey credential.
+- `setStorageMode` moves an existing key between `device` and `passkey` without a new approval (one prompt).
 - Both ceremonies use `userVerification: "required"` (device PIN or biometric, not just a touch). Authenticators derive the PRF output from different secrets with and without user verification, so the frame never lets the browser choose. An authenticator that can't verify the user fails the ceremony.
 - The WebAuthn RP ID is the signer's host (e.g. `signer.kokoah.example`).
 

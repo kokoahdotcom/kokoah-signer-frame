@@ -12,6 +12,7 @@ export type LogEvent =
   | "key.created"
   | "key.confirmed"
   | "key.unlocked"
+  | "key.storage_changed"
   | "key.locked"
   | "key.revoked"
   | "key.revoke_failed"

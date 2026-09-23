@@ -32,7 +32,11 @@ export const PROTOCOL_NAME = "kokoah-signer" as const;
 export const PROTOCOL_VERSION = 1 as const;
 /** Largest accepted request, measured as the length of its JSON serialization (UTF-16 code units). */
 export const MAX_MESSAGE_BYTES = 64 * 1024;
-/** Default (and recommended) agent name. Named agents only; Kokoah never uses HL's unnamed agent slot. */
+/**
+ * Default agent name. Named agents only; Kokoah never uses HL's unnamed agent slot. Hyperliquid allows 3 named agents
+ * per account and approving a name again replaces that agent, so apps give each device its own name (e.g.
+ * `kokoah-a1b2`) to keep one device from replacing another's key.
+ */
 export const DEFAULT_AGENT_NAME = "kokoah-web";
 /** Agent name limit (HL rejects longer names). */
 export const MAX_AGENT_NAME_LENGTH = 16;
@@ -58,6 +62,7 @@ export const METHODS = [
   "setLimits",
   "revoke",
   "setTheme",
+  "setStorageMode",
 ] as const;
 export type MethodName = (typeof METHODS)[number];
 
@@ -242,7 +247,10 @@ export interface CreateAgentParams {
   userAddress: Hex;
   /** 1–30 days. */
   validForDays: number;
-  /** Requested storage. `passkey` falls back to `device` when the browser can't do WebAuthn PRF. */
+  /**
+   * Requested storage. `device` is the recommended default (survives reloads, no prompt); `passkey` is an opt-in
+   * upgrade and falls back to `device` when the browser can't do WebAuthn PRF.
+   */
   storageMode: StorageMode;
   /** Agent name, 1–16 characters. Default `kokoah-web`. */
   agentName?: string;
@@ -368,6 +376,13 @@ export interface RevokeResult {
   status: SignerStatus;
 }
 
+/** Re-wraps the current stored key under another storage mode. No new `approveAgent`: same key, same agent. */
+export interface SetStorageModeParams {
+  /** `passkey`: protect the key with a passkey (one prompt). `device`: remove passkey protection (one prompt). */
+  to: "passkey" | "device";
+}
+export type SetStorageModeResult = SignerStatus;
+
 export interface SetThemeParams {
   /** CSS custom properties; values are validated (colors, lengths, font stacks) and length-capped. */
   variables?: Partial<Record<ThemeVariable, string>>;
@@ -389,6 +404,7 @@ export interface MethodParams {
   setLimits: SetLimitsParams;
   revoke: RevokeParams;
   setTheme: SetThemeParams;
+  setStorageMode: SetStorageModeParams;
 }
 /** Result of every method. */
 export interface MethodResults {
@@ -402,6 +418,7 @@ export interface MethodResults {
   setLimits: SetLimitsResult;
   revoke: RevokeResult;
   setTheme: SetThemeResult;
+  setStorageMode: SetStorageModeResult;
 }
 
 // ---------------------------------------------------------------------------------------------

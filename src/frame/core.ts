@@ -50,6 +50,7 @@ import {
   type RevokeResult,
   type SetLimitsParams,
   type SetLimitsResult,
+  type SetStorageModeParams,
   type SetThemeParams,
   type SetThemeResult,
   type SignAndSubmitParams,
@@ -314,6 +315,8 @@ export class FrameCore {
         return (await this.revoke(params as RevokeParams)) as MethodResults[M];
       case "setTheme":
         return this.setTheme(params as SetThemeParams) as MethodResults[M];
+      case "setStorageMode":
+        return (await this.setStorageMode(params as SetStorageModeParams)) as MethodResults[M];
       default:
         throw new SignerFailure("UNKNOWN_METHOD", `Unknown method "${String(method)}"`);
     }
@@ -720,10 +723,20 @@ export class FrameCore {
     });
   }
 
-  private async storeDeviceRecord(meta: KeyMeta, secret: Uint8Array): Promise<void> {
+  private async storeDeviceRecord(meta: KeyMeta, secret: Uint8Array, confirmedAt?: number): Promise<void> {
     const deviceKey = await generateDeviceKey(this.deps.crypto);
     const wrapped = await wrapSecret(this.deps.crypto, deviceKey, secret, keyAad(this.config.network.name, "device", meta.agentAddress));
-    await this.deps.store.putKeyRecord({ slot: "current", v: 1, network: this.config.network.name, ...meta, storageMode: "device", keyState: meta.keyState, wrapped, deviceKey });
+    await this.deps.store.putKeyRecord({
+      slot: "current",
+      v: 1,
+      network: this.config.network.name,
+      ...meta,
+      storageMode: "device",
+      keyState: meta.keyState,
+      wrapped,
+      deviceKey,
+      ...(confirmedAt !== undefined ? { confirmedAt } : {}),
+    });
   }
 
   private promptFailure(e: unknown): ActionFailure {
@@ -748,7 +761,7 @@ export class FrameCore {
    * Wraps the secret with a passkey PRF secret. Returns "unsupported" when the authenticator can't do PRF (the caller
    * falls back to device storage); throws on cancel/timeout.
    */
-  private async storePasskeyRecord(meta: KeyMeta, secret: Uint8Array, previous: StoredKeyRecord | undefined): Promise<"stored" | "unsupported"> {
+  private async storePasskeyRecord(meta: KeyMeta, secret: Uint8Array, previous: StoredKeyRecord | undefined, confirmedAt?: number): Promise<"stored" | "unsupported"> {
     const crypto = this.deps.crypto;
     const rpId = new URL(this.deps.frameOrigin).hostname;
     const prfSalt = randomBytes(crypto, 32);
@@ -816,6 +829,7 @@ export class FrameCore {
         keyState: meta.keyState,
         wrapped,
         passkey: { credentialId: new Uint8Array(credentialId), prfSalt, hkdfSalt, rpId },
+        ...(confirmedAt !== undefined ? { confirmedAt } : {}),
       });
     } finally {
       wipe(prfFirst);
@@ -968,6 +982,97 @@ export class FrameCore {
         key.generation = this.generation;
       }
       this.log("key.locked", { agent: key.meta.agentAddress, storageMode: key.meta.storageMode });
+      this.statusChanged();
+      return this.status();
+    });
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // setStorageMode
+  // -------------------------------------------------------------------------------------------
+
+  /**
+   * Re-wraps the stored key under another mode with no new `approveAgent`: `device` → `passkey` adds passkey
+   * protection (one passkey prompt), `passkey` → `device` removes it (one passkey prompt to decrypt). The secret is
+   * read from the stored ciphertext (never from memory), re-encrypted and written in place of the old record. A key
+   * that is unlocked in this tab stays unlocked.
+   */
+  private async setStorageMode(p: SetStorageModeParams): Promise<SignerStatus> {
+    return await this.withState(async () => {
+      const key = this.key;
+      if (!key) throw new SignerFailure("NO_KEY", "There is no trading key on this device.");
+      if (key.meta.storageMode === p.to) return this.status();
+      if (key.meta.storageMode === "session" || !this.deps.store.persistent) {
+        throw new SignerFailure("STORAGE_FAILED", "This trading key is kept for this session only; create a new key to store it.");
+      }
+      let rec: StoredKeyRecord | undefined;
+      try {
+        rec = await this.deps.store.getKeyRecord();
+      } catch {
+        rec = undefined;
+      }
+      if (!rec || rec.agentAddress !== key.meta.agentAddress || rec.network !== this.config.network.name) {
+        throw new SignerFailure("NO_KEY", "The stored trading key is gone; create a new one.");
+      }
+      const meta: KeyMeta = { ...metaFromRecord(rec), keyState: key.meta.keyState, validUntil: key.meta.validUntil, storageMode: p.to };
+      if (p.to === "passkey") {
+        const support = await this.passkeySupport();
+        if (!support.available) throw new SignerFailure("PASSKEY_UNAVAILABLE", `Passkeys are not available here: ${support.reason ?? "not supported"}.`);
+        let secret: Uint8Array;
+        try {
+          if (!rec.deviceKey) throw new Error("device record without key");
+          secret = await unwrapSecret(this.deps.crypto, rec.deviceKey, rec.wrapped, keyAad(rec.network, "device", rec.agentAddress));
+        } catch {
+          throw new SignerFailure("UNLOCK_FAILED", "The stored trading key could not be decrypted; revoke it and create a new one.");
+        }
+        try {
+          const outcome = await this.storePasskeyRecord(meta, secret, undefined, rec.confirmedAt);
+          if (outcome === "unsupported") throw new SignerFailure("PASSKEY_UNAVAILABLE", "This passkey does not support the PRF extension, so it can't protect the key.");
+        } finally {
+          wipe(secret);
+        }
+      } else {
+        const pk = rec.passkey;
+        if (!pk) throw new SignerFailure("UNLOCK_FAILED", "The stored passkey record is incomplete; revoke it and create a new one.");
+        const aad = keyAad(rec.network, "passkey", rec.agentAddress);
+        const wrapped = rec.wrapped;
+        let secret: Uint8Array;
+        try {
+          secret = await this.prompt(
+            "passkey-unlock",
+            { title: "Remove passkey protection", body: "Use your passkey once more. After this, the trading key unlocks on this device without a passkey.", actionLabel: "Use passkey" },
+            async () => {
+              const { prfFirst } = await this.deps.passkeys.get({ rpId: pk.rpId, credentialId: pk.credentialId, prfSalt: pk.prfSalt, timeoutMs: 60_000 });
+              try {
+                const wrapKey = await deriveKeyFromPrf(this.deps.crypto, prfFirst, pk.hkdfSalt);
+                try {
+                  return await unwrapSecret(this.deps.crypto, wrapKey, wrapped, aad);
+                } catch {
+                  throw new SignerFailure("UNLOCK_FAILED", "This passkey could not unlock the trading key.");
+                }
+              } finally {
+                wipe(prfFirst);
+              }
+            },
+          );
+        } catch (e) {
+          if (e instanceof PasskeyError) throw new SignerFailure(e.code === "unsupported" ? "PASSKEY_UNAVAILABLE" : "PASSKEY_FAILED", e.message, { retryable: e.code !== "unsupported" });
+          throw e;
+        }
+        try {
+          this.accountFromSecret(new Uint8Array(secret), rec.agentAddress);
+          await this.storeDeviceRecord(meta, secret, rec.confirmedAt);
+        } catch (e) {
+          if (e instanceof SignerFailure) throw e;
+          throw new SignerFailure("STORAGE_FAILED", "The trading key could not be stored on this device.", { retryable: true });
+        } finally {
+          wipe(secret);
+        }
+      }
+      if (this.key !== key) throw new SignerFailure("KEY_CHANGED", "The trading key changed while changing its protection.", { retryable: true });
+      key.meta = { ...key.meta, storageMode: p.to };
+      this.log("key.storage_changed", { agent: key.meta.agentAddress, storageMode: p.to });
+      this.notifyOtherTabs();
       this.statusChanged();
       return this.status();
     });
