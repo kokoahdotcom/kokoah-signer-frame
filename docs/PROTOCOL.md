@@ -530,7 +530,7 @@ The baseline is built into the frame and can't be loosened:
 | Allowed action types | `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `updateLeverage`, `updateIsolatedMargin`, `scheduleCancel`, `noop`. Everything else is denied, and fund movements, vault/sub-account actions, approvals, TWAP etc. are hard-denied by the shared policy anyway |
 | Builder | Every `order` carries exactly `{ b: VITE_BUILDER_ADDRESS, f: VITE_BUILDER_FEE_TENTHS_BPS }` |
 | `vaultAddress` | Must be absent (master account only in v1) |
-| Price band | Limit price within **10%** of HL's mark; market-order slippage ≤ 10% |
+| Price band | Orders that execute now (market, IOC, and marketable limits: a buy at or above min(mark, mid), a sell at or below max(mark, mid)) within **10%** of HL's mark; market-order slippage ≤ 10%. Resting GTC/ALO limits that don't cross may sit up to **50%** from mark (shared `RESTING_PRICE_BAND_PCT`), which still stops typos like 8500 for 85000. Triggers: the limit within 10% of its trigger; an untriggered trigger up to 50% from mark; a trigger that would fire now banded at 10% from mark. Mark and mid come from the frame's own HL reads. `setLimits.priceBandPct` tightens the 10% band only |
 | Leverage | Each market's own maximum (`updateLeverage` above it is denied) |
 | Rate | **60 orders per minute** per agent (TP/SL legs count; cancels don't). Persisted, so a reload doesn't reset it |
 | Notional | $1,000,000 per order, $25,000,000 per UTC day (reduce-only orders exempt) |
@@ -553,7 +553,7 @@ Denials come back as `POLICY_DENIED` with every violation, for example:
 
 ```json
 { "code": "POLICY_DENIED", "message": "The action is not allowed by the signer policy.", "retryable": false,
-  "details": { "violations": [ { "code": "PRICE_OUTSIDE_BAND", "message": "ETH price 2300 is 15% from mark 2000 (band 10%)." } ] } }
+  "details": { "violations": [ { "code": "PRICE_OUTSIDE_BAND", "message": "ETH buy at 2300 is 15% from the mark price 2000 and would fill immediately; orders that execute now must be within 10% of the mark (a resting limit can be up to 50% away)." } ] } }
 ```
 
 ## 8. Key storage and passkeys

@@ -1178,6 +1178,7 @@ export class FrameCore {
         policy: this.policy,
         registry: snapshot.registry,
         markPrices: snapshot.markPrices,
+        midPrices: snapshot.midPrices,
         ordersInLastMinute: usage.ordersInLastMinute,
         dailyNotionalUsedUsd: usage.dailyNotionalUsedUsd,
         ...(leverageByCoin !== undefined ? { leverageByCoin } : {}),

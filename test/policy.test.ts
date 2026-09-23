@@ -94,6 +94,50 @@ describe("policy through signAndSubmit", () => {
     expect((await h.ok("getStatus")).metrics.policyDenials).toBe(1);
   });
 
+  it("lets resting limits sit up to 50% from HL's mark, but bands orders that execute now at 10%", async () => {
+    h = await FrameHarness.create();
+    await h.activeAgent("device");
+    // Resting GTC and ALO buys 20% below mark (1600 vs 2000) are signed.
+    expect((await h.ok("signAndSubmit", { requestId: "r1", intent: limitOrder({ price: "1600" }) })).status).toBe("ok");
+    expect((await h.ok("signAndSubmit", { requestId: "r2", intent: limitOrder({ price: "1600", tif: "Alo" }) })).status).toBe("ok");
+    // A resting sell 20% above is signed too.
+    expect((await h.ok("signAndSubmit", { requestId: "r3", intent: limitOrder({ side: "sell", price: "2400" }) })).status).toBe("ok");
+    // A marketable buy 20% above mark executes now: denied with a message that says why.
+    const above = await h.fail("signAndSubmit", { requestId: "a", intent: limitOrder({ price: "2400" }) });
+    expect(above.code).toBe("POLICY_DENIED");
+    expect(above.details?.violations).toEqual([
+      { code: "PRICE_OUTSIDE_BAND", message: "ETH buy at 2400 is 20% from the mark price 2000 and would fill immediately; orders that execute now must be within 10% of the mark (a resting limit can be up to 50% away)." },
+    ]);
+    // IOC 20% below executes now (or not at all): denied.
+    expect((await h.fail("signAndSubmit", { requestId: "i", intent: limitOrder({ price: "1600", tif: "Ioc" }) })).code).toBe("POLICY_DENIED");
+    // A typo (200 for 2000) is still refused.
+    const typo = await h.fail("signAndSubmit", { requestId: "t", intent: limitOrder({ price: "200" }) });
+    expect(typo.details?.violations?.[0]?.message).toContain("resting limits must be within 50% of the mark");
+  });
+
+  it("classifies marketable limits with HL's own mid, and a tightened band keeps the resting band", async () => {
+    h = await FrameHarness.create();
+    await h.activeAgent("device");
+    // HL's book mid is far under the mark (thin book): a buy at 1600 crosses it, so it executes now.
+    h.hl.mid.ETH = "1500";
+    expect((await h.fail("signAndSubmit", { requestId: "m", intent: limitOrder({ price: "1600" }) })).code).toBe("POLICY_DENIED");
+    h.destroy();
+    h = await FrameHarness.create(); // fresh market-data cache
+    await h.activeAgent("device");
+    await h.ok("setLimits", { priceBandPct: 2 });
+    expect((await h.fail("signAndSubmit", { requestId: "x", intent: limitOrder({ price: "2060" }) })).code).toBe("POLICY_DENIED"); // +3%, marketable
+    expect((await h.ok("signAndSubmit", { requestId: "y", intent: limitOrder({ price: "1600" }) })).status).toBe("ok");
+  });
+
+  it("bands triggers: untriggered stops up to 50% from mark", async () => {
+    h = await FrameHarness.create();
+    await h.activeAgent("device");
+    const stop = (trigger: string) => ({ kind: "order", coin: "ETH", side: "sell", orderType: "stopMarket", size: "0.1", triggerPrice: trigger, reduceOnly: true, origin: "manual", cloid: cloid() });
+    expect((await h.ok("signAndSubmit", { requestId: "s1", intent: stop("1600") })).status).toBe("ok");
+    const far = await h.fail("signAndSubmit", { requestId: "s2", intent: stop("500") });
+    expect(far.details?.violations?.[0]?.message).toContain("triggers must be within 50% of the mark");
+  });
+
   it("caps leverage at the market maximum", async () => {
     h = await FrameHarness.create();
     await h.activeAgent("device");

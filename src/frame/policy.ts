@@ -7,6 +7,11 @@
  * 2. on the **wire** subject built from the exact action object that will be hashed and signed (defense in depth: a
  *    compiler bug can't turn an allowed intent into, say, a transfer).
  *
+ * Price band (shared `band.ts`): orders that execute now (market, IOC, marketable limits) must be within
+ * `priceBandPct` (10% baseline, user-tightenable) of HL's mark; resting GTC/ALO limits that don't cross may sit up to
+ * `RESTING_PRICE_BAND_PCT` (50%) away; untriggered triggers likewise. Mark and mid always come from the frame's own
+ * HL reads.
+ *
  * The frame adds three things the shared policy has no field for: the per-market leverage cap (baseline = each
  * market's own maximum), a hard "no `vaultAddress`" rule independent of the policy object, and the notional counted
  * against the daily limit.
@@ -195,6 +200,11 @@ export interface FramePolicyInput {
   /** Whether the user tightened `maxLeverage` (else the per-market maximum is the only cap). */
   registry: MarketRegistry;
   markPrices: Readonly<Record<string, number>>;
+  /**
+   * Book mids the frame fetched from HL itself (never from the parent). Optional: they refine which limits count as
+   * marketable (executes now: `priceBandPct`) versus resting (up to `RESTING_PRICE_BAND_PCT` from mark).
+   */
+  midPrices?: Readonly<Record<string, string | number>>;
   ordersInLastMinute: number;
   dailyNotionalUsedUsd: number;
   /** The user's current leverage per coin, when known (only fetched when `maxLeverage` was tightened). */
@@ -234,10 +244,16 @@ export function evaluateFramePolicy(input: FramePolicyInput): FramePolicyDecisio
   if (input.compiled.vaultAddress !== undefined || input.compiled.intent.vaultAddress !== undefined) {
     add({ code: "VAULT_NOT_ALLOWED", message: "The signer frame acts for the master account only; vaultAddress must be absent." });
   }
+  const midPrices: Record<string, number> = {};
+  for (const [coin, raw] of Object.entries(input.midPrices ?? {})) {
+    const mid = Number(raw);
+    if (Number.isFinite(mid) && mid > 0) midPrices[coin] = mid;
+  }
   const context = {
     policy,
     now: input.now,
     markPrices: input.markPrices,
+    midPrices,
     dailyNotionalUsedUsd: input.dailyNotionalUsedUsd,
     ordersInLastMinute: input.ordersInLastMinute,
     registry: input.registry,
