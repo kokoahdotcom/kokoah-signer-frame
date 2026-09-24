@@ -151,14 +151,21 @@ export interface PolicySummary {
   requireStopLossForNewEntries: boolean;
   /** Every order carries exactly this builder code. */
   builder: { address: Hex; feeTenthsBps: number };
-  /** Always false in v1: the frame acts for the master account only. */
+  /** Always false: the frame never acts for a Hyperliquid vault (see `ownSubAccountsAllowed` for sub-accounts). */
   vaultAddressAllowed: false;
+  /**
+   * `vaultAddress` is allowed for the key's master's own sub-accounts only: the frame reads HL `subAccounts` for the
+   * master itself (cached briefly) and denies any other address with `POLICY_DENIED` / `VAULT_NOT_ALLOWED`.
+   */
+  ownSubAccountsAllowed: true;
   /** `expiresAfter` the frame puts on every action, ms after its clock. */
   expiresAfterMs: number;
   /** Intent origins the frame accepts. */
   allowedOrigins: Array<"manual" | "ai_ticket">;
-  /** The limits last applied with `setLimits` (null: baseline only). */
+  /** The master account's limits last applied with `setLimits` (null: baseline only). */
   userLimits: UserLimits | null;
+  /** Sub-accounts with their own limits (`setLimits` with `account`); any other sub-account uses `userLimits`. */
+  accountLimits: Record<Hex, UserLimits>;
 }
 
 /** Status of the frame and its key (`getStatus`, `statusChanged`). */
@@ -331,7 +338,11 @@ export interface SignAndSubmitParams {
    * the first result instead of re-signing. See {@link REQUEST_ID_PATTERN}.
    */
   requestId: string;
-  /** A Kokoah action intent (`@kokoah/shared/intents`). Prices, registries and builder are never taken from the parent. */
+  /**
+   * A Kokoah action intent (`@kokoah/shared/intents`). Prices, registries and builder are never taken from the parent.
+   * `intent.vaultAddress` trades for a sub-account; the frame signs it only when HL lists that address as a
+   * sub-account of the key's master.
+   */
   intent: ActionIntentInput;
 }
 
@@ -386,8 +397,15 @@ export interface UserLimits {
   /** Subset of the baseline action types. */
   allowedActionTypes?: AllowedActionType[];
 }
-/** `setLimits` replaces the previous user limits entirely; `{}` resets to the baseline. */
-export type SetLimitsParams = UserLimits;
+/**
+ * `setLimits` replaces the previous limits of one account entirely. Without `account` (or with the key's master) it
+ * sets the master's limits (`{}` resets them to the baseline). With a sub-account address it sets that sub-account's
+ * own limits; `{ account }` alone removes them, so the sub-account uses the master's again.
+ */
+export type SetLimitsParams = UserLimits & {
+  /** A sub-account of the key's master. Omit for the master account. */
+  account?: Hex;
+};
 export interface SetLimitsResult {
   policy: PolicySummary;
 }

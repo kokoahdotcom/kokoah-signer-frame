@@ -53,9 +53,15 @@ export interface UsageRecord {
   lastNonce: number;
   /** Times (ms, corrected clock) of orders signed in roughly the last minute, one entry per order. */
   orderTimes: number[];
-  /** UTC day (YYYY-MM-DD) of `dayNotionalUsd`. */
+  /** UTC day (YYYY-MM-DD) of `dayNotionalUsd` and `accountNotionalUsd`. */
   day: string;
+  /** Notional signed on `day` across every account. */
   dayNotionalUsd: number;
+  /**
+   * Notional signed on `day` per account (lowercase address: the master or a sub-account). Missing in records written
+   * before sub-accounts: then all of `dayNotionalUsd` belongs to the master.
+   */
+  accountNotionalUsd?: Record<string, number>;
 }
 
 /** Storage used by the frame. */

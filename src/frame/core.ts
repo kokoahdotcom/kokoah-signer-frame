@@ -21,6 +21,7 @@ import { deviceLinkCode } from "@kokoah/shared/link";
 import { isWriteAllowed } from "@kokoah/shared/network";
 import type { Policy } from "@kokoah/shared/policy";
 import { buildApproveAgent, buildRevokeAgent, parseAgentName, prepareL1Request } from "@kokoah/shared/signing";
+import { SubAccountLookupError, SubAccountOwnership } from "@kokoah/shared/subaccounts";
 import { bytesToHex, hexToBytes } from "viem";
 import { generatePrivateKey as viemGeneratePrivateKey, privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import {
@@ -73,12 +74,16 @@ import { classifyMessage } from "./messages.js";
 import { SignerBusyError, SigningCoordinator, type LockManagerLike } from "./nonces.js";
 import { PasskeyError, type PasskeyProvider } from "./passkey.js";
 import {
+  type AccountLimits,
   actionNotionalUsd,
   applyUserLimits,
   createBaselinePolicy,
   evaluateFramePolicy,
   intentCoins,
+  limitsForAccount,
+  MAX_ACCOUNT_LIMITS,
   orderCount,
+  policyForAccount,
   summarizeFramePolicy,
 } from "./policy.js";
 import { applyTheme, invalidThemeVariables, PromptError, PromptUi, type ActionFailure, type PromptKind } from "./prompt.js";
@@ -198,6 +203,10 @@ export class FrameCore {
   private readonly instanceId: string;
   private policy: Policy;
   private userLimits: UserLimits | null = null;
+  /** Sub-accounts with their own limits (lowercase address → limits); others use the master's. */
+  private readonly accountLimits = new Map<string, AccountLimits>();
+  /** The master's sub-accounts, read from HL by the frame itself (never from the parent). */
+  private readonly subAccounts: SubAccountOwnership;
   private key: LoadedKey | null = null;
   private generation = 0;
   private boundOrigin: string | null = null;
@@ -220,6 +229,7 @@ export class FrameCore {
     this.log = deps.logger ?? silentLogger;
     this.hl = new HlHttp({ fetch: deps.fetch, infoUrl: this.config.network.infoUrl, exchangeUrl: this.config.network.exchangeUrl });
     this.market = new MarketData({ hl: this.hl, now: this.now });
+    this.subAccounts = new SubAccountOwnership({ now: this.now, load: async (master) => await this.hl.info({ type: "subAccounts", user: master }) });
     this.coordinator = new SigningCoordinator({ store: deps.store, locks: deps.locks, lockPrefix: `kokoah-signer/v1/${this.config.network.name}` });
     this.baseline = createBaselinePolicy(this.config.builder);
     this.policy = this.baseline;
@@ -404,7 +414,7 @@ export class FrameCore {
       network: this.config.network.name,
       mainnetWritesEnabled: this.config.network.name === "mainnet" && this.config.network.allowMainnetWrites,
       clockOffsetMs: this.clockOffsetMs,
-      policy: summarizeFramePolicy(this.policy, this.userLimits),
+      policy: summarizeFramePolicy(this.policy, this.userLimits, this.accountLimits),
       metrics: { ...this.metrics },
     };
   }
@@ -1182,12 +1192,24 @@ export class FrameCore {
   // -------------------------------------------------------------------------------------------
 
   private setLimits(p: SetLimitsParams): SetLimitsResult {
-    const r = applyUserLimits(this.baseline, p);
+    const { account, ...limits } = p;
+    const r = applyUserLimits(this.baseline, limits);
     if (!r.ok) throw new SignerFailure("LIMIT_LOOSENING_REJECTED", r.message, { details: { fields: r.fields } });
-    this.policy = r.policy;
-    this.userLimits = r.limits;
+    const sub = account?.toLowerCase();
+    if (sub === undefined || sub === this.key?.meta.userAddress.toLowerCase()) {
+      this.policy = r.policy;
+      this.userLimits = r.limits;
+    } else if (r.limits === null) {
+      // `{ account }` alone: the sub-account uses the master's limits again.
+      this.accountLimits.delete(sub);
+    } else {
+      if (!this.accountLimits.has(sub) && this.accountLimits.size >= MAX_ACCOUNT_LIMITS) {
+        throw new SignerFailure("INVALID_REQUEST", `At most ${MAX_ACCOUNT_LIMITS} sub-accounts can have their own limits.`);
+      }
+      this.accountLimits.set(sub, { policy: r.policy, limits: r.limits });
+    }
     this.statusChanged();
-    return { policy: summarizeFramePolicy(this.policy, this.userLimits) };
+    return { policy: summarizeFramePolicy(this.policy, this.userLimits, this.accountLimits) };
   }
 
   private setTheme(p: SetThemeParams): SetThemeResult {
@@ -1256,6 +1278,25 @@ export class FrameCore {
     if (!parsed.success) throw new SignerFailure("INVALID_INTENT", "The intent is not valid.", { details: { issues: parsed.issues.slice(0, 20) } });
     const intent: ActionIntent = parsed.intent;
 
+    // 1b. Acting for a sub-account: the frame checks on HL itself that it belongs to this key's master (cached
+    // briefly). Anything else (a vault the master leads, another user's account) is denied by the policy below.
+    const master = key.meta.userAddress.toLowerCase() as `0x${string}`;
+    const vault = intent.vaultAddress?.toLowerCase() as `0x${string}` | undefined;
+    let ownedSubAccount: `0x${string}` | undefined;
+    if (vault !== undefined) {
+      try {
+        if (await this.subAccounts.isOwned(master, vault)) ownedSubAccount = vault;
+      } catch (e) {
+        if (e instanceof SubAccountLookupError) {
+          throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Could not read your sub-accounts from Hyperliquid; nothing was signed. Try again shortly.", { retryable: true });
+        }
+        throw e;
+      }
+    }
+    const account = vault ?? master;
+    const accountPolicy = policyForAccount(this.policy, this.accountLimits, vault);
+    const accountLimits = limitsForAccount(this.userLimits, this.accountLimits, vault);
+
     // 2. The frame's own clock, market metadata and prices.
     await this.ensureClock();
     const coins = intentCoins({ intent });
@@ -1295,12 +1336,12 @@ export class FrameCore {
     // 4. The user's current leverage, only needed when the parent tightened maxLeverage below the market maximum.
     let leverageByCoin: Record<string, number> | undefined;
     const opensExposure = (intent.kind === "order" && !intent.reduceOnly) || (intent.kind === "modify" && !intent.order.reduceOnly);
-    if (this.userLimits?.maxLeverage !== undefined && opensExposure) {
+    if (accountLimits?.maxLeverage !== undefined && opensExposure) {
       leverageByCoin = {};
       for (const coin of coins) {
         let lev: number | undefined;
         try {
-          lev = await this.market.leverageFor(key.meta.userAddress, coin);
+          lev = await this.market.leverageFor(account, coin);
         } catch {
           throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Could not read the account's leverage from Hyperliquid; try again shortly.", { retryable: true });
         }
@@ -1321,18 +1362,21 @@ export class FrameCore {
       const now = this.correctedNow();
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
       const expiresAfter = now + EXPIRES_AFTER_MS;
-      const usage = await this.coordinator.usage(agent, now);
+      const usageAccount = { account, master };
+      const usage = await this.coordinator.usage(agent, now, usageAccount);
       const decision = evaluateFramePolicy({
         compiled,
         expiresAfter,
         now,
-        policy: this.policy,
+        policy: accountPolicy,
         registry: snapshot.registry,
         markPrices: snapshot.markPrices,
         midPrices: snapshot.midPrices,
         ordersInLastMinute: usage.ordersInLastMinute,
-        dailyNotionalUsedUsd: usage.dailyNotionalUsedUsd,
+        dailyNotionalUsedUsd: usage.accountDailyNotionalUsd,
+        agentDailyNotionalUsedUsd: usage.dailyNotionalUsedUsd,
         ...(leverageByCoin !== undefined ? { leverageByCoin } : {}),
+        ...(ownedSubAccount !== undefined ? { ownedSubAccount } : {}),
       });
       if (!decision.allowed) {
         this.metrics.policyDenials++;
@@ -1342,14 +1386,20 @@ export class FrameCore {
 
       let nonce: number;
       try {
-        nonce = await this.coordinator.reserve(agent, { now, orders: orderCount(action), notionalUsd: actionNotionalUsd(action, snapshot.registry, snapshot.markPrices) });
+        nonce = await this.coordinator.reserve(agent, {
+          now,
+          orders: orderCount(action),
+          notionalUsd: actionNotionalUsd(action, snapshot.registry, snapshot.markPrices),
+          account: usageAccount,
+        });
       } catch (e) {
         if (e instanceof RangeError) throw new SignerFailure("INTERNAL_ERROR", "Could not produce a valid nonce; check the device clock.");
         throw new SignerFailure("STORAGE_FAILED", "Could not reserve a nonce on this device.", { retryable: true });
       }
 
-      // Signs exactly `compiled.action` (the object the policy evaluated). No vaultAddress: master account only.
-      const body = await prepareL1Request({ wallet: current.account, network: this.config.network, compiled: { action: compiled.action }, nonce, expiresAfter });
+      // Signs exactly `compiled.action` (the object the policy evaluated), for the master or the verified sub-account.
+      const signFor = ownedSubAccount !== undefined && compiled.vaultAddress?.toLowerCase() === ownedSubAccount ? { vaultAddress: ownedSubAccount } : {};
+      const body = await prepareL1Request({ wallet: current.account, network: this.config.network, compiled: { action: compiled.action, ...signFor }, nonce, expiresAfter });
 
       markConsumed();
       this.metrics.submitted++;

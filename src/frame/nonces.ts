@@ -39,8 +39,20 @@ export function utcDay(ms: number): string {
 }
 
 export interface Usage {
+  /** Orders this agent signed in the last minute, across every account. */
   ordersInLastMinute: number;
+  /** Notional this agent signed today, across every account. */
   dailyNotionalUsedUsd: number;
+  /** Notional signed today for the account asked about (the master when none was given). */
+  accountDailyNotionalUsd: number;
+}
+
+/** Which account a usage question or reservation is about. */
+export interface UsageAccount {
+  /** The account (the master or one of its sub-accounts). */
+  account: string;
+  /** The key's master (records from before sub-accounts count everything for it). */
+  master: string;
 }
 
 export interface SigningCoordinatorOptions {
@@ -87,17 +99,17 @@ export class SigningCoordinator {
   }
 
   /** Orders in the last minute and notional used today (corrected clock), from the persisted record. */
-  async usage(agent: string, now: number): Promise<Usage> {
-    return usageOf(await this.store.readUsage(agent), now);
+  async usage(agent: string, now: number, account?: UsageAccount): Promise<Usage> {
+    return usageOf(await this.store.readUsage(agent), now, account);
   }
 
   /**
    * Reserves the next nonce for `agent` and records the orders and notional this action adds, atomically.
    * Throws if the nonce would fall outside HL's accepted window.
    */
-  async reserve(agent: string, params: { now: number; orders: number; notionalUsd: number }): Promise<number> {
+  async reserve(agent: string, params: { now: number; orders: number; notionalUsd: number; account?: UsageAccount }): Promise<number> {
     const now = Math.floor(params.now);
-    const record = await this.store.updateUsage(agent, (prev) => nextUsage(agent, prev, now, params.orders, params.notionalUsd));
+    const record = await this.store.updateUsage(agent, (prev) => nextUsage(agent, prev, now, params.orders, params.notionalUsd, params.account));
     if (!isNonceInWindow(record.lastNonce, now)) throw new RangeError("Nonce outside Hyperliquid's accepted window; check the device clock");
     return record.lastNonce;
   }
@@ -132,17 +144,27 @@ export class SigningCoordinator {
   }
 }
 
-/** Usage counters of a record at `now`. */
-export function usageOf(record: UsageRecord | undefined, now: number): Usage {
-  if (!record) return { ordersInLastMinute: 0, dailyNotionalUsedUsd: 0 };
+/** Usage counters of a record at `now`. Without `account`, the account figure is the master's. */
+export function usageOf(record: UsageRecord | undefined, now: number, account?: UsageAccount): Usage {
+  if (!record) return { ordersInLastMinute: 0, dailyNotionalUsedUsd: 0, accountDailyNotionalUsd: 0 };
+  const today = record.day === utcDay(now);
   return {
     ordersInLastMinute: record.orderTimes.filter((t) => t > now - MINUTE && t <= now + MINUTE).length,
-    dailyNotionalUsedUsd: record.day === utcDay(now) ? record.dayNotionalUsd : 0,
+    dailyNotionalUsedUsd: today ? record.dayNotionalUsd : 0,
+    accountDailyNotionalUsd: today ? accountNotional(record, account) : 0,
   };
 }
 
+function accountNotional(record: UsageRecord, account: UsageAccount | undefined): number {
+  const byAccount = record.accountNotionalUsd;
+  if (byAccount === undefined) return account === undefined || account.account.toLowerCase() === account.master.toLowerCase() ? record.dayNotionalUsd : 0;
+  if (account === undefined) return record.dayNotionalUsd;
+  const value = byAccount[account.account.toLowerCase()];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
 /** Pure update of the usage record (runs inside the IndexedDB transaction). */
-export function nextUsage(agent: string, prev: UsageRecord | undefined, now: number, orders: number, notionalUsd: number): UsageRecord {
+export function nextUsage(agent: string, prev: UsageRecord | undefined, now: number, orders: number, notionalUsd: number, account?: UsageAccount): UsageRecord {
   const mgr = new MonotonicNonceManager({ now: () => now });
   const last = prev?.lastNonce;
   // A persisted nonce beyond HL's future window can only come from a broken clock; it would make every later nonce
@@ -152,6 +174,25 @@ export function nextUsage(agent: string, prev: UsageRecord | undefined, now: num
   const today = utcDay(now);
   const recent = (prev?.orderTimes ?? []).filter((t) => t > now - MINUTE && t <= now + MINUTE);
   for (let i = 0; i < orders; i++) recent.push(now);
-  const dayNotionalUsd = (prev && prev.day === today ? prev.dayNotionalUsd : 0) + (Number.isFinite(notionalUsd) && notionalUsd > 0 ? notionalUsd : 0);
-  return { agent: agent.toLowerCase(), lastNonce: nonce, orderTimes: recent.slice(-10_000), day: today, dayNotionalUsd };
+  const added = Number.isFinite(notionalUsd) && notionalUsd > 0 ? notionalUsd : 0;
+  const sameDay = prev !== undefined && prev.day === today;
+  const dayNotionalUsd = (sameDay ? prev.dayNotionalUsd : 0) + added;
+  const record: UsageRecord = { agent: agent.toLowerCase(), lastNonce: nonce, orderTimes: recent.slice(-10_000), day: today, dayNotionalUsd };
+  if (account !== undefined || prev?.accountNotionalUsd !== undefined) {
+    const byAccount: Record<string, number> = {};
+    if (sameDay) {
+      if (prev.accountNotionalUsd !== undefined) {
+        for (const [a, n] of Object.entries(prev.accountNotionalUsd)) if (typeof n === "number" && Number.isFinite(n)) byAccount[a] = n;
+      } else if (account !== undefined && prev.dayNotionalUsd > 0) {
+        // A record from before sub-accounts: everything signed so far today was for the master.
+        byAccount[account.master.toLowerCase()] = prev.dayNotionalUsd;
+      }
+    }
+    if (account !== undefined) {
+      const key = account.account.toLowerCase();
+      byAccount[key] = (byAccount[key] ?? 0) + added;
+    }
+    record.accountNotionalUsd = byAccount;
+  }
+  return record;
 }
