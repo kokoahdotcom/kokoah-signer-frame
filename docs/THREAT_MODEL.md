@@ -93,3 +93,35 @@ Trust boundaries:
 | Named agent, `valid_until` ≤ 30 days, never reused, expiry enforced | `core.ts` | `test/agent.test.ts`, `test/lifecycle.test.ts` |
 | Nonces unique and increasing across tabs | `nonces.ts` | `test/nonce.test.ts` |
 | Testnet default; mainnet needs `VITE_ALLOW_MAINNET_WRITES=true`; shared write guard | `config.ts`, shared `assertWriteAllowed` | `test/config.test.ts` |
+| Link phone: the phone's own key, a matching code over that key, the link secret never stored, logged or echoed, no `approveAgent` on the phone | `core.ts` `createLinkedAgent`, shared `deviceLinkCode` | `test/link.test.ts`, shared `test/link.test.ts` |
+
+## 7. Link phone
+
+"Link phone" lets a user who is signed in on a computer trade on a phone with no wallet app on the phone. The flow is
+in [PROTOCOL.md §12](PROTOCOL.md#12-link-phone); the backend's side is in kokoah-backend `docs/API.md` ("Linked
+devices", with the same threat model).
+
+**What never travels:** the phone's frame creates the phone's **own** agent key (`createLinkedAgent`), stored like any
+other key (`device` by default, `passkey` optional, non-extractable wrapping key in IndexedDB). No private key, seed or
+signature is ever in a QR code, a link, a screenshot, the backend or a message to the app. The QR code carries only a
+one-time pairing token and a link secret.
+
+| Control | How |
+|---|---|
+| **Pairing token** | 32 random bytes, stored only as a SHA-256 hash, **one-time** (consumed atomically when the phone claims it), **expires 5 minutes** after it is created, carried in the **URL fragment** (`/link#t=…&k=…`) so it never appears in a request line, server or proxy log or `Referer`; the phone removes the fragment from the address bar at once. It is **bound to the computer's session and address**: only that session can see, approve or cancel the pairing, the phone gets a session for that address only, and the pairing dies with that session. One open pairing per account |
+| **Relay protection** | The computer generates a 16-byte link secret that stays in the fragment and never reaches a server. Both devices show `deviceLinkCode` (6 digits, HMAC-SHA256 keyed with that secret over pairing id, account, agent address, agent name and expiry); the phone's code comes from the frame, computed over the key the frame actually holds. The computer refuses to build the `approveAgent` until the user confirms the codes match; "They don't match" cancels the pairing and is logged |
+| **One readable approval** | The computer builds its own `approveAgent` for exactly the relayed address, name and expiry (≤ 30 days); the main wallet signs readable EIP-712. The phone's frame refuses to sign until `confirmAgent` finds that address under that name in `extraAgents` |
+| **Linked-device session** | Issued only after the backend itself sees the approved agent on Hyperliquid, so it needs a main-wallet signature just like a SIWE sign-in. It expires with the key (at most 30 days, 7-day idle timeout) and is revoked with the device. It can trade through its own agent key and read and change what a normal session can, **except**: link further devices, remove other devices' keys, or change security settings (personal limits, sessions, devices). Withdrawals and sends need the main wallet, which the phone does not have |
+| **Rate limits** | Every pairing endpoint is rate-limited per IP, and creating pairings also per account |
+| **Audit trail** | Pairing started, cancelled (including "codes didn't match"), phone linked and device revoked are entries in the Security center's activity |
+| **Revoke** | Each device on its own from the computer's Security center: the main wallet revokes that agent name on Hyperliquid and the backend revokes the device and its sessions. A phone can unlink itself (its session and its local key), but its agent stays on Hyperliquid until the computer revokes it or it expires |
+
+Attacks and what stops them:
+
+| Attacker | Can | Stopped / limited by | Residual |
+|---|---|---|---|
+| Someone who photographs or intercepts the QR code | Claim the token first and get their key shown on the computer | One-time token: the user's phone says the link was already used and shows no code, and the attacker's code is not on the user's phone; 5-minute expiry | A user who approves without comparing the codes |
+| A compromised backend or relay (without the app) | Swap in its own agent address, name or expiry | The link secret is not on the server, so it can't produce a matching code | None for key substitution; it can still refuse service |
+| A phishing QR for the attacker's account | Link the victim's phone to the attacker's account | The phone shows the account it is joining and the computer that asked, before creating a key | The victim ignores the account shown |
+| A stolen linked phone | Trade within the frame's policy and the user's limits | No withdrawals or sends (no main wallet); can't link devices, revoke others or loosen limits; revoke it from the computer | Trading losses until revoked or expired (≤ 30 days) |
+| XSS in the app (A1) on either device | As A1 | Unchanged: the key stays in the frame. On the computer, A1 could already ask the main wallet for any approval | As A1 |
