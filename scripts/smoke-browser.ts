@@ -14,7 +14,9 @@
  *   with a **virtual authenticator that supports PRF**: create → sign → lock → unlock (passkey assertion) → sign; after
  *   a reload the key is locked;
  * - when the app doesn't delegate WebAuthn (its own Permissions-Policy disables it), passkeys are reported unavailable
- *   and `passkey` falls back to `device`.
+ *   and `passkey` falls back to `device`;
+ * - Link phone: `createLinkedAgent` in the real frame returns the matching code the computer computes, and the key
+ *   signs once another wallet's `approveAgent` for its address is on the (mock) exchange.
  *
  * The frame is served with `public/_headers` as built; the only changes are origins: `frame-ancestors` and
  * `connect-src` name the local test origins instead of the production placeholders (and HSTS is dropped on http).
@@ -32,6 +34,9 @@ import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "vite";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { deviceLinkCode, generateLinkSecret } from "@kokoah/shared/link";
+import { getNetworkConfig } from "@kokoah/shared/network";
+import { buildApproveAgent } from "@kokoah/shared/signing";
 import { createMockHl } from "../dev/mock-hl.ts";
 import { addSri } from "./postbuild.ts";
 
@@ -421,6 +426,21 @@ async function main(): Promise<number> {
       before === 0 && reconnected.status.agentAddress === createdA.agentAddress && reconnected.status.keyState === "active" && afterFrameReload.agentAddress === createdA.agentAddress,
       { before, reconnected: reconnected.status, afterFrameReload },
     );
+    // Link phone: the phone's own key, the matching code computed inside the real frame, the computer's approveAgent.
+    const link = { pairingId: "0b7f1a52-3c3d-4c1e-9d0e-6a1b2c3d4e5f", secret: generateLinkSecret() };
+    const linked = await evaluate<{ agentAddress: `0x${string}`; agentName: string; validUntil: number; keyState: string; matchCode: string; approveAgent?: unknown }>(
+      `signer.createLinkedAgent({ userAddress: ${JSON.stringify(mainWallet.address)}, agentName: "kokoah-ph12", validForDays: 30, storageMode: "device", replaceExisting: true, link: ${JSON.stringify(link)} })`,
+    );
+    const computerCode = deviceLinkCode({ ...link, userAddress: mainWallet.address, agentAddress: linked.agentAddress, agentName: "kokoah-ph12", validUntil: linked.validUntil });
+    check(
+      "createLinkedAgent: a new pending key and the same matching code the computer computes",
+      linked.keyState === "pending" && linked.agentAddress !== createdA.agentAddress && linked.matchCode === computerCode && linked.approveAgent === undefined,
+      { keyState: linked.keyState, same: linked.matchCode === computerCode },
+    );
+    await approve(buildApproveAgent({ agentAddress: linked.agentAddress, agentName: "kokoah-ph12", validUntil: linked.validUntil, nonce: Date.now(), network: getNetworkConfig("testnet") }));
+    const linkedActive = await evaluate<{ keyState: string; agentAddress: string }>("signer.confirmAgent({ timeoutMs: 3000 })");
+    const signed3 = await evaluate<{ status: string }>(`signer.signAndSubmit({ requestId: crypto.randomUUID(), intent: ${intent()} })`);
+    check("the linked key signs after the computer's approveAgent", linkedActive.keyState === "active" && linkedActive.agentAddress === linked.agentAddress && signed3.status === "ok", { linkedActive, signed3 });
     check("no CSP/SRI/console errors during normal operation (frame A)", problems.length === 0, problems);
 
     // ---------------------------------------------------------------- frame-ancestors.
