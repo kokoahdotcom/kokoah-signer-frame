@@ -55,6 +55,7 @@ export const METHODS = [
   "hello",
   "getStatus",
   "createAgent",
+  "createLinkedAgent",
   "confirmAgent",
   "unlock",
   "lock",
@@ -273,6 +274,46 @@ export interface CreateAgentResult {
   approveAgent: PreparedUserSignedAction;
 }
 
+/**
+ * "Link phone": the phone creates its **own** agent key for an account whose main wallet is on another device (the
+ * computer). Nothing secret travels: the computer's QR code carries a one-time pairing token for the backend and a
+ * link secret that only the two devices know. The frame returns the 6-digit matching code for the key it created;
+ * the computer computes the same code from what the backend relays, and the user approves only when both match.
+ */
+export interface CreateLinkedAgentParams {
+  /** The account the phone is being linked to (the backend's pairing binds it). */
+  userAddress: Hex;
+  /** The agent name the computer will approve (from the pairing), 1–16 characters. */
+  agentName: string;
+  /** 1–30 days. */
+  validForDays: number;
+  /** Same as `createAgent`. `device` is the default for phones. */
+  storageMode: StorageMode;
+  /** Required when a non-expired key already exists on this device: it is wiped. */
+  replaceExisting?: boolean;
+  link: {
+    /** The pairing id the backend issued (lowercase UUID). */
+    pairingId: string;
+    /** The link secret from the QR code's URL fragment: 16 bytes, base64url (22 characters). Never stored. */
+    secret: string;
+  };
+}
+export interface CreateLinkedAgentResult {
+  agentAddress: Hex;
+  agentName: string;
+  validUntil: number;
+  storageMode: StorageMode;
+  requestedStorageMode: StorageMode;
+  storageFallbackReason?: string;
+  keyState: "pending";
+  pairingId: string;
+  /**
+   * `@kokoah/shared/link` `deviceLinkCode` over (pairingId, userAddress, agentAddress, agentName, validUntil), keyed
+   * with the link secret: 6 digits. Show it; the user compares it with the computer's.
+   */
+  matchCode: string;
+}
+
 export interface ConfirmAgentParams {
   /** Keep polling HL `extraAgents` for up to this long (ms, max 60000). Default 0: check once. */
   timeoutMs?: number;
@@ -397,6 +438,7 @@ export interface MethodParams {
   hello: HelloParams;
   getStatus: GetStatusParams;
   createAgent: CreateAgentParams;
+  createLinkedAgent: CreateLinkedAgentParams;
   confirmAgent: ConfirmAgentParams;
   unlock: UnlockParams;
   lock: LockParams;
@@ -411,6 +453,7 @@ export interface MethodResults {
   hello: HelloResult;
   getStatus: GetStatusResult;
   createAgent: CreateAgentResult;
+  createLinkedAgent: CreateLinkedAgentResult;
   confirmAgent: ConfirmAgentResult;
   unlock: UnlockResult;
   lock: LockResult;

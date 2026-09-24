@@ -17,6 +17,7 @@
 import { CompileError, compileAction, type CompiledAction } from "@kokoah/shared/actions";
 import { parseExchangeResponse } from "@kokoah/shared/errors";
 import { safeParseActionIntent, type ActionIntent } from "@kokoah/shared/intents";
+import { deviceLinkCode } from "@kokoah/shared/link";
 import { isWriteAllowed } from "@kokoah/shared/network";
 import type { Policy } from "@kokoah/shared/policy";
 import { buildApproveAgent, buildRevokeAgent, parseAgentName, prepareL1Request } from "@kokoah/shared/signing";
@@ -34,6 +35,8 @@ import {
   type ConfirmAgentParams,
   type CreateAgentParams,
   type CreateAgentResult,
+  type CreateLinkedAgentParams,
+  type CreateLinkedAgentResult,
   type EventData,
   type EventName,
   type FrameToParentMessage,
@@ -301,6 +304,8 @@ export class FrameCore {
         return this.status() as MethodResults[M];
       case "createAgent":
         return (await this.createAgent(params as CreateAgentParams)) as MethodResults[M];
+      case "createLinkedAgent":
+        return (await this.createLinkedAgent(params as CreateLinkedAgentParams)) as MethodResults[M];
       case "confirmAgent":
         return (await this.confirmAgent(params as ConfirmAgentParams)) as MethodResults[M];
       case "unlock":
@@ -627,6 +632,49 @@ export class FrameCore {
   // -------------------------------------------------------------------------------------------
 
   private async createAgent(p: CreateAgentParams): Promise<CreateAgentResult> {
+    return await this.createKey({ ...p, agentName: p.agentName ?? this.config.defaultAgentName }, "local", (meta) => ({
+      approveAgent: buildApproveAgent({
+        agentAddress: meta.agentAddress,
+        agentName: meta.agentName,
+        validUntil: meta.validUntil,
+        nonce: meta.createdAt,
+        now: meta.createdAt,
+        network: this.config.network,
+        ...(p.signatureChainId !== undefined ? { signatureChainId: p.signatureChainId } : {}),
+      }),
+    }));
+  }
+
+  /**
+   * "Link phone": the same fresh, stored, pending key as `createAgent`, for an account whose main wallet is on another
+   * device. No `approveAgent` typed data is returned (the computer builds and signs its own for this address, name and
+   * expiry); instead the frame returns the matching code bound to the key it holds. The link secret is used for the
+   * code only and never stored or logged.
+   */
+  private async createLinkedAgent(p: CreateLinkedAgentParams): Promise<CreateLinkedAgentResult> {
+    return await this.createKey(p, "linked", (meta) => ({
+      pairingId: p.link.pairingId,
+      matchCode: deviceLinkCode({
+        secret: p.link.secret,
+        pairingId: p.link.pairingId,
+        userAddress: meta.userAddress,
+        agentAddress: meta.agentAddress,
+        agentName: meta.agentName,
+        validUntil: meta.validUntil,
+      }),
+    }));
+  }
+
+  /**
+   * Generates a fresh agent key (never reused), stores it pending under the requested mode (with the passkey and
+   * IndexedDB fallbacks) and makes it the current key. `describe` adds the caller's result fields; it runs before the
+   * key is stored, so a failure there leaves the previous key in place.
+   */
+  private async createKey<X extends object>(
+    p: { userAddress: Hex; agentName: string; validForDays: number; storageMode: StorageMode; replaceExisting?: boolean | undefined },
+    kind: "local" | "linked",
+    describe: (meta: KeyMeta) => X,
+  ): Promise<X & Omit<CreateAgentResult, "approveAgent">> {
     return await this.withState(async () => {
       if (!isWriteAllowed(this.config.network)) throw new SignerFailure("MAINNET_WRITES_DISABLED", "This frame build does not allow mainnet writes.");
       const existing = this.key;
@@ -635,7 +683,7 @@ export class FrameCore {
           details: { agentAddress: existing.meta.agentAddress, keyState: this.keyStateOf(existing) },
         });
       }
-      const agentName = p.agentName ?? this.config.defaultAgentName;
+      const agentName = p.agentName;
       let mode: StorageMode = p.storageMode;
       let fallbackReason: string | undefined;
       if (mode === "passkey") {
@@ -674,16 +722,14 @@ export class FrameCore {
 
       const now = this.correctedNow();
       const validUntil = now + p.validForDays * DAY_MS;
-      const approveAgent = buildApproveAgent({
-        agentAddress,
-        agentName,
-        validUntil,
-        nonce: now,
-        now,
-        network: this.config.network,
-        ...(p.signatureChainId !== undefined ? { signatureChainId: p.signatureChainId } : {}),
-      });
       const meta: KeyMeta = { agentAddress, agentName, userAddress: p.userAddress, validUntil, keyState: "pending", storageMode: mode, createdAt: now };
+      let extra: X;
+      try {
+        extra = describe({ ...meta });
+      } catch (e) {
+        wipe(secret);
+        throw e;
+      }
 
       try {
         if (mode === "passkey") {
@@ -707,18 +753,18 @@ export class FrameCore {
       }
 
       this.setKey({ meta, account });
-      this.log("key.created", { agent: agentAddress, storageMode: mode, ...(fallbackReason ? { fallback: "yes" } : {}) });
+      this.log("key.created", { agent: agentAddress, storageMode: mode, ...(fallbackReason ? { fallback: "yes" } : {}), ...(kind === "linked" ? { reason: "linked" } : {}) });
       this.notifyOtherTabs();
       this.statusChanged();
       return {
+        ...extra,
         agentAddress,
         agentName,
         validUntil,
         storageMode: mode,
         requestedStorageMode: p.storageMode,
         ...(fallbackReason !== undefined ? { storageFallbackReason: fallbackReason } : {}),
-        keyState: "pending",
-        approveAgent,
+        keyState: "pending" as const,
       };
     });
   }

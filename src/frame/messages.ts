@@ -5,6 +5,7 @@
  *
  * @module
  */
+import { LINK_PAIRING_ID_PATTERN, LINK_SECRET_PATTERN } from "@kokoah/shared/link";
 import * as v from "valibot";
 import {
   BASELINE_ACTION_TYPES,
@@ -58,6 +59,17 @@ export const PARAMS_SCHEMAS = {
     agentName: v.optional(AgentName),
     signatureChainId: v.optional(ChainIdHex),
     replaceExisting: v.optional(v.boolean()),
+  }),
+  createLinkedAgent: v.strictObject({
+    userAddress: Address,
+    agentName: AgentName,
+    validForDays: v.pipe(v.number(), v.integer(), v.minValue(MIN_VALID_FOR_DAYS), v.maxValue(MAX_VALID_FOR_DAYS)),
+    storageMode: v.picklist(["passkey", "device", "session"]),
+    replaceExisting: v.optional(v.boolean()),
+    link: v.strictObject({
+      pairingId: v.pipe(v.string(), v.regex(LINK_PAIRING_ID_PATTERN, "pairingId must be a lowercase UUID")),
+      secret: v.pipe(v.string(), v.regex(LINK_SECRET_PATTERN, "secret must be 16 bytes of base64url")),
+    }),
   }),
   confirmAgent: v.strictObject({
     timeoutMs: v.optional(v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(MAX_CONFIRM_TIMEOUT_MS))),
