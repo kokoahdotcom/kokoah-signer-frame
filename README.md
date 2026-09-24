@@ -194,8 +194,9 @@ These aren't in this repo's power; they are for the kokoah-infra owners.
    ```
    Show `r.marketOrder` (mid and IOC price signed) for market orders, `r.outcome.statuses` for `ok`, and `r.error` for `rejected`. The final state comes from the WebSocket.
 7. **Security center (J11):** `revoke()` → sign `revokeAgent.typedData` → post it like step 5. If the result has `wipeError` (`wiped: false`), the stored copy couldn't be deleted: still post `revokeAgent`, tell the user, and call `revoke()` again.
-8. **Settings (§B11.4):** `setLimits({...})` after every `hello` and on every `reconnected`. Loosening fails with `LIMIT_LOOSENING_REJECTED`.
-9. **Errors:** `SignerRequestError.code` is one of the `SignerErrorCode`s in [PROTOCOL §6](docs/PROTOCOL.md#6-errors), with recommended handling.
+8. **Link phone:** on the phone, after claiming the pairing, `createLinkedAgent({ userAddress, agentName, validForDays: 30, storageMode: "device", link: { pairingId, secret } })` returns the pending key's address, expiry and the 6-digit `matchCode` to show; the computer approves the key with its main wallet, then the phone calls `confirmAgent`. See [PROTOCOL §12](docs/PROTOCOL.md#12-link-phone).
+9. **Settings (§B11.4):** `setLimits({...})` after every `hello` and on every `reconnected`. Loosening fails with `LIMIT_LOOSENING_REJECTED`.
+10. **Errors:** `SignerRequestError.code` is one of the `SignerErrorCode`s in [PROTOCOL §6](docs/PROTOCOL.md#6-errors), with recommended handling.
 
 ## Dev harness
 
@@ -223,6 +224,7 @@ Ports can be changed with `DEV_HARNESS_PORT` and `DEV_FRAME_PORT`; `0` picks fre
 - **validation**: malformed and oversized messages;
 - **`createAgent`**: named agent with `valid_until`; typed data equal to shared `buildApproveAgent`; a fresh address every time; reuse refused;
 - **`confirmAgent`**: HL `extraAgents`, polling, expiry clamping;
+- **`createLinkedAgent`** (Link phone): a fresh pending key, the matching code over exactly that key, no typed data, the link secret never echoed, strict params;
 - **signing happy path**: signer recovered with shared `recoverL1Signer` equals the agent; body equals shared `buildExchangeRequest` of shared `compileAction`; builder present;
 - **results**: `ok`, `rejected`, `unknown`; `requestId` idempotency;
 - **policy denials**: vault/transfer/withdraw wire actions, builder mismatch or missing, price band, leverage (market maximum and tightened), per-minute rate (persisted across reloads), notional, coins, stop-loss, origin; `setLimits` loosening rejected and tightening applied;

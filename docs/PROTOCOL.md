@@ -18,6 +18,7 @@ Contents:
 9. [Several tabs](#9-several-tabs)
 10. [Rules for the parent](#10-rules-for-the-parent)
 11. [Versioning](#11-versioning)
+12. [Link phone](#12-link-phone)
 
 ---
 
@@ -273,6 +274,48 @@ Creates a **fresh** key (never reused; the frame refuses an address it has gener
   - `STORAGE_FAILED`;
   - `MAINNET_WRITES_DISABLED`;
   - `INVALID_REQUEST`.
+
+### `createLinkedAgent`
+
+"Link phone" ([§12](#12-link-phone)): creates this device's **own** fresh key for an account whose main wallet is on
+**another** device (the computer). It is the same key lifecycle as `createAgent` (fresh address, stored `pending`,
+same storage modes and fallbacks, `replaceExisting`), with two differences: the agent name comes from the pairing,
+and instead of `approveAgent` typed data the frame returns the 6-digit **matching code** for the key it holds.
+
+→
+```json
+{ "userAddress": "0x11…user", "agentName": "kokoah-ph12", "validForDays": 30, "storageMode": "device",
+  "replaceExisting": false,
+  "link": { "pairingId": "0b7f1a52-3c3d-4c1e-9d0e-6a1b2c3d4e5f", "secret": "AAECAwQFBgcICQoLDA0ODw" } }
+```
+
+| Param | Rules |
+|---|---|
+| `userAddress` | The account the backend's pairing is bound to, 20-byte hex |
+| `agentName` | **Required**, 1–16 of `A–Z a–z 0–9 . _ -`, no `valid_until`: the name the computer will approve (it picked a free slot, or the slot the user chose to replace) |
+| `validForDays` | Integer 1–30 |
+| `storageMode` | As in `createAgent` |
+| `replaceExisting` | As in `createAgent` |
+| `link.pairingId` | The backend's pairing id, a lowercase UUID |
+| `link.secret` | The link secret from the QR code's URL fragment: 16 bytes as base64url (22 characters). Used for the code only; never stored, logged or echoed |
+
+←
+```json
+{ "agentAddress": "0x9f…agent", "agentName": "kokoah-ph12", "validUntil": 1792670400000,
+  "storageMode": "device", "requestedStorageMode": "device", "keyState": "pending",
+  "pairingId": "0b7f1a52-3c3d-4c1e-9d0e-6a1b2c3d4e5f", "matchCode": "482913" }
+```
+
+- `matchCode` is `@kokoah/shared/link` `deviceLinkCode({ secret, pairingId, userAddress, agentAddress, agentName,
+  validUntil })`: HMAC-SHA256 keyed with the link secret over those fields, 6 digits. The computer computes the same
+  code from the fields the backend relays; if anyone swapped the agent address (or the name or expiry), the codes
+  differ.
+- No `approveAgent` is returned: there is no main wallet on this device. The computer builds its own `approveAgent`
+  for exactly `agentAddress`, `agentName` and `validUntil`, and the phone calls `confirmAgent` once the backend says
+  it was approved.
+- The key refuses to sign (`KEY_PENDING`) until `confirmAgent` finds it on Hyperliquid under `userAddress` with that
+  name.
+- Errors: as `createAgent`; `INVALID_REQUEST` for a missing name or a malformed `link`.
 
 ### `confirmAgent`
 
@@ -623,3 +666,27 @@ Denials come back as `POLICY_DENIED` with every violation, for example:
 
 - `version: 1` is in every envelope. Additive changes (new optional params, new result fields, new events, new error codes) keep version 1: ignore unknown fields and codes.
 - Breaking changes create version 2. A frame answers other versions with `UNSUPPORTED_VERSION`.
+
+## 12. Link phone
+
+A user signed in on a computer starts trading on a phone with no wallet app on the phone. **No key ever travels**: the
+phone's frame creates its own key; the computer's main wallet approves that key's address with one readable
+`approveAgent` signature. The pairing API is in kokoah-backend `docs/API.md` ("Linked devices"); the threat model is in
+[THREAT_MODEL.md §7](THREAT_MODEL.md#7-link-phone).
+
+1. **Computer** (signed in with its main wallet): picks the agent name (a free slot of Hyperliquid's three named
+   agents, or the slot the user chose to replace), asks the backend for a pairing (`POST /v1/devices/link`, a one-time
+   token that expires in 5 minutes, bound to this session and address) and generates a 16-byte link secret itself. It
+   shows a QR code for `https://<app>/link#t=<token>&k=<secret>`. The fragment never reaches a server.
+2. **Phone** opens the link, removes the fragment from the address bar, claims the token (`POST /v1/link/claim`,
+   one-time), and calls `createLinkedAgent` with the pairing's account and agent name and the link secret. It sends
+   only `agentAddress` and `validUntil` to the backend, and shows `matchCode`.
+3. **Computer** receives the phone's device name, agent address and expiry from the backend, computes
+   `deviceLinkCode` itself and shows the same 6 digits. The user checks that both screens match; the app refuses to
+   continue otherwise ("They don't match" cancels the pairing).
+4. **Computer** builds `buildApproveAgent({ agentAddress, agentName, validUntil, … })`, the main wallet signs it (one
+   readable signature), the app posts it to Hyperliquid and tells the backend, which checks `extraAgents` itself.
+5. **Phone** calls `confirmAgent` and gets a Kokoah session for the account, marked as a linked device.
+
+The phone's key is an ordinary agent key: the frame's baseline policy and the user's limits apply, it can't withdraw or
+send, and it can be revoked on its own (by name, with the main wallet) from the computer's Security center.
