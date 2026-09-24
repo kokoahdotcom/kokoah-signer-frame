@@ -90,6 +90,7 @@ export const PARAMS_SCHEMAS = {
     allowedCoins: v.optional(v.pipe(v.array(Coin), v.minLength(1), v.maxLength(500))),
     requireStopLossForNewEntries: v.optional(v.boolean()),
     allowedActionTypes: v.optional(v.pipe(v.array(v.picklist(BASELINE_ACTION_TYPES)), v.minLength(1), v.maxLength(BASELINE_ACTION_TYPES.length))),
+    account: v.optional(Address),
   }),
   revoke: v.strictObject({
     agentName: v.optional(AgentName),

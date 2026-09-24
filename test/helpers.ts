@@ -105,6 +105,10 @@ export class MockHl {
   serverOffsetMs = 0;
   extraAgents: Record<string, Array<{ address: string; name: string; validUntil: number | null }>> = {};
   leverage: Record<string, number> = {};
+  /** Leverage per account (lowercase address) and coin; falls back to `leverage`. */
+  leverageByUser: Record<string, Record<string, number>> = {};
+  /** HL `subAccounts` answers by master (lowercase); unknown masters answer `null`. */
+  subAccounts: Record<string, unknown> = {};
   infoCalls: Array<Record<string, unknown>> = [];
   exchangeCalls: ExchangeCall[] = [];
   infoFailure: ((body: Record<string, unknown>) => boolean) | null = null;
@@ -152,8 +156,10 @@ export class MockHl {
         return { time: this.clock.now() + this.serverOffsetMs, specialStatuses: null };
       case "extraAgents":
         return this.extraAgents[String(body.user).toLowerCase()] ?? [];
+      case "subAccounts":
+        return this.subAccounts[String(body.user).toLowerCase()] ?? null;
       case "activeAssetData": {
-        const lev = this.leverage[String(body.coin)] ?? 10;
+        const lev = this.leverageByUser[String(body.user).toLowerCase()]?.[String(body.coin)] ?? this.leverage[String(body.coin)] ?? 10;
         return { user: body.user, coin: body.coin, leverage: { type: "cross", value: lev }, maxTradeSzs: ["1", "1"], availableToTrade: ["1", "1"], markPx: this.mark[String(body.coin)] };
       }
       default:
@@ -448,6 +454,11 @@ let cloidCounter = 0;
 export function cloid(): `0x${string}` {
   cloidCounter++;
   return `0x6b6f0101${cloidCounter.toString(16).padStart(24, "0")}`;
+}
+
+/** An HL `subAccounts` entry. */
+export function subAccountEntry(address: string, master: string = USER, name = "Swing"): Record<string, unknown> {
+  return { name, subAccountUser: address, master, clearinghouseState: { marginSummary: { accountValue: "0" }, assetPositions: [] }, spotState: { balances: [] } };
 }
 
 export function limitOrder(overrides: Record<string, unknown> = {}): Record<string, unknown> {

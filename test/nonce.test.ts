@@ -92,7 +92,7 @@ describe("nonces across two tabs sharing IndexedDB", () => {
     expect(Math.min(...nonces)).toBe(T0);
     expect(Math.max(...nonces)).toBe(T0 + 49);
     const usage = usageOf(await s1.readUsage("0xabc"), T0);
-    expect(usage).toEqual({ ordersInLastMinute: 50, dailyNotionalUsedUsd: 500 });
+    expect(usage).toEqual({ ordersInLastMinute: 50, dailyNotionalUsedUsd: 500, accountDailyNotionalUsd: 500 });
   });
 });
 

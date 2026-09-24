@@ -12,9 +12,14 @@
  * `RESTING_PRICE_BAND_PCT` (50%) away; untriggered triggers likewise. Mark and mid always come from the frame's own
  * HL reads.
  *
- * The frame adds three things the shared policy has no field for: the per-market leverage cap (baseline = each
- * market's own maximum), a hard "no `vaultAddress`" rule independent of the policy object, and the notional counted
- * against the daily limit.
+ * The frame adds four things the shared policy has no field for: the per-market leverage cap (baseline = each
+ * market's own maximum), a hard `vaultAddress` rule independent of the policy object (only a sub-account that the
+ * frame itself found in HL's `subAccounts` list of the key's master; HL vaults and anything else are denied), the
+ * notional counted against the daily limit, and the agent-wide baseline daily cap across all accounts.
+ *
+ * Personal limits (`setLimits`) are kept per account: the master's, and optionally one set per sub-account (a
+ * sub-account without its own uses the master's). Orders per minute are counted per agent across accounts; daily
+ * notional per account for personal limits, and per agent for the baseline cap.
  *
  * @module
  */
@@ -109,8 +114,29 @@ export function applyUserLimits(baseline: Policy, limits: UserLimits): ApplyLimi
   return { ok: true, policy, limits: Object.keys(cleaned).length > 0 ? cleaned : null };
 }
 
+/** Most sub-accounts with their own limits a frame keeps (HL allows 50 per master). */
+export const MAX_ACCOUNT_LIMITS = 64;
+
+/** Per-sub-account limits set with `setLimits({ account, … })`. */
+export interface AccountLimits {
+  policy: Policy;
+  limits: UserLimits;
+}
+
+/** The policy for an account: the sub-account's own limits when set, else the master's. */
+export function policyForAccount(masterPolicy: Policy, accountLimits: ReadonlyMap<string, AccountLimits>, subAccount: string | undefined): Policy {
+  if (subAccount === undefined) return masterPolicy;
+  return accountLimits.get(subAccount.toLowerCase())?.policy ?? masterPolicy;
+}
+
+/** The limits for an account (see {@link policyForAccount}). */
+export function limitsForAccount(masterLimits: UserLimits | null, accountLimits: ReadonlyMap<string, AccountLimits>, subAccount: string | undefined): UserLimits | null {
+  if (subAccount === undefined) return masterLimits;
+  return accountLimits.get(subAccount.toLowerCase())?.limits ?? masterLimits;
+}
+
 /** Summary of the effective policy for `getStatus`. */
-export function summarizeFramePolicy(policy: Policy, userLimits: UserLimits | null): PolicySummary {
+export function summarizeFramePolicy(policy: Policy, userLimits: UserLimits | null, accountLimits: ReadonlyMap<string, AccountLimits> = new Map()): PolicySummary {
   const builder = policy.requiredBuilder;
   if (!builder) throw new Error("The frame policy always requires a builder");
   return {
@@ -124,9 +150,11 @@ export function summarizeFramePolicy(policy: Policy, userLimits: UserLimits | nu
     requireStopLossForNewEntries: policy.requireStopLossForNewEntries,
     builder: { address: builder.b, feeTenthsBps: builder.f },
     vaultAddressAllowed: false,
+    ownSubAccountsAllowed: true,
     expiresAfterMs: EXPIRES_AFTER_MS,
     allowedOrigins: (policy.allowedOrigins ?? ["manual", "ai_ticket"]).filter((o): o is "manual" | "ai_ticket" => o !== "guardian"),
     userLimits: userLimits === null ? null : structuredClone(userLimits),
+    accountLimits: Object.fromEntries([...accountLimits].map(([account, a]) => [account, structuredClone(a.limits)])) as Record<`0x${string}`, UserLimits>,
   };
 }
 
@@ -205,10 +233,22 @@ export interface FramePolicyInput {
    * marketable (executes now: `priceBandPct`) versus resting (up to `RESTING_PRICE_BAND_PCT` from mark).
    */
   midPrices?: Readonly<Record<string, string | number>>;
+  /** Orders this agent signed in the last minute, across every account. */
   ordersInLastMinute: number;
+  /** Notional already signed today for the account the action is for (checked against the account's own limit). */
   dailyNotionalUsedUsd: number;
-  /** The user's current leverage per coin, when known (only fetched when `maxLeverage` was tightened). */
+  /**
+   * Notional this agent signed today across every account, checked against the baseline daily cap so spreading
+   * orders over sub-accounts can't multiply it. Omitted: `dailyNotionalUsedUsd` (single account).
+   */
+  agentDailyNotionalUsedUsd?: number;
+  /** The account's current leverage per coin, when known (only fetched when `maxLeverage` was tightened). */
   leverageByCoin?: Readonly<Record<string, number>>;
+  /**
+   * The sub-account the frame itself found in HL's `subAccounts` list of the key's master (never taken from the
+   * parent). An action with `vaultAddress` is denied unless it equals this address.
+   */
+  ownedSubAccount?: `0x${string}`;
 }
 
 /** Decision of {@link evaluateFramePolicy}. */
@@ -235,14 +275,37 @@ export function leverageCapFor(policy: Policy, registry: MarketRegistry, coins: 
 export function evaluateFramePolicy(input: FramePolicyInput): FramePolicyDecision {
   const coins = intentCoins(input.compiled);
   const cap = leverageCapFor(input.policy, input.registry, coins);
-  const policy: Policy = cap === input.policy.maxLeverage ? input.policy : { ...input.policy, maxLeverage: Math.max(1, Math.floor(cap)) };
   const violations: PolicyViolation[] = [];
   const add = (v: PolicyViolation) => {
     if (!violations.some((x) => x.code === v.code && x.message === v.message)) violations.push(v);
   };
-  // Frame rule: master account only in v1, regardless of what the policy object says.
-  if (input.compiled.vaultAddress !== undefined || input.compiled.intent.vaultAddress !== undefined) {
-    add({ code: "VAULT_NOT_ALLOWED", message: "The signer frame acts for the master account only; vaultAddress must be absent." });
+  // Frame rule: the master account, or one of its own sub-accounts as verified by the frame on HL. The policy
+  // object's allowedVaultAddresses is ignored: it is replaced by the verified address or by nothing.
+  const wireVault = lowerOrUndefined(input.compiled.vaultAddress);
+  const intentVault = lowerOrUndefined(input.compiled.intent.vaultAddress);
+  const owned = lowerOrUndefined(input.ownedSubAccount);
+  let allowedVaults: `0x${string}`[] = [];
+  if (wireVault !== undefined || intentVault !== undefined) {
+    if (wireVault !== intentVault) {
+      add({ code: "VAULT_NOT_ALLOWED", message: "The signed vaultAddress differs from the intent's." });
+    } else if (owned === undefined || owned !== wireVault) {
+      add({ code: "VAULT_NOT_ALLOWED", message: `The signer frame acts only for the master account and its own sub-accounts; ${wireVault} is not a sub-account of this key's master on Hyperliquid.` });
+    } else {
+      allowedVaults = [owned];
+    }
+  }
+  const policy: Policy = {
+    ...input.policy,
+    allowedVaultAddresses: allowedVaults,
+    ...(cap === input.policy.maxLeverage ? {} : { maxLeverage: Math.max(1, Math.floor(cap)) }),
+  };
+  // Frame rule: the baseline daily cap holds per agent, across every account.
+  if (input.agentDailyNotionalUsedUsd !== undefined) {
+    const action = input.compiled.action as unknown as Record<string, unknown>;
+    const next = input.agentDailyNotionalUsedUsd + actionNotionalUsd(action, input.registry, input.markPrices);
+    if (next > BASELINE_LIMITS.maxDailyNotionalUsd) {
+      add({ code: "DAILY_NOTIONAL_EXCEEDED", message: `This device's key would pass the signer's daily limit of $${BASELINE_LIMITS.maxDailyNotionalUsd.toLocaleString("en-US")} across all accounts.` });
+    }
   }
   const midPrices: Record<string, number> = {};
   for (const [coin, raw] of Object.entries(input.midPrices ?? {})) {
@@ -275,4 +338,8 @@ export function evaluateFramePolicy(input: FramePolicyInput): FramePolicyDecisio
   );
   for (const v of wireDecision.violations) add(v);
   return { allowed: violations.length === 0, violations, actionType: wireDecision.actionType };
+}
+
+function lowerOrUndefined(address: string | undefined): `0x${string}` | undefined {
+  return address === undefined ? undefined : (address.toLowerCase() as `0x${string}`);
 }

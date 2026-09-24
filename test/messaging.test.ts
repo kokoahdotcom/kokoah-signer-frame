@@ -167,9 +167,11 @@ describe("hello and status", () => {
       requireStopLossForNewEntries: false,
       builder: { address: "0x00000000000000000000000000000000000b0b1d", feeTenthsBps: 25 },
       vaultAddressAllowed: false,
+      ownSubAccountsAllowed: true,
       expiresAfterMs: 15_000,
       allowedOrigins: ["manual", "ai_ticket"],
       userLimits: null,
+      accountLimits: {},
     });
   });
 

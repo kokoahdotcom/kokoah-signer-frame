@@ -24,7 +24,7 @@ function compiledOrder(overrides: Record<string, unknown> = {}, builder: { addre
 const codes = (d: { violations: Array<{ code: string }> }) => d.violations.map((v) => v.code);
 
 describe("baseline policy", () => {
-  it("allows exactly the trading actions and requires builder, expiresAfter and the master account", () => {
+  it("allows exactly the trading actions and requires builder and expiresAfter; no vault is listed in the policy object", () => {
     expect([...baseline.allowedActionTypes]).toEqual(["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop"]);
     expect(baseline.requiredBuilder).toEqual({ b: BUILDER, f: 25 });
     expect(baseline.allowedVaultAddresses).toEqual([]);
@@ -76,7 +76,7 @@ describe("baseline policy", () => {
 });
 
 describe("policy through signAndSubmit", () => {
-  it("denies an intent acting for a vault or sub-account", async () => {
+  it("denies an intent acting for a vault or an account HL doesn't list as the master's sub-account", async () => {
     h = await FrameHarness.create();
     await h.activeAgent("device");
     const e = await h.fail("signAndSubmit", { requestId: "v", intent: limitOrder({ vaultAddress: `0x${"66".repeat(20)}` }) });
