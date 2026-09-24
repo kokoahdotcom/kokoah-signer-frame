@@ -405,14 +405,23 @@ signature). This is how the app offers passkey protection as an optional upgrade
 
 `origin` must be `manual` or `ai_ticket`. Guardian intents are signed by the server, never by this frame.
 
+`intent.vaultAddress` trades for a **sub-account** ("strategy account") of the key's master. The frame signs it only
+when HL's own `{"type":"subAccounts","user":<master>}` lists that address with `master` equal to the key's master
+(read by the frame itself, cached 30 s, re-read on a miss once the list is 5 s old). Anything else — a vault the master
+leads, another user's sub-account, the master's own address — is `POLICY_DENIED` with `VAULT_NOT_ALLOWED`; when HL's
+list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE` (retryable).
+
 **The parent never supplies prices, registries, builder or nonce.** There is no field for them, and unknown fields are rejected. The frame then does the following, in order:
-1. Validates the intent (`safeParseActionIntent`).
+1. Validates the intent (`safeParseActionIntent`). With `vaultAddress`, checks on HL that it is one of the master's
+   sub-accounts (above).
 2. Fetches its **own** market metadata and mark/mid prices from HL `/info` (`metaAndAssetCtxs`, per perp dex; `perpDexs` for HIP-3; cached about 3 s). It syncs its clock with `exchangeStatus`.
 3. Compiles with `compileAction`, using the configured builder `{b, f}`. Market orders become IOC limits at the frame's own mid ± `slippageBps`.
 4. Takes the per-agent Web Lock (serialized across tabs).
-5. Evaluates the policy ([§7](#7-policy)) on the compiled action and again on the exact wire action.
-6. Reserves a nonce, `max(now + clockOffset, last + 1)`, persisted in IndexedDB.
-7. Signs with `expiresAfter = now + 15 s`.
+5. Evaluates the policy ([§7](#7-policy)) of the account the intent is for, on the compiled action and again on the
+   exact wire action.
+6. Reserves a nonce, `max(now + clockOffset, last + 1)`, persisted in IndexedDB. One key signs for every account, so
+   nonces stay unique and increasing across accounts (HL tracks nonces per signer).
+7. Signs with `expiresAfter = now + 15 s` (and `vaultAddress` for a sub-account, inside the signed hash).
 8. Submits to HL `/exchange` itself.
 
 ←
@@ -480,9 +489,16 @@ Sizes and prices must already be valid for the market (shared `formatSize`, `che
 
 ### `setLimits`
 
-Personal limits (Settings, §B11.4). They can only **tighten** the frame's baseline, and they **replace** the previous user limits (`{}` resets to the baseline). Loosening anything rejects the whole call and changes nothing.
+Personal limits (Settings, §B11.4). They can only **tighten** the frame's baseline, and they **replace** the previous limits of that account (`{}` resets the master to the baseline). Loosening anything rejects the whole call and changes nothing.
 
 → `{ "maxOrderNotionalUsd": 5000, "maxDailyNotionalUsd": 50000, "maxLeverage": 10, "requireStopLossForNewEntries": true }`
+
+Limits are kept **per account**. Without `account` (or with the key's master) the call sets the master's limits. With a
+sub-account's address it sets that sub-account's own limits, which replace the master's for it:
+`{ "account": "0x…sub", "maxOrderNotionalUsd": 1000 }`. `{ "account": "0x…sub" }` alone removes them, so the
+sub-account uses the master's limits again. A sub-account without its own limits always uses the master's. At most 64
+sub-accounts can have their own limits. Setting limits for an address grants nothing: `vaultAddress` is still checked
+on HL at signing.
 
 ← `{ "policy": PolicySummary }` ([§7](#7-policy)). The frame also emits `statusChanged`.
 
@@ -493,8 +509,11 @@ Personal limits (Settings, §B11.4). They can only **tighten** the frame's basel
 | `allowedCoins` | Non-empty list of HL coin names (a subset of the baseline) |
 | `requireStopLossForNewEntries` | `true` tightens; `false` is a no-op |
 | `allowedActionTypes` | A subset of the baseline action types |
+| `account` | Optional sub-account address (see above) |
 
-- User limits live in the frame's memory: re-apply them after `hello` on every load and on `reconnected` (store them in settings).
+- User limits live in the frame's memory: re-apply them (the master's and every sub-account's) after `hello` on every load and on `reconnected` (store them in settings).
+- Counting: orders per minute are counted per key across all accounts. Daily notional is counted per account for its
+  own `maxDailyNotionalUsd`, and per key across all accounts for the baseline $25M.
 - Errors:
   - `LIMIT_LOOSENING_REJECTED`, with `details.fields` listing the fields that would loosen;
   - `INVALID_REQUEST`.
@@ -596,23 +615,25 @@ The baseline is built into the frame and can't be loosened:
 |---|---|
 | Allowed action types | `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `updateLeverage`, `updateIsolatedMargin`, `scheduleCancel`, `noop`. Everything else is denied, and fund movements, vault/sub-account actions, approvals, TWAP etc. are hard-denied by the shared policy anyway |
 | Builder | Every `order` carries exactly `{ b: VITE_BUILDER_ADDRESS, f: VITE_BUILDER_FEE_TENTHS_BPS }` |
-| `vaultAddress` | Must be absent (master account only in v1) |
+| `vaultAddress` | Absent (the master), or one of the master's own sub-accounts as listed by HL `subAccounts`, read by the frame itself. Vaults and any other address are denied (`VAULT_NOT_ALLOWED`) |
 | Price band | Orders that execute now (market, IOC, and marketable limits: a buy at or above min(mark, mid), a sell at or below max(mark, mid)) within **10%** of HL's mark; market-order slippage ≤ 10%. Resting GTC/ALO limits that don't cross may sit up to **50%** from mark (shared `RESTING_PRICE_BAND_PCT`), which still stops typos like 8500 for 85000. Triggers: the limit within 10% of its trigger; an untriggered trigger up to 50% from mark; a trigger that would fire now banded at 10% from mark. Mark and mid come from the frame's own HL reads. `setLimits.priceBandPct` tightens the 10% band only |
 | Leverage | Each market's own maximum (`updateLeverage` above it is denied) |
 | Rate | **60 orders per minute** per agent (TP/SL legs count; cancels don't). Persisted, so a reload doesn't reset it |
-| Notional | $1,000,000 per order, $25,000,000 per UTC day (reduce-only orders exempt) |
+| Notional | $1,000,000 per order, $25,000,000 per UTC day per key across every account (reduce-only orders exempt) |
 | `expiresAfter` | Required; the frame uses now + 15 s (window ≤ 30 s) |
 | Origins | `manual`, `ai_ticket` |
 
-`status.policy` (`PolicySummary`) shows the effective values:
+`status.policy` (`PolicySummary`) shows the master's effective values; `accountLimits` lists sub-accounts with limits of
+their own:
 
 ```json
 {
   "allowedActionTypes": ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop"],
   "allowedCoins": "*", "maxOrderNotionalUsd": 1000000, "maxDailyNotionalUsd": 25000000, "maxLeverage": "market",
   "maxOrdersPerMinute": 60, "priceBandPct": 10, "requireStopLossForNewEntries": false,
-  "builder": { "address": "0x…builder", "feeTenthsBps": 25 }, "vaultAddressAllowed": false, "expiresAfterMs": 15000,
-  "allowedOrigins": ["manual", "ai_ticket"], "userLimits": null
+  "builder": { "address": "0x…builder", "feeTenthsBps": 25 }, "vaultAddressAllowed": false, "ownSubAccountsAllowed": true,
+  "expiresAfterMs": 15000, "allowedOrigins": ["manual", "ai_ticket"], "userLimits": null,
+  "accountLimits": { "0x…sub": { "maxOrderNotionalUsd": 1000 } }
 }
 ```
 
@@ -660,7 +681,9 @@ Denials come back as `POLICY_DENIED` with every violation, for example:
 - Don't send prices, registries, nonces or builders; the frame ignores or rejects them. The ticket's own numbers are for display and risk estimates only.
 - The main wallet signs only readable typed data: `approveAgent`, `revokeAgent`, builder fee. **Never** an L1 action.
 - Never log or forward signatures, and never ask for a seed phrase.
-- Re-apply `setLimits` and `setTheme` after each `hello` and on `reconnected`.
+- Re-apply `setLimits` (the master's and each sub-account's) and `setTheme` after each `hello` and on `reconnected`.
+- Put `vaultAddress` on every intent for a sub-account (orders, cancels, modifies, leverage, margin, `scheduleCancel`):
+  the account a request acts for is part of the signed hash.
 
 ## 11. Versioning
 

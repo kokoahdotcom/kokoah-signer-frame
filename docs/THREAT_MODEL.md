@@ -10,7 +10,10 @@ An HL agent key **cannot**:
 
 Those need the main wallet. It **can**:
 - place, modify and cancel orders on any market, and change leverage and margin;
-- sign `vaultTransfer`, `createVault` (10k USDC fee), `createSubAccount`, `reserveRequestWeight` and others (research B §1.7).
+- do all of that **for the master's sub-accounts and for any vault the master leads**, by setting `vaultAddress` on
+  the request (sub-accounts and vaults have no key of their own);
+- sign `vaultTransfer`, `createVault` (10k USDC fee), `createSubAccount`, `agentSendAsset`, `reserveRequestWeight` and
+  others (research B §1.7).
 
 A stolen agent key can therefore still drain an account:
 - by trading against the attacker's resting orders in thin markets;
@@ -51,6 +54,8 @@ Trust boundaries:
 | A9 | A malicious parent that reloads the frame to reset limits | Reset in-memory counters | Rate and daily-notional counters are persisted in IndexedDB | Tested (reload keeps the rate limit) |
 | A10 | A malicious parent that feeds fake prices to widen the band | Get orders signed far from the market | The frame fetches mark and mid itself from HL `/info`; there's no protocol field for prices | Tested |
 | A11 | Replay of old signed actions | Resubmit captured actions | Signatures never leave the frame except to HL. `expiresAfter` = now + 15 s. Nonces are unique and never reused. Agent addresses are never reused (HL prunes a deregistered agent's nonce state) | Tested |
+| A12 | A1 asks the frame to act for **another account** (`intent.vaultAddress`): a vault the user leads, someone else's sub-account, a made-up address | Trade that account with the user's key | `vaultAddress` is signed only for an address that HL's own `subAccounts` answer lists with `master` equal to the key's master. The frame reads it itself (its own `fetch`, `connect-src` HL only), never from the parent; there is no protocol field for ownership; the policy object's `allowedVaultAddresses` is replaced by the one verified address or by nothing. Cached 30 s (a re-read on a miss once the list is 5 s old); a failed or unreadable read signs nothing. Sub-accounts can't change master, so a cached "owned" can't become wrong; a stale "not owned" only denies. The address is inside the signed hash, so an action signed for one account can't be replayed for another | Unit-tested (`test/subaccounts.test.ts`) |
+| A13 | A1 spreads orders over many sub-accounts to escape limits | Multiply the daily notional cap | The baseline $25M/day holds per key across every account (per-account figures only feed personal limits); orders per minute are per key | Unit-tested |
 
 ## 4. What each storage mode protects (plainly)
 
@@ -69,10 +74,11 @@ Trust boundaries:
    - an in-frame confirmation for orders above a threshold (TODO).
 2. **In-frame prompts can be clickjacked by the parent** (made transparent or covered). The browser's own WebAuthn dialog still appears and names the signer, and the result is still policy-bounded. IntersectionObserver v2 visibility checks are a possible hardening (TODO).
 3. **Passkeys and headers.** Resolved 2026-09-22: kokoah-infra allows WebAuthn for the signer (`(self)`), and the app delegates it to the signer origin. If a deployment's `Permissions-Policy` disables it again, every `passkey` request falls back to `device` (reported via `storageFallbackReason`).
-4. **User limits are not persisted by the frame.** The parent re-applies them after each load, including a reload of the frame alone (the client's `reconnected` event). A compromised parent can drop them back to the baseline, but never below it.
+4. **User limits are not persisted by the frame.** The parent re-applies them after each load, including a reload of the frame alone (the client's `reconnected` event). A compromised parent can drop them back to the baseline, but never below it. Per-account limits (`setLimits` with `account`) work the same way, and a sub-account without its own limits uses the master's.
 5. **Revocation needs the main wallet.** `revoke` wipes the local key at once (or reports `wipeError` when IndexedDB refuses to delete the stored copy, which would then come back after a reload), but the agent stays registered on HL until the user signs and posts `revokeAgent`. The wiped key is unrecoverable, so that is safe unless the key was already stolen, in which case only the on-chain revoke (or expiry, at most 30 days) stops it.
 6. **Out of scope and unverified:** the WebAuthn PRF behaviour of real authenticators (Safari/iCloud Keychain, Windows Hello, Android, security keys) and passkeys inside sandboxed iframes. See README "Manual verification".
 7. **`modify` carries no builder field** in HL's schema. Whether a modified order keeps its builder fee is undocumented (shared library note). The policy enforces the builder on `order` only.
+8. **Sub-accounts trust HL's answer.** Ownership comes from HL `subAccounts` over HTTPS; a compromised HL API is out of scope (it could also lie about prices). Whether HL charges the builder fee on a sub-account's orders with only the master's `approveBuilderFee`, or needs an approval for the sub-account itself, is **unverified** (checked on funded testnet by the coordinator). The frame puts the builder on every sub-account order either way; if HL refuses them, sub-account trading fails closed ("builder fee not approved") rather than trading without the fee.
 
 ## 6. Controls checklist
 
@@ -89,6 +95,7 @@ Trust boundaries:
 | Key and signature never posted; outgoing guard | `errors.ts` | `test/leak.test.ts` |
 | Logs: fixed events, whitelisted fields | `log.ts` | `test/leak.test.ts` |
 | Baseline policy plus tighten-only limits | `policy.ts` (shared `evaluatePolicy`) | `test/policy.test.ts` |
+| `vaultAddress` only for the master's own sub-accounts, read from HL by the frame | `core.ts` (shared `SubAccountOwnership`), `policy.ts` | `test/subaccounts.test.ts` |
 | Frame-sourced prices and metadata | `market-data.ts` | `test/sign.test.ts` |
 | Named agent, `valid_until` ≤ 30 days, never reused, expiry enforced | `core.ts` | `test/agent.test.ts`, `test/lifecycle.test.ts` |
 | Nonces unique and increasing across tabs | `nonces.ts` | `test/nonce.test.ts` |
