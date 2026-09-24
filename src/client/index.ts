@@ -25,6 +25,8 @@ import {
   type ConfirmAgentParams,
   type CreateAgentParams,
   type CreateAgentResult,
+  type CreateLinkedAgentParams,
+  type CreateLinkedAgentResult,
   type EventData,
   type FrameToParentMessage,
   type HelloParams,
@@ -97,7 +99,7 @@ export interface KokoahSignerClientOptions {
   container?: HTMLElement;
   /** Default request timeout (ms). Default 30 000. */
   requestTimeoutMs?: number;
-  /** Timeout for requests that may wait for the user in the frame (`unlock`, `setStorageMode`, passkey `createAgent`). Default 300 000. */
+  /** Timeout for requests that may wait for the user in the frame (`unlock`, `setStorageMode`, passkey `createAgent` / `createLinkedAgent`). Default 300 000. */
   interactiveTimeoutMs?: number;
   /** How long `hello()` keeps trying to reach the frame (ms). Default 15 000. */
   helloTimeoutMs?: number;
@@ -231,6 +233,14 @@ export class KokoahSignerClient {
   /** Creates a fresh named agent key; the main wallet then signs `result.approveAgent.typedData` and the app posts it. */
   createAgent(params: CreateAgentParams): Promise<CreateAgentResult> {
     return this.request("createAgent", params, params.storageMode === "passkey" ? this.options.interactiveTimeoutMs : undefined);
+  }
+
+  /**
+   * "Link phone": creates this device's own agent key for an account whose main wallet is on another device and
+   * returns the 6-digit matching code to show. The other device approves the key; then call `confirmAgent`.
+   */
+  createLinkedAgent(params: CreateLinkedAgentParams): Promise<CreateLinkedAgentResult> {
+    return this.request("createLinkedAgent", params, params.storageMode === "passkey" ? this.options.interactiveTimeoutMs : undefined);
   }
 
   /** Asks the frame to look the agent up on Hyperliquid (`extraAgents`) and mark it active. */

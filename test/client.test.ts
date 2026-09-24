@@ -106,6 +106,21 @@ describe("KokoahSignerClient", () => {
     expect(statuses.length).toBe(n);
   });
 
+  it("links a phone: createLinkedAgent returns the matching code, confirmAgent activates the key", async () => {
+    const { h, client } = await connected();
+    const created = await client.createLinkedAgent({
+      userAddress: USER,
+      agentName: "kokoah-ph12",
+      validForDays: 30,
+      storageMode: "device",
+      link: { pairingId: "0b7f1a52-3c3d-4c1e-9d0e-6a1b2c3d4e5f", secret: "AAECAwQFBgcICQoLDA0ODw" },
+    });
+    expect(created.matchCode).toMatch(/^\d{6}$/);
+    expect(created.keyState).toBe("pending");
+    h.hl.approve(USER, created.agentAddress, created.agentName, created.validUntil);
+    expect((await client.confirmAgent({ timeoutMs: 1_000 })).keyState).toBe("active");
+  });
+
   it("surfaces frame errors as SignerRequestError with the protocol code", async () => {
     const { client } = await connected();
     await client.createAgent({ userAddress: USER, validForDays: 30, storageMode: "device" });
