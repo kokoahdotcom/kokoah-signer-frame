@@ -171,7 +171,8 @@ export function summarizeFramePolicy(policy: Policy, userLimits: UserLimits | nu
     vaultAddressAllowed: false,
     ownSubAccountsAllowed: true,
     expiresAfterMs: EXPIRES_AFTER_MS,
-    allowedOrigins: (policy.allowedOrigins ?? ["manual", "ai_ticket"]).filter((o): o is "manual" | "ai_ticket" => o !== "guardian"),
+    // The browser key signs only the user's own orders and AI tickets; server origins (guardian, bot, telegram) never.
+    allowedOrigins: (policy.allowedOrigins ?? ["manual", "ai_ticket"]).filter((o): o is "manual" | "ai_ticket" => o === "manual" || o === "ai_ticket"),
     spotCoins: [...(policy.allowedSpotCoins ?? [])],
     referralCode: policy.referralCode ?? null,
     userLimits: userLimits === null ? null : structuredClone(userLimits),
