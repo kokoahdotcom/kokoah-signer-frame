@@ -280,5 +280,7 @@ Two more suites run on demand:
 - **Tune the baseline limits.** $1M per order, $25M per day and a 10% band are wide backstops.
 - **Clickjacking hardening of the in-frame prompt** (IntersectionObserver v2 visibility checks).
 - **User limits aren't persisted by the frame**; the parent re-applies them after each `hello` and on `reconnected`.
-- **Spot and outcome markets aren't supported** (`UNSUPPORTED_MARKET`).
+- **Outcome markets aren't supported, nor unverified spot tokens** (`UNSUPPORTED_MARKET`): spot is limited to
+  Convert's stablecoin pairs and, once the user turns spot trading on, the verified pairs (Hyperliquid's "Strict" list),
+  with no trigger orders.
 - **The shared-library workarounds** listed in `docs/SHARED_ISSUES.md`.

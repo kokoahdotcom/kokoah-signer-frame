@@ -6,14 +6,14 @@
  * - `perpDexs` gives dex indices, needed for HIP-3 asset ids (cached longer; the registry cross-checks names).
  * - `activeAssetData` gives the user's current leverage for a market (only needed when the parent tightened
  *   `maxLeverage` below the market maximum).
- * - `spotMetaAndAssetCtxs` (Convert only) gives the spot pairs and their mark and mid. Only the network's pinned
- *   stablecoin pairs that this `spotMeta` confirms exactly (`verifiedStablecoinPairs`) enter the registry; any other
- *   spot coin is `UNSUPPORTED_MARKET`.
+ * - `spotMetaAndAssetCtxs` (Convert and spot trading) gives the spot pairs, their mark and mid and 24 h volume. Only
+ *   the network's pinned pairs (stablecoins and verified tokens against USDC) that this `spotMeta` confirms exactly
+ *   (`verifiedSpotPairs`) enter the registry; any other spot coin is `UNSUPPORTED_MARKET`.
  *
  * @module
  */
 import { MarketRegistry, parseCoin, type PerpDexLike, type PerpMetaLike, type SpotMetaLike } from "@kokoah/shared/markets";
-import { STABLECOIN_PAIRS, verifiedStablecoinPairs } from "@kokoah/shared/policy";
+import { STABLECOIN_PAIRS, VERIFIED_SPOT_PAIRS, verifiedSpotPairs } from "@kokoah/shared/policy";
 import type { HlHttp } from "./hl.js";
 
 /** Everything the signing pipeline needs about the markets an intent touches. */
@@ -23,6 +23,10 @@ export interface MarketSnapshot {
   markPrices: Record<string, number>;
   /** Mid price by coin (compiler: market-order IOC price). Missing when the book is empty. */
   midPrices: Record<string, string>;
+  /** 24 h notional volume (USD) by spot coin in the registry (the per-order cap on verified pairs). */
+  spotDayVolumes: Record<string, number>;
+  /** Verified (non-stablecoin) spot pairs in the registry. */
+  verifiedSpotCoins: string[];
 }
 
 /** Thrown when market data can't be fetched or is malformed. */
@@ -70,10 +74,13 @@ function positiveNumber(x: unknown): number | undefined {
 }
 
 interface SpotSnapshot {
-  /** `spotMeta` narrowed to the verified stablecoin pairs and their tokens. */
+  /** `spotMeta` narrowed to the pinned pairs it confirms and their tokens. */
   meta: SpotMetaLike;
   markPrices: Record<string, number>;
   midPrices: Record<string, string>;
+  dayVolumes: Record<string, number>;
+  /** Confirmed pairs that are verified tokens (not stablecoins). */
+  verified: string[];
 }
 
 export class MarketData {
@@ -87,24 +94,32 @@ export class MarketData {
     this.opts = { priceTtlMs: 3_000, dexListTtlMs: 60_000, leverageTtlMs: 3_000, network: "testnet", ...options };
   }
 
-  /** Coins of the network's pinned stablecoin pairs (the only spot markets the frame may trade). */
+  /** Coins of the network's pinned stablecoin pairs (Convert). */
   get stablecoinPairCoins(): string[] {
     return STABLECOIN_PAIRS[this.opts.network].map((p) => p.coin);
   }
 
-  /** Registry, mark and mid prices covering every coin in `coins` (perps, HIP-3 perps and the stablecoin pairs). */
+  /** Coins of the network's pinned verified token/USDC pairs (spot trading, once the user turns it on). */
+  get tradingPairCoins(): string[] {
+    return VERIFIED_SPOT_PAIRS[this.opts.network].map((p) => p.coin);
+  }
+
+  /** Registry, prices and spot volumes covering every coin in `coins` (perps, HIP-3 perps and the pinned spot pairs). */
   async snapshotFor(coins: readonly string[]): Promise<MarketSnapshot> {
     const dexes = new Set<string>();
     const spotCoins: string[] = [];
     for (const coin of coins) {
       const parsed = parseCoin(coin);
       if (!parsed) throw new MarketDataError("UNSUPPORTED_MARKET", `"${coin}" is not a valid market name`);
-      if ((parsed.kind === "spotIndex" || parsed.kind === "spotPair") && this.stablecoinPairCoins.includes(coin)) {
+      if (parsed.kind === "spotIndex" || parsed.kind === "spotPair") {
+        if (!this.stablecoinPairCoins.includes(coin) && !this.tradingPairCoins.includes(coin)) {
+          throw new MarketDataError("UNSUPPORTED_MARKET", `${coin} is not a verified spot pair; the signer frame trades verified tokens against USDC only`);
+        }
         spotCoins.push(coin);
         continue;
       }
       if (parsed.kind !== "perp" && parsed.kind !== "hip3") {
-        throw new MarketDataError("UNSUPPORTED_MARKET", `${coin} is not a perpetual market; the signer frame trades perps, HIP-3 perps and stablecoin conversions only`);
+        throw new MarketDataError("UNSUPPORTED_MARKET", `${coin} is not a perpetual market; the signer frame trades perps, HIP-3 perps and verified spot pairs only`);
       }
       dexes.add(parsed.kind === "hip3" ? parsed.dex : "");
     }
@@ -123,7 +138,7 @@ export class MarketData {
     if (spot) {
       for (const coin of spotCoins) {
         if (!spot.meta.universe.some((u) => u.name === coin)) {
-          throw new MarketDataError("UNSUPPORTED_MARKET", `${coin} does not match the stablecoin pair the signer expects on Hyperliquid; nothing was signed`);
+          throw new MarketDataError("UNSUPPORTED_MARKET", `${coin} does not match the spot pair the signer expects on Hyperliquid; nothing was signed`);
         }
       }
     }
@@ -147,7 +162,12 @@ export class MarketData {
     } catch (e) {
       throw new MarketDataError("MARKET_DATA_UNAVAILABLE", `Inconsistent market metadata: ${e instanceof Error ? e.message : "error"}`);
     }
-    return { registry, markPrices, midPrices };
+    const spotDayVolumes: Record<string, number> = {};
+    for (const coin of spotCoins) {
+      const volume = spot?.dayVolumes[coin];
+      if (volume !== undefined) spotDayVolumes[coin] = volume;
+    }
+    return { registry, markPrices, midPrices, spotDayVolumes, verifiedSpotCoins: spotCoins.filter((c) => spot?.verified.includes(c)) };
   }
 
   /** The user's current leverage setting for `coin`, or undefined when HL doesn't report one. */
@@ -162,8 +182,8 @@ export class MarketData {
   }
 
   /**
-   * The verified stablecoin pairs from `spotMetaAndAssetCtxs`: the spot meta narrowed to them (and their tokens), with
-   * their mark and mid prices.
+   * The pinned spot pairs `spotMetaAndAssetCtxs` confirms exactly: the spot meta narrowed to them (and their tokens),
+   * with their mark and mid prices and 24 h volume. Contexts are matched by `coin`, never by position.
    */
   private async spot(): Promise<SpotSnapshot> {
     return await this.cached(this.spotCache, "spot", this.opts.priceTtlMs, async () => {
@@ -172,7 +192,7 @@ export class MarketData {
         throw new MarketDataError("MARKET_DATA_UNAVAILABLE", "Malformed spotMetaAndAssetCtxs response");
       }
       const full = r[0] as unknown as SpotMetaLike;
-      const pairs = verifiedStablecoinPairs(this.opts.network, full);
+      const pairs = verifiedSpotPairs(this.opts.network, full);
       const coins = new Set(pairs.map((p) => p.coin));
       const tokenIndexes = new Set(pairs.flatMap((p) => [p.base.index, p.quote.index]));
       const meta: SpotMetaLike = {
@@ -181,13 +201,16 @@ export class MarketData {
       };
       const markPrices: Record<string, number> = {};
       const midPrices: Record<string, string> = {};
+      const dayVolumes: Record<string, number> = {};
       for (const ctx of r[1] as unknown[]) {
         if (!isRecord(ctx) || typeof ctx.coin !== "string" || !coins.has(ctx.coin)) continue;
         const mark = positiveNumber(ctx.markPx);
         if (mark !== undefined) markPrices[ctx.coin] = mark;
         if (positiveNumber(ctx.midPx) !== undefined) midPrices[ctx.coin] = String(ctx.midPx);
+        const volume = Number(ctx.dayNtlVlm);
+        if ((typeof ctx.dayNtlVlm === "string" || typeof ctx.dayNtlVlm === "number") && Number.isFinite(volume) && volume >= 0) dayVolumes[ctx.coin] = volume;
       }
-      return { meta, markPrices, midPrices };
+      return { meta, markPrices, midPrices, dayVolumes, verified: pairs.filter((p) => p.trust === "verified").map((p) => p.coin) };
     });
   }
 

@@ -21,10 +21,17 @@
  * sub-account without its own uses the master's). Orders per minute are counted per agent across accounts; daily
  * notional per account for personal limits, and per agent for the baseline cap.
  *
- * Revenue actions (PHASE3 REV), all for the master account only:
- * - Convert stablecoins: spot orders only on the pinned stablecoin/USDC pairs of the frame's network
+ * Spot, for the master account only:
+ * - Convert stablecoins (PHASE3 REV): orders only on the pinned stablecoin/USDC pairs of the frame's network
  *   (`allowedSpotCoins`), each checked against the `spotMeta` the frame fetches itself; one IOC order, the builder on
- *   sells and none on buys. Every other spot market stays denied.
+ *   sells and none on buys.
+ * - Spot trading (PHASE3 SPOT), off until the parent sets `spotTrading: true`: also the verified token/USDC pairs
+ *   (shared `VERIFIED_SPOT_PAIRS`, Hyperliquid's "Strict" list), each checked against the frame's own `spotMeta`, with
+ *   market orders and IOC, GTC and post-only limits within the bands (shared `spotTrading`). On mainnet one order on a
+ *   verified pair may be at most 10% of its 24 h volume, as the frame read it (shared `spotOrderVolumeProblem`). No
+ *   triggers (Hyperliquid's app offers none on spot), no reduce-only, no modify. Every other spot market is denied.
+ *
+ * Revenue actions (PHASE3 REV), for the master account only:
  * - `startFeeTrial`: allowed (it is in the baseline action types).
  * - `setReferrer`: only with the frame's configured referral code (`referralCode`, from the build, never from the
  *   parent), only while HL reports no referrer for the account and at most once per key (see `core.ts`).
@@ -34,7 +41,7 @@
 import type { AccountIntent, CompiledAccountAction, CompiledAction } from "@kokoah/shared/actions";
 import type { ActionIntent } from "@kokoah/shared/intents";
 import type { MarketRegistry } from "@kokoah/shared/markets";
-import { createManualTradingPolicy, evaluatePolicy, parsePolicy, type Policy, type PolicyViolation } from "@kokoah/shared/policy";
+import { createManualTradingPolicy, evaluatePolicy, parsePolicy, type Policy, type PolicyViolation, spotOrderVolumeProblem } from "@kokoah/shared/policy";
 import { BASELINE_ACTION_TYPES, EXPIRES_AFTER_MS, type AllowedActionType, type PolicySummary, type UserLimits } from "../protocol/index.js";
 
 /** Leverage value meaning "no global cap; each market's own maximum applies". */
@@ -96,9 +103,13 @@ export type ApplyLimitsResult = { ok: true; policy: Policy; limits: UserLimits |
 
 /**
  * Applies user limits on top of the baseline. Every field must be at least as strict as the baseline; otherwise
- * nothing is applied and the loosening fields are listed. `{}` resets to the baseline.
+ * nothing is applied and the loosening fields are listed. `{}` resets to the baseline, with spot trading off.
+ *
+ * Spot trading is the one setting that starts off: `spotTrading: true` adds `spot.tradingCoins` (the verified pairs
+ * the frame can trade, all within its baseline) to the policy's `allowedSpotCoins` and sets the shared `spotTrading`
+ * flag; omitted or `false` leaves Convert's stablecoin pairs with IOC orders only.
  */
-export function applyUserLimits(baseline: Policy, limits: UserLimits): ApplyLimitsResult {
+export function applyUserLimits(baseline: Policy, limits: UserLimits, spot: { tradingCoins: readonly string[] } = { tradingCoins: [] }): ApplyLimitsResult {
   const loosening: string[] = [];
   const num = (field: "maxOrderNotionalUsd" | "maxDailyNotionalUsd" | "maxOrdersPerMinute" | "priceBandPct") => {
     const value = limits[field];
@@ -129,7 +140,13 @@ export function applyUserLimits(baseline: Policy, limits: UserLimits): ApplyLimi
   if (limits.allowedCoins !== undefined) cleaned.allowedCoins = [...new Set(limits.allowedCoins)];
   if (limits.requireStopLossForNewEntries === true) cleaned.requireStopLossForNewEntries = true;
   if (limits.allowedActionTypes !== undefined) cleaned.allowedActionTypes = [...new Set(limits.allowedActionTypes)];
-  const policy = parsePolicy({ ...baseline, ...cleaned });
+  if (limits.spotTrading === true) cleaned.spotTrading = true;
+  const { spotTrading: _flag, ...policyLimits } = cleaned;
+  const policy = parsePolicy({
+    ...baseline,
+    ...policyLimits,
+    ...(cleaned.spotTrading ? { allowedSpotCoins: [...new Set([...(baseline.allowedSpotCoins ?? []), ...spot.tradingCoins])], spotTrading: true } : {}),
+  });
   return { ok: true, policy, limits: Object.keys(cleaned).length > 0 ? cleaned : null };
 }
 
@@ -154,8 +171,13 @@ export function limitsForAccount(masterLimits: UserLimits | null, accountLimits:
   return accountLimits.get(subAccount.toLowerCase())?.limits ?? masterLimits;
 }
 
-/** Summary of the effective policy for `getStatus`. */
-export function summarizeFramePolicy(policy: Policy, userLimits: UserLimits | null, accountLimits: ReadonlyMap<string, AccountLimits> = new Map()): PolicySummary {
+/** Summary of the effective policy for `getStatus`. `spotTradingCoins`: the verified pairs spot trading would add. */
+export function summarizeFramePolicy(
+  policy: Policy,
+  userLimits: UserLimits | null,
+  accountLimits: ReadonlyMap<string, AccountLimits> = new Map(),
+  spotTradingCoins: readonly string[] = [],
+): PolicySummary {
   const builder = policy.requiredBuilder;
   if (!builder) throw new Error("The frame policy always requires a builder");
   return {
@@ -174,6 +196,8 @@ export function summarizeFramePolicy(policy: Policy, userLimits: UserLimits | nu
     // The browser key signs only the user's own orders and AI tickets; server origins (guardian, bot, telegram) never.
     allowedOrigins: (policy.allowedOrigins ?? ["manual", "ai_ticket"]).filter((o): o is "manual" | "ai_ticket" => o === "manual" || o === "ai_ticket"),
     spotCoins: [...(policy.allowedSpotCoins ?? [])],
+    spotTrading: policy.spotTrading === true,
+    spotTradingCoins: [...spotTradingCoins],
     referralCode: policy.referralCode ?? null,
     userLimits: userLimits === null ? null : structuredClone(userLimits),
     accountLimits: Object.fromEntries([...accountLimits].map(([account, a]) => [account, structuredClone(a.limits)])) as Record<`0x${string}`, UserLimits>,
@@ -217,6 +241,20 @@ function wireOrders(action: Record<string, unknown>): WireOrder[] {
     return (action.modifies as Array<{ order?: unknown }>).map((m) => (m?.order ?? {}) as WireOrder);
   }
   return [];
+}
+
+/** Spot orders of an action (wire `order` only): coin, size and limit price. */
+function spotLegs(action: Record<string, unknown>, registry: MarketRegistry): Array<{ coin: string; size: number; price: number }> {
+  if (action.type !== "order") return [];
+  const legs: Array<{ coin: string; size: number; price: number }> = [];
+  for (const o of wireOrders(action)) {
+    const market = typeof o.a === "number" ? registry.getByAssetId(o.a) : undefined;
+    if (market?.kind !== "spot") continue;
+    const size = Number(o.s);
+    const price = Number(o.p);
+    legs.push({ coin: market.coin, size: Number.isFinite(size) ? size : 0, price: Number.isFinite(price) ? price : 0 });
+  }
+  return legs;
 }
 
 /** Number of orders an action creates (counts toward the per-minute limit; cancels count 0). */
@@ -274,6 +312,12 @@ export interface FramePolicyInput {
    * parent). An action with `vaultAddress` is denied unless it equals this address.
    */
   ownedSubAccount?: `0x${string}`;
+  /** Network of the frame: sets the per-order volume cap on verified spot pairs (mainnet only). Default testnet. */
+  network?: "mainnet" | "testnet";
+  /** Verified (non-stablecoin) spot pairs in this action's registry: orders on them get the volume cap. */
+  verifiedSpotCoins?: readonly string[];
+  /** 24 h notional volume (USD) by spot coin, from the frame's own `spotMetaAndAssetCtxs` read. */
+  spotDayVolumes?: Readonly<Record<string, number>>;
 }
 
 /** Decision of {@link evaluateFramePolicy}. */
@@ -318,11 +362,24 @@ export function evaluateFramePolicy(input: FramePolicyInput): FramePolicyDecisio
     } else {
       allowedVaults = [owned];
     }
-    // Frame rule: stablecoin conversions are for the master account only.
+    // Frame rule: spot (conversions and trading) is for the master account only.
     const intent = input.compiled.intent;
     if (intent.kind === "order" && input.registry.get(intent.coin)?.kind === "spot") {
-      add({ code: "VAULT_NOT_ALLOWED", message: "Stablecoin conversions are for the main account only." });
+      add({ code: "VAULT_NOT_ALLOWED", message: "Spot orders are for the main account only." });
     }
+  }
+  // Frame rule (mainnet): one order on a verified spot pair is at most 10% of the pair's 24 h volume.
+  for (const leg of spotLegs(input.compiled.action as unknown as Record<string, unknown>, input.registry)) {
+    if (!(input.verifiedSpotCoins ?? []).includes(leg.coin)) continue;
+    const mark = input.markPrices[leg.coin];
+    const px = Math.max(leg.price, typeof mark === "number" && Number.isFinite(mark) ? mark : 0);
+    const problem = spotOrderVolumeProblem({
+      network: input.network ?? "testnet",
+      label: input.registry.get(leg.coin)?.displayName ?? leg.coin,
+      notionalUsd: leg.size * px,
+      dayVolumeUsd: input.spotDayVolumes?.[leg.coin],
+    });
+    if (problem) add({ code: "ORDER_NOTIONAL_EXCEEDED", message: problem });
   }
   const policy: Policy = {
     ...input.policy,

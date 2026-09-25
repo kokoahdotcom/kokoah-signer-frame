@@ -426,7 +426,7 @@ export class FrameCore {
       network: this.config.network.name,
       mainnetWritesEnabled: this.config.network.name === "mainnet" && this.config.network.allowMainnetWrites,
       clockOffsetMs: this.clockOffsetMs,
-      policy: summarizeFramePolicy(this.policy, this.userLimits, this.accountLimits),
+      policy: summarizeFramePolicy(this.policy, this.userLimits, this.accountLimits, this.market.tradingPairCoins),
       metrics: { ...this.metrics },
     };
   }
@@ -1205,7 +1205,7 @@ export class FrameCore {
 
   private setLimits(p: SetLimitsParams): SetLimitsResult {
     const { account, ...limits } = p;
-    const r = applyUserLimits(this.baseline, limits);
+    const r = applyUserLimits(this.baseline, limits, { tradingCoins: this.market.tradingPairCoins });
     if (!r.ok) throw new SignerFailure("LIMIT_LOOSENING_REJECTED", r.message, { details: { fields: r.fields } });
     const sub = account?.toLowerCase();
     if (sub === undefined || sub === this.key?.meta.userAddress.toLowerCase()) {
@@ -1221,7 +1221,7 @@ export class FrameCore {
       this.accountLimits.set(sub, { policy: r.policy, limits: r.limits });
     }
     this.statusChanged();
-    return { policy: summarizeFramePolicy(this.policy, this.userLimits, this.accountLimits) };
+    return { policy: summarizeFramePolicy(this.policy, this.userLimits, this.accountLimits, this.market.tradingPairCoins) };
   }
 
   private setTheme(p: SetThemeParams): SetThemeResult {
@@ -1351,7 +1351,7 @@ export class FrameCore {
     const opensExposure = (intent.kind === "order" && !intent.reduceOnly) || (intent.kind === "modify" && !intent.order.reduceOnly);
     if (accountLimits?.maxLeverage !== undefined && opensExposure) {
       leverageByCoin = {};
-      // Spot has no leverage: the stablecoin pairs are skipped.
+      // Spot has no leverage: spot pairs are skipped.
       for (const coin of coins.filter((c) => snapshot.registry.get(c)?.kind !== "spot")) {
         let lev: number | undefined;
         try {
@@ -1391,6 +1391,9 @@ export class FrameCore {
         agentDailyNotionalUsedUsd: usage.dailyNotionalUsedUsd,
         ...(leverageByCoin !== undefined ? { leverageByCoin } : {}),
         ...(ownedSubAccount !== undefined ? { ownedSubAccount } : {}),
+        network: this.config.network.name,
+        verifiedSpotCoins: snapshot.verifiedSpotCoins,
+        spotDayVolumes: snapshot.spotDayVolumes,
       });
       if (!decision.allowed) {
         this.metrics.policyDenials++;

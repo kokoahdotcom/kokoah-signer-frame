@@ -170,8 +170,10 @@ describe("hello and status", () => {
       ownSubAccountsAllowed: true,
       expiresAfterMs: 15_000,
       allowedOrigins: ["manual", "ai_ticket"],
-      // Testnet's pinned stablecoin pairs; this build has no referral code.
+      // Testnet's pinned stablecoin pairs; spot trading is off until the parent turns it on; no referral code.
       spotCoins: ["@1115", "@1200"],
+      spotTrading: false,
+      spotTradingCoins: ["PURR/USDC", "@138", "@60", "@1035", "@1137", "@1461"],
       referralCode: null,
       userLimits: null,
       accountLimits: {},
