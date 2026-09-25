@@ -157,7 +157,7 @@ describe("hello and status", () => {
     await h.ok("hello", { protocolVersion: 1 });
     const s = await h.ok("getStatus");
     expect(s.policy).toEqual({
-      allowedActionTypes: ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop"],
+      allowedActionTypes: ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop", "startFeeTrial"],
       allowedCoins: "*",
       maxOrderNotionalUsd: 1_000_000,
       maxDailyNotionalUsd: 25_000_000,
@@ -170,6 +170,9 @@ describe("hello and status", () => {
       ownSubAccountsAllowed: true,
       expiresAfterMs: 15_000,
       allowedOrigins: ["manual", "ai_ticket"],
+      // Testnet has no pinned stablecoin pairs yet, and this build has no referral code.
+      spotCoins: [],
+      referralCode: null,
       userLimits: null,
       accountLimits: {},
     });

@@ -6,10 +6,14 @@
  * - `perpDexs` gives dex indices, needed for HIP-3 asset ids (cached longer; the registry cross-checks names).
  * - `activeAssetData` gives the user's current leverage for a market (only needed when the parent tightened
  *   `maxLeverage` below the market maximum).
+ * - `spotMetaAndAssetCtxs` (Convert only) gives the spot pairs and their mark and mid. Only the network's pinned
+ *   stablecoin pairs that this `spotMeta` confirms exactly (`verifiedStablecoinPairs`) enter the registry; any other
+ *   spot coin is `UNSUPPORTED_MARKET`.
  *
  * @module
  */
-import { MarketRegistry, parseCoin, type PerpDexLike, type PerpMetaLike } from "@kokoah/shared/markets";
+import { MarketRegistry, parseCoin, type PerpDexLike, type PerpMetaLike, type SpotMetaLike } from "@kokoah/shared/markets";
+import { STABLECOIN_PAIRS, verifiedStablecoinPairs } from "@kokoah/shared/policy";
 import type { HlHttp } from "./hl.js";
 
 /** Everything the signing pipeline needs about the markets an intent touches. */
@@ -45,6 +49,8 @@ interface CacheEntry<T> {
 export interface MarketDataOptions {
   hl: HlHttp;
   now: () => number;
+  /** Network whose pinned stablecoin pairs Convert may trade. Default testnet. */
+  network?: "mainnet" | "testnet";
   /** TTL of mark/mid prices and dex metadata. Default 3 s. */
   priceTtlMs?: number;
   /** TTL of the `perpDexs` list. Default 60 s. */
@@ -63,24 +69,42 @@ function positiveNumber(x: unknown): number | undefined {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
+interface SpotSnapshot {
+  /** `spotMeta` narrowed to the verified stablecoin pairs and their tokens. */
+  meta: SpotMetaLike;
+  markPrices: Record<string, number>;
+  midPrices: Record<string, string>;
+}
+
 export class MarketData {
   private readonly opts: Required<MarketDataOptions>;
   private readonly dexCache = new Map<string, CacheEntry<DexSnapshot>>();
+  private readonly spotCache = new Map<string, CacheEntry<SpotSnapshot>>();
   private perpDexsCache: CacheEntry<ReadonlyArray<PerpDexLike>> | undefined;
   private readonly leverageCache = new Map<string, CacheEntry<number | undefined>>();
 
   constructor(options: MarketDataOptions) {
-    this.opts = { priceTtlMs: 3_000, dexListTtlMs: 60_000, leverageTtlMs: 3_000, ...options };
+    this.opts = { priceTtlMs: 3_000, dexListTtlMs: 60_000, leverageTtlMs: 3_000, network: "testnet", ...options };
   }
 
-  /** Registry, mark and mid prices covering every coin in `coins` (perps and HIP-3 only). */
+  /** Coins of the network's pinned stablecoin pairs (the only spot markets the frame may trade). */
+  get stablecoinPairCoins(): string[] {
+    return STABLECOIN_PAIRS[this.opts.network].map((p) => p.coin);
+  }
+
+  /** Registry, mark and mid prices covering every coin in `coins` (perps, HIP-3 perps and the stablecoin pairs). */
   async snapshotFor(coins: readonly string[]): Promise<MarketSnapshot> {
     const dexes = new Set<string>();
+    const spotCoins: string[] = [];
     for (const coin of coins) {
       const parsed = parseCoin(coin);
       if (!parsed) throw new MarketDataError("UNSUPPORTED_MARKET", `"${coin}" is not a valid market name`);
+      if ((parsed.kind === "spotIndex" || parsed.kind === "spotPair") && this.stablecoinPairCoins.includes(coin)) {
+        spotCoins.push(coin);
+        continue;
+      }
       if (parsed.kind !== "perp" && parsed.kind !== "hip3") {
-        throw new MarketDataError("UNSUPPORTED_MARKET", `${coin} is not a perpetual market; the signer frame trades perps and HIP-3 perps only`);
+        throw new MarketDataError("UNSUPPORTED_MARKET", `${coin} is not a perpetual market; the signer frame trades perps, HIP-3 perps and stablecoin conversions only`);
       }
       dexes.add(parsed.kind === "hip3" ? parsed.dex : "");
     }
@@ -92,9 +116,19 @@ export class MarketData {
         if (!perpDexs.some((x, i) => i > 0 && x !== null && x.name === d)) throw new MarketDataError("UNKNOWN_DEX", `Unknown HIP-3 dex "${d}"`);
       }
     }
-    const snaps = await Promise.all([...dexes].map(async (d) => [d, await this.dex(d)] as const));
-    const markPrices: Record<string, number> = {};
-    const midPrices: Record<string, string> = {};
+    const [snaps, spot] = await Promise.all([
+      Promise.all([...dexes].map(async (d) => [d, await this.dex(d)] as const)),
+      spotCoins.length > 0 ? this.spot() : Promise.resolve(undefined),
+    ]);
+    if (spot) {
+      for (const coin of spotCoins) {
+        if (!spot.meta.universe.some((u) => u.name === coin)) {
+          throw new MarketDataError("UNSUPPORTED_MARKET", `${coin} does not match the stablecoin pair the signer expects on Hyperliquid; nothing was signed`);
+        }
+      }
+    }
+    const markPrices: Record<string, number> = { ...spot?.markPrices };
+    const midPrices: Record<string, string> = { ...spot?.midPrices };
     const dexMetas: Record<string, PerpMetaLike> = {};
     let meta: PerpMetaLike | undefined;
     for (const [d, s] of snaps) {
@@ -108,6 +142,7 @@ export class MarketData {
       registry = MarketRegistry.fromInfo({
         ...(meta ? { meta } : {}),
         ...(hip3.length > 0 ? { dexMetas, perpDexs: perpDexs as ReadonlyArray<PerpDexLike> } : {}),
+        ...(spot ? { spotMeta: spot.meta } : {}),
       });
     } catch (e) {
       throw new MarketDataError("MARKET_DATA_UNAVAILABLE", `Inconsistent market metadata: ${e instanceof Error ? e.message : "error"}`);
@@ -123,6 +158,36 @@ export class MarketData {
       if (!isRecord(r) || !isRecord(r.leverage)) throw new MarketDataError("MARKET_DATA_UNAVAILABLE", "Malformed activeAssetData response");
       const value = r.leverage.value;
       return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+    });
+  }
+
+  /**
+   * The verified stablecoin pairs from `spotMetaAndAssetCtxs`: the spot meta narrowed to them (and their tokens), with
+   * their mark and mid prices.
+   */
+  private async spot(): Promise<SpotSnapshot> {
+    return await this.cached(this.spotCache, "spot", this.opts.priceTtlMs, async () => {
+      const r = await this.opts.hl.info({ type: "spotMetaAndAssetCtxs" });
+      if (!Array.isArray(r) || r.length !== 2 || !isRecord(r[0]) || !Array.isArray(r[0].universe) || !Array.isArray(r[0].tokens) || !Array.isArray(r[1])) {
+        throw new MarketDataError("MARKET_DATA_UNAVAILABLE", "Malformed spotMetaAndAssetCtxs response");
+      }
+      const full = r[0] as unknown as SpotMetaLike;
+      const pairs = verifiedStablecoinPairs(this.opts.network, full);
+      const coins = new Set(pairs.map((p) => p.coin));
+      const tokenIndexes = new Set(pairs.flatMap((p) => [p.base.index, p.quote.index]));
+      const meta: SpotMetaLike = {
+        universe: full.universe.filter((u) => coins.has(u.name)),
+        tokens: full.tokens.filter((t) => tokenIndexes.has(t.index)),
+      };
+      const markPrices: Record<string, number> = {};
+      const midPrices: Record<string, string> = {};
+      for (const ctx of r[1] as unknown[]) {
+        if (!isRecord(ctx) || typeof ctx.coin !== "string" || !coins.has(ctx.coin)) continue;
+        const mark = positiveNumber(ctx.markPx);
+        if (mark !== undefined) markPrices[ctx.coin] = mark;
+        if (positiveNumber(ctx.midPx) !== undefined) midPrices[ctx.coin] = String(ctx.midPx);
+      }
+      return { meta, markPrices, midPrices };
     });
   }
 

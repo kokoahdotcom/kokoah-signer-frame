@@ -25,6 +25,11 @@ export interface FrameConfig {
   readonly builder: { readonly address: `0x${string}`; readonly feeTenthsBps: number };
   /** Default agent name for `createAgent`. */
   readonly defaultAgentName: string;
+  /**
+   * Kokoah's own Hyperliquid referral code, or null. It is the only code `setReferrer` may carry; the parent never
+   * supplies it. Null: `setReferrer` stays denied.
+   */
+  readonly referralCode: string | null;
   /** Development only: base URL that replaces the HL API (the dev harness mock/read-only proxy). */
   readonly hlApiUrlOverride: string | null;
   /** True for production builds (stricter origin rules, no overrides). */
@@ -43,6 +48,7 @@ export class FrameConfigError extends Error {
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const AGENT_NAME_RE = /^[A-Za-z0-9._-]{1,16}$/;
+const REFERRAL_CODE_RE = /^[A-Za-z0-9_-]{1,20}$/;
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 function str(env: RawEnv, key: string): string | undefined {
@@ -64,6 +70,8 @@ function str(env: RawEnv, key: string): string | undefined {
  * - `VITE_BUILDER_ADDRESS`: the Kokoah builder address (required).
  * - `VITE_BUILDER_FEE_TENTHS_BPS`: builder fee in tenths of a basis point, integer 0–100 (required).
  * - `VITE_AGENT_NAME`: default agent name (default `kokoah-web`), 1–16 of `A–Z a–z 0–9 . _ -`.
+ * - `VITE_HL_REFERRAL_CODE`: optional, Kokoah's Hyperliquid referral code (1–20 of `A–Z a–z 0–9 _ -`); keep it equal
+ *   to the backend's `HL_REFERRAL_CODE`. Unset: the frame never signs `setReferrer`.
  * - `VITE_HL_API_URL_OVERRIDE`: development builds only (dev harness proxy). Rejected in production builds.
  */
 export function parseFrameConfig(env: RawEnv, options: { production: boolean }): FrameConfig {
@@ -131,6 +139,10 @@ export function parseFrameConfig(env: RawEnv, options: { production: boolean }):
   const nameRaw = str(env, "VITE_AGENT_NAME") ?? "kokoah-web";
   if (!AGENT_NAME_RE.test(nameRaw) || /valid_until/.test(nameRaw)) problems.push("VITE_AGENT_NAME must be 1-16 of A-Z a-z 0-9 . _ - (no \"valid_until\")");
 
+  // Referral code (optional).
+  const referralRaw = str(env, "VITE_HL_REFERRAL_CODE");
+  if (referralRaw !== undefined && !REFERRAL_CODE_RE.test(referralRaw)) problems.push("VITE_HL_REFERRAL_CODE must be 1-20 of A-Z a-z 0-9 _ -");
+
   if (problems.length > 0) throw new FrameConfigError(problems);
 
   const network = getNetworkConfig(isMainnet ? "mainnet" : "testnet", {
@@ -142,6 +154,7 @@ export function parseFrameConfig(env: RawEnv, options: { production: boolean }):
     allowedParentOrigins: Object.freeze([...allowedParentOrigins]),
     builder: Object.freeze({ address: builderAddress, feeTenthsBps }),
     defaultAgentName: nameRaw,
+    referralCode: referralRaw ?? null,
     hlApiUrlOverride,
     production,
   });

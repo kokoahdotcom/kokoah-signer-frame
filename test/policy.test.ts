@@ -25,7 +25,10 @@ const codes = (d: { violations: Array<{ code: string }> }) => d.violations.map((
 
 describe("baseline policy", () => {
   it("allows exactly the trading actions and requires builder and expiresAfter; no vault is listed in the policy object", () => {
-    expect([...baseline.allowedActionTypes]).toEqual(["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop"]);
+    expect([...baseline.allowedActionTypes]).toEqual(["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop", "startFeeTrial"]);
+    // No spot and no referral code unless the frame's configuration gives them.
+    expect(baseline.allowedSpotCoins).toBeUndefined();
+    expect(baseline.referralCode).toBeUndefined();
     expect(baseline.requiredBuilder).toEqual({ b: BUILDER, f: 25 });
     expect(baseline.allowedVaultAddresses).toEqual([]);
     expect(baseline.maxExpiresAfterWindowMs).toBe(BASELINE_LIMITS.maxExpiresAfterWindowMs);

@@ -13,7 +13,9 @@ Those need the main wallet. It **can**:
 - do all of that **for the master's sub-accounts and for any vault the master leads**, by setting `vaultAddress` on
   the request (sub-accounts and vaults have no key of their own);
 - sign `vaultTransfer`, `createVault` (10k USDC fee), `createSubAccount`, `agentSendAsset`, `reserveRequestWeight` and
-  others (research B §1.7).
+  others (research B §1.7);
+- sign `setReferrer` (any code) and `startFeeTrial`, and trade spot. The frame allows only Kokoah's own code once, the
+  fee trial, and spot on the pinned stablecoin pairs (A14–A16).
 
 A stolen agent key can therefore still drain an account:
 - by trading against the attacker's resting orders in thin markets;
@@ -56,6 +58,9 @@ Trust boundaries:
 | A11 | Replay of old signed actions | Resubmit captured actions | Signatures never leave the frame except to HL. `expiresAfter` = now + 15 s. Nonces are unique and never reused. Agent addresses are never reused (HL prunes a deregistered agent's nonce state) | Tested |
 | A12 | A1 asks the frame to act for **another account** (`intent.vaultAddress`): a vault the user leads, someone else's sub-account, a made-up address | Trade that account with the user's key | `vaultAddress` is signed only for an address that HL's own `subAccounts` answer lists with `master` equal to the key's master. The frame reads it itself (its own `fetch`, `connect-src` HL only), never from the parent; there is no protocol field for ownership; the policy object's `allowedVaultAddresses` is replaced by the one verified address or by nothing. Cached 30 s (a re-read on a miss once the list is 5 s old); a failed or unreadable read signs nothing. Sub-accounts can't change master, so a cached "owned" can't become wrong; a stale "not owned" only denies. The address is inside the signed hash, so an action signed for one account can't be replayed for another | Unit-tested (`test/subaccounts.test.ts`) |
 | A13 | A1 spreads orders over many sub-accounts to escape limits | Multiply the daily notional cap | The baseline $25M/day holds per key across every account (per-account figures only feed personal limits); orders per minute are per key | Unit-tested |
+| A14 | A1 asks the frame to **set a referrer** (`setReferrer`) | Point the account's referral rewards at the attacker's code | The intent has no code field (strict schema); the frame signs only its own build value `VITE_HL_REFERRAL_CODE`, and the shared policy allows `setReferrer` only with exactly that `referralCode`. The frame reads HL `referral` itself and signs only while no referrer is set, and at most once per key (recorded with the nonce in the same IndexedDB transaction, so reloads and other tabs see it). Master account only. No code configured: denied | Unit-tested (`test/revenue.test.ts`, shared `accountActions.test.ts`) |
+| A15 | A1 uses **Convert** to trade spot | Trade an illiquid or look-alike spot token, rest spot orders, or trade spot for a sub-account | Spot is denied except the network's pinned stablecoin/USDC pairs (shared `STABLECOIN_PAIRS`: pair index, token indices, names and token ids), which the frame checks against the `spotMetaAndAssetCtxs` it fetches itself; only those pairs enter its registry. One IOC order, within the 10% band of HL's mark, counted toward notional and rate limits; no triggers, reduce-only, TP/SL or modify; master account only. Worst case is the same class as A1 on perps: a conversion at up to 10% from mark | Unit-tested |
+| A16 | A1 **starts the fee trial** (`startFeeTrial`) | Start Hyperliquid's fee trial without the user asking | Allowed by design (agent-signed on HL). It takes no parameters, master account only; HL allows one trial per 90 days, so the effect is bounded to starting the trial early (see §5) | Unit-tested |
 
 ## 4. What each storage mode protects (plainly)
 
@@ -78,7 +83,11 @@ Trust boundaries:
 5. **Revocation needs the main wallet.** `revoke` wipes the local key at once (or reports `wipeError` when IndexedDB refuses to delete the stored copy, which would then come back after a reload), but the agent stays registered on HL until the user signs and posts `revokeAgent`. The wiped key is unrecoverable, so that is safe unless the key was already stolen, in which case only the on-chain revoke (or expiry, at most 30 days) stops it.
 6. **Out of scope and unverified:** the WebAuthn PRF behaviour of real authenticators (Safari/iCloud Keychain, Windows Hello, Android, security keys) and passkeys inside sandboxed iframes. See README "Manual verification".
 7. **`modify` carries no builder field** in HL's schema. Whether a modified order keeps its builder fee is undocumented (shared library note). The policy enforces the builder on `order` only.
-8. **Sub-accounts trust HL's answer.** Ownership comes from HL `subAccounts` over HTTPS; a compromised HL API is out of scope (it could also lie about prices). Whether HL charges the builder fee on a sub-account's orders with only the master's `approveBuilderFee`, or needs an approval for the sub-account itself, is **unverified** (checked on funded testnet by the coordinator). The frame puts the builder on every sub-account order either way; if HL refuses them, sub-account trading fails closed ("builder fee not approved") rather than trading without the fee.
+8. **Fee trial and referral code.** `startFeeTrial` is in the baseline, so an attacker controlling the app (A1) can
+   start the user's fee trial at a moment the user didn't choose (once per 90 days, per HL). The app explains the
+   terms and asks before it sends the action; the frame cannot tell a real click from A1. `setReferrer` can only ever
+   carry Kokoah's own code (A14), so A1 gains nothing by triggering it.
+9. **Sub-accounts trust HL's answer.** Ownership comes from HL `subAccounts` over HTTPS; a compromised HL API is out of scope (it could also lie about prices). Whether HL charges the builder fee on a sub-account's orders with only the master's `approveBuilderFee`, or needs an approval for the sub-account itself, is **unverified** (checked on funded testnet by the coordinator). The frame puts the builder on every sub-account order either way; if HL refuses them, sub-account trading fails closed ("builder fee not approved") rather than trading without the fee.
 
 ## 6. Controls checklist
 
@@ -101,6 +110,7 @@ Trust boundaries:
 | Nonces unique and increasing across tabs | `nonces.ts` | `test/nonce.test.ts` |
 | Testnet default; mainnet needs `VITE_ALLOW_MAINNET_WRITES=true`; shared write guard | `config.ts`, shared `assertWriteAllowed` | `test/config.test.ts` |
 | Link phone: the phone's own key, a matching code over that key, the link secret never stored, logged or echoed, no `approveAgent` on the phone | `core.ts` `createLinkedAgent`, shared `deviceLinkCode` | `test/link.test.ts`, shared `test/link.test.ts` |
+| `setReferrer` only with the frame's own code, only while HL reports no referrer, once per key; `startFeeTrial` master-only; spot only on the pinned stablecoin pairs verified against the frame's own `spotMeta` | `core.ts` `runAccountAction`, `policy.ts`, `market-data.ts`, shared `evaluatePolicy` and `STABLECOIN_PAIRS` | `test/revenue.test.ts`, shared `accountActions.test.ts` and `spotPolicy.test.ts` |
 
 ## 7. Link phone
 
