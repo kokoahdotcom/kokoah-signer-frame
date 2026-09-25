@@ -383,6 +383,14 @@ async function main(): Promise<number> {
     check("confirmAgent finds the agent via extraAgents", confirmed.keyState === "active", confirmed);
     const signed = await evaluate<{ status: string; cloids: string[] }>(`signer.signAndSubmit({ requestId: crypto.randomUUID(), intent: ${intent()} })`);
     check("signAndSubmit: mock HL verified the agent signature", signed.status === "ok" && mock.state.exchangeCount === 1, signed);
+    // Account actions (PHASE3 REV): the fee trial goes through the same path; without a configured referral code,
+    // setReferrer is refused before anything is signed.
+    const trial = await evaluate<{ status: string; actionType: string }>('signer.signAndSubmit({ requestId: crypto.randomUUID(), intent: { kind: "startFeeTrial", origin: "manual" } })');
+    check("startFeeTrial: mock HL verified the agent signature", trial.status === "ok" && trial.actionType === "startFeeTrial" && mock.state.exchangeCount === 2, trial);
+    const referral = await evaluate<{ code?: string; violations?: string }>(
+      'signer.signAndSubmit({ requestId: crypto.randomUUID(), intent: { kind: "setReferrer", origin: "manual" } }).then(() => ({}), (e) => ({ code: e.code, violations: JSON.stringify(e.details?.violations ?? []) }))',
+    );
+    check("setReferrer without a configured code is POLICY_DENIED, nothing sent", referral.code === "POLICY_DENIED" && /REFERRER_ACTION_DENIED/.test(referral.violations ?? "") && mock.state.exchangeCount === 2, referral);
     const denied = await evaluate<{ code: string }>(`signer.signAndSubmit({ requestId: crypto.randomUUID(), intent: ${intent("3000")} }).then(() => ({ code: "none" }), (e) => ({ code: e.code }))`);
     check("policy denial surfaces as POLICY_DENIED", denied.code === "POLICY_DENIED", denied);
     const theme = await evaluate<{ applied: string[] }>(`signer.setTheme({ variables: { "--ks-accent": "#123456" }, colorScheme: "dark" })`);
@@ -414,7 +422,7 @@ async function main(): Promise<number> {
     const afterReload = await evaluate<{ hasKey: boolean; keyState: string; locked: boolean; agentAddress: string }>("signer.getStatus()");
     check("device key survives a reload (IndexedDB) and stays unlocked", afterReload.hasKey && afterReload.keyState === "active" && !afterReload.locked && afterReload.agentAddress === createdA.agentAddress, afterReload);
     const signed2 = await evaluate<{ status: string }>(`signer.signAndSubmit({ requestId: crypto.randomUUID(), intent: ${intent()} })`);
-    check("signing after reload", signed2.status === "ok" && mock.state.exchangeCount === 2, signed2);
+    check("signing after reload", signed2.status === "ok" && mock.state.exchangeCount === 3, signed2);
     // Reload only the iframe: the client re-handshakes on the new ready and emits reconnected (never on the first ready).
     const before = await evaluate<number>("window.reconnects.length");
     await evaluate("signer.iframe.src = signer.iframe.src; true");

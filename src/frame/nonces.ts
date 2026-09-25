@@ -31,6 +31,14 @@ export class SignerBusyError extends Error {
   }
 }
 
+/** `reserve` for `setReferrer` when this agent already signed one: nothing was reserved or signed. */
+export class ReferrerAlreadySignedError extends Error {
+  constructor(message = "This trading key already set the referral code once.") {
+    super(message);
+    this.name = "ReferrerAlreadySignedError";
+  }
+}
+
 const MINUTE = 60_000;
 
 /** UTC day key. */
@@ -103,13 +111,31 @@ export class SigningCoordinator {
     return usageOf(await this.store.readUsage(agent), now, account);
   }
 
+  /** Whether this agent already signed `setReferrer` (persisted, so a reload or another tab doesn't reset it). */
+  async referrerSigned(agent: string): Promise<boolean> {
+    return typeof (await this.store.readUsage(agent))?.referrerSignedAt === "number";
+  }
+
   /**
    * Reserves the next nonce for `agent` and records the orders and notional this action adds, atomically.
+   * `referrer`: this action is `setReferrer`; it is recorded in the same transaction, and the reservation fails with
+   * {@link ReferrerAlreadySignedError} when the agent already signed one.
    * Throws if the nonce would fall outside HL's accepted window.
    */
-  async reserve(agent: string, params: { now: number; orders: number; notionalUsd: number; account?: UsageAccount }): Promise<number> {
+  async reserve(agent: string, params: { now: number; orders: number; notionalUsd: number; account?: UsageAccount; referrer?: boolean }): Promise<number> {
     const now = Math.floor(params.now);
-    const record = await this.store.updateUsage(agent, (prev) => nextUsage(agent, prev, now, params.orders, params.notionalUsd, params.account));
+    let already = false;
+    const record = await this.store.updateUsage(agent, (prev) => {
+      if (params.referrer && typeof prev?.referrerSignedAt === "number") {
+        already = true;
+        // Unchanged: nothing is reserved.
+        return prev;
+      }
+      const next = nextUsage(agent, prev, now, params.orders, params.notionalUsd, params.account);
+      if (params.referrer) next.referrerSignedAt = now;
+      return next;
+    });
+    if (already) throw new ReferrerAlreadySignedError();
     if (!isNonceInWindow(record.lastNonce, now)) throw new RangeError("Nonce outside Hyperliquid's accepted window; check the device clock");
     return record.lastNonce;
   }
@@ -178,6 +204,7 @@ export function nextUsage(agent: string, prev: UsageRecord | undefined, now: num
   const sameDay = prev !== undefined && prev.day === today;
   const dayNotionalUsd = (sameDay ? prev.dayNotionalUsd : 0) + added;
   const record: UsageRecord = { agent: agent.toLowerCase(), lastNonce: nonce, orderTimes: recent.slice(-10_000), day: today, dayNotionalUsd };
+  if (typeof prev?.referrerSignedAt === "number") record.referrerSignedAt = prev.referrerSignedAt;
   if (account !== undefined || prev?.accountNotionalUsd !== undefined) {
     const byAccount: Record<string, number> = {};
     if (sameDay) {

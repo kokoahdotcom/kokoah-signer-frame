@@ -62,6 +62,11 @@ export interface UsageRecord {
    * before sub-accounts: then all of `dayNotionalUsd` belongs to the master.
    */
   accountNotionalUsd?: Record<string, number>;
+  /**
+   * When this agent signed `setReferrer` (corrected clock, ms). The frame signs it at most once per key; Hyperliquid
+   * itself accepts a referrer once per account.
+   */
+  referrerSignedAt?: number;
 }
 
 /** Storage used by the frame. */

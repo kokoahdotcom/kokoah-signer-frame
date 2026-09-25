@@ -93,6 +93,7 @@ Every value is a **public, build-time** `VITE_*` variable. It is validated by [`
 | `VITE_BUILDER_ADDRESS` | yes | – | Kokoah builder address, attached to every order. Must equal the backend's `public-config` builder (the frontend compares them after `hello`) |
 | `VITE_BUILDER_FEE_TENTHS_BPS` | yes | – | Builder fee in tenths of a basis point (25 = 0.025%), 0–100 |
 | `VITE_AGENT_NAME` | no | `kokoah-web` | Default agent name, 1–16 characters |
+| `VITE_HL_REFERRAL_CODE` | no | – | Kokoah's Hyperliquid referral code (1–20 of `A–Z a–z 0–9 _ -`), the only code `setReferrer` may carry; keep it equal to the backend's `HL_REFERRAL_CODE`. Unset: `setReferrer` is denied |
 | `VITE_HL_API_URL_OVERRIDE` | no | – | **Development builds only** (dev harness mock/proxy). Rejected in production builds |
 
 Post-build variables (not in the bundle):

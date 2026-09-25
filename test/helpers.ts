@@ -94,6 +94,28 @@ export const META_XYZ = {
   marginTables: [],
   collateralToken: 0,
 };
+/** Mainnet `spotMeta` excerpt: the pinned stablecoin pairs (@166 USDT0/USDC, @150 USDE/USDC) and HYPE/USDC. */
+export const SPOT_META = {
+  universe: [
+    { tokens: [150, 0], name: "@107", index: 107, isCanonical: false },
+    { tokens: [235, 0], name: "@150", index: 150, isCanonical: false },
+    { tokens: [268, 0], name: "@166", index: 166, isCanonical: false },
+  ],
+  tokens: [
+    { name: "USDC", szDecimals: 8, weiDecimals: 8, index: 0, tokenId: "0x6d1e7cde53ba9467b783cb7c530ce054", isCanonical: true },
+    { name: "HYPE", szDecimals: 2, weiDecimals: 8, index: 150, tokenId: "0x0d01dc56dcaaca66ad901c959b4011ec", isCanonical: false },
+    { name: "USDE", szDecimals: 2, weiDecimals: 8, index: 235, tokenId: "0x2e6d84f2d7ca82e6581e03523e4389f7", isCanonical: false },
+    { name: "USDT0", szDecimals: 2, weiDecimals: 8, index: 268, tokenId: "0x25faedc3f054130dbb4e4203aca63567", isCanonical: false },
+  ],
+};
+export const SPOT_META_AND_CTXS = [
+  SPOT_META,
+  [
+    { coin: "@107", markPx: "40", midPx: "40.01", prevDayPx: "39", dayNtlVlm: "1000000" },
+    { coin: "@150", markPx: "0.9991", midPx: "0.99915", prevDayPx: "0.999", dayNtlVlm: "1000000" },
+    { coin: "@166", markPx: "0.9998", midPx: "0.99985", prevDayPx: "0.9997", dayNtlVlm: "50000000" },
+  ],
+];
 export const PERP_DEXS = [null, { name: "xyz", fullName: "XYZ", deployer: "0x2222222222222222222222222222222222222222", assetToStreamingOiCap: [], assetToFundingMultiplier: [] }];
 
 /** In-memory stand-in for api.hyperliquid-testnet.xyz. */
@@ -109,6 +131,10 @@ export class MockHl {
   leverageByUser: Record<string, Record<string, number>> = {};
   /** HL `subAccounts` answers by master (lowercase); unknown masters answer `null`. */
   subAccounts: Record<string, unknown> = {};
+  /** HL `referral` answers by user (lowercase); unknown users have no referrer. */
+  referral: Record<string, unknown> = {};
+  /** HL `spotMetaAndAssetCtxs` answer (Convert); default: the pinned mainnet stablecoin pairs plus HYPE/USDC. */
+  spot: unknown = SPOT_META_AND_CTXS;
   infoCalls: Array<Record<string, unknown>> = [];
   exchangeCalls: ExchangeCall[] = [];
   infoFailure: ((body: Record<string, unknown>) => boolean) | null = null;
@@ -158,6 +184,10 @@ export class MockHl {
         return this.extraAgents[String(body.user).toLowerCase()] ?? [];
       case "subAccounts":
         return this.subAccounts[String(body.user).toLowerCase()] ?? null;
+      case "referral":
+        return this.referral[String(body.user).toLowerCase()] ?? { referredBy: null, cumVlm: "0", unclaimedRewards: "0", claimedRewards: "0", builderRewards: "0", referrerState: { stage: "needToCreateCode" }, rewardHistory: [] };
+      case "spotMetaAndAssetCtxs":
+        return this.spot;
       case "activeAssetData": {
         const lev = this.leverageByUser[String(body.user).toLowerCase()]?.[String(body.coin)] ?? this.leverage[String(body.coin)] ?? 10;
         return { user: body.user, coin: body.coin, leverage: { type: "cross", value: lev }, maxTradeSzs: ["1", "1"], availableToTrade: ["1", "1"], markPx: this.mark[String(body.coin)] };

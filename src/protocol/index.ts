@@ -15,12 +15,13 @@
  *
  * @module
  */
+import type { AccountIntentInput } from "@kokoah/shared/actions";
 import type { ExchangeOutcome, MappedHlError } from "@kokoah/shared/errors";
 import type { ActionIntentInput } from "@kokoah/shared/intents";
 import type { PolicyViolation } from "@kokoah/shared/policy";
 import type { PreparedUserSignedAction } from "@kokoah/shared/signing";
 
-export type { ActionIntentInput, ExchangeOutcome, MappedHlError, PolicyViolation, PreparedUserSignedAction };
+export type { AccountIntentInput, ActionIntentInput, ExchangeOutcome, MappedHlError, PolicyViolation, PreparedUserSignedAction };
 
 // ---------------------------------------------------------------------------------------------
 // Constants
@@ -88,7 +89,10 @@ export const THEME_VARIABLES = [
 ] as const;
 export type ThemeVariable = (typeof THEME_VARIABLES)[number];
 
-/** Action types the frame's baseline policy allows. `setLimits.allowedActionTypes` may only be a subset. */
+/**
+ * Action types the frame's baseline policy allows. `setLimits.allowedActionTypes` may only be a subset. `setReferrer`
+ * is not listed: it is allowed only with the frame's configured referral code (`PolicySummary.referralCode`), once.
+ */
 export const BASELINE_ACTION_TYPES = [
   "order",
   "cancel",
@@ -99,6 +103,7 @@ export const BASELINE_ACTION_TYPES = [
   "updateIsolatedMargin",
   "scheduleCancel",
   "noop",
+  "startFeeTrial",
 ] as const;
 export type AllowedActionType = (typeof BASELINE_ACTION_TYPES)[number];
 
@@ -162,6 +167,16 @@ export interface PolicySummary {
   expiresAfterMs: number;
   /** Intent origins the frame accepts. */
   allowedOrigins: Array<"manual" | "ai_ticket">;
+  /**
+   * Spot pairs the frame may trade (HL coin names, e.g. `@166`): Convert's stablecoin pairs against USDC, with single
+   * IOC orders only, the builder on sells and none on buys. Every other spot market is denied.
+   */
+  spotCoins: string[];
+  /**
+   * Kokoah's Hyperliquid referral code from the frame's own build configuration, the only code `setReferrer` may
+   * carry (signed at most once per account). Null: `setReferrer` is denied.
+   */
+  referralCode: string | null;
   /** The master account's limits last applied with `setLimits` (null: baseline only). */
   userLimits: UserLimits | null;
   /** Sub-accounts with their own limits (`setLimits` with `account`); any other sub-account uses `userLimits`. */
@@ -342,8 +357,13 @@ export interface SignAndSubmitParams {
    * A Kokoah action intent (`@kokoah/shared/intents`). Prices, registries and builder are never taken from the parent.
    * `intent.vaultAddress` trades for a sub-account; the frame signs it only when HL lists that address as a
    * sub-account of the key's master.
+   *
+   * Or an account action (`@kokoah/shared/actions` `AccountIntentInput`, master account only):
+   * `{ kind: "setReferrer", origin: "manual" }` sets the frame's configured referral code (never one from the parent),
+   * only while HL reports no referrer and only once per key; `{ kind: "startFeeTrial", origin: "manual" }` starts
+   * Hyperliquid's fee trial.
    */
-  intent: ActionIntentInput;
+  intent: ActionIntentInput | AccountIntentInput;
 }
 
 /** Outcome of an action that may or may not have reached Hyperliquid. */

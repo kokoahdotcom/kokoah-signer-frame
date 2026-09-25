@@ -21,9 +21,18 @@
  * sub-account without its own uses the master's). Orders per minute are counted per agent across accounts; daily
  * notional per account for personal limits, and per agent for the baseline cap.
  *
+ * Revenue actions (PHASE3 REV), all for the master account only:
+ * - Convert stablecoins: spot orders only on the pinned stablecoin/USDC pairs of the frame's network
+ *   (`allowedSpotCoins`), each checked against the `spotMeta` the frame fetches itself; one IOC order, the builder on
+ *   sells and none on buys. Every other spot market stays denied.
+ * - `startFeeTrial`: allowed (it is in the baseline action types).
+ * - `setReferrer`: only with the frame's configured referral code (`referralCode`, from the build, never from the
+ *   parent), only while HL reports no referrer for the account and at most once per key (see `core.ts`).
+ *
  * @module
  */
-import type { CompiledAction } from "@kokoah/shared/actions";
+import type { AccountIntent, CompiledAccountAction, CompiledAction } from "@kokoah/shared/actions";
+import type { ActionIntent } from "@kokoah/shared/intents";
 import type { MarketRegistry } from "@kokoah/shared/markets";
 import { createManualTradingPolicy, evaluatePolicy, parsePolicy, type Policy, type PolicyViolation } from "@kokoah/shared/policy";
 import { BASELINE_ACTION_TYPES, EXPIRES_AFTER_MS, type AllowedActionType, type PolicySummary, type UserLimits } from "../protocol/index.js";
@@ -51,8 +60,16 @@ export interface BuilderSetting {
   feeTenthsBps: number;
 }
 
+/** Frame-wide allowances beyond trading (both from the frame's own build configuration). */
+export interface BaselineExtras {
+  /** Spot pairs Convert may trade: the network's pinned stablecoin pairs. Empty: no spot at all. */
+  spotCoins?: readonly string[];
+  /** Kokoah's Hyperliquid referral code, the only one `setReferrer` may carry. Null: `setReferrer` is denied. */
+  referralCode?: string | null;
+}
+
 /** Builds the baseline `Policy` (shared schema) for a builder. */
-export function createBaselinePolicy(builder: BuilderSetting): Policy {
+export function createBaselinePolicy(builder: BuilderSetting, extras: BaselineExtras = {}): Policy {
   return createManualTradingPolicy({
     builder: { b: builder.address.toLowerCase() as `0x${string}`, f: builder.feeTenthsBps },
     overrides: {
@@ -68,6 +85,8 @@ export function createBaselinePolicy(builder: BuilderSetting): Policy {
       maxExpiresAfterWindowMs: BASELINE_LIMITS.maxExpiresAfterWindowMs,
       allowedOrigins: [...BASELINE_LIMITS.allowedOrigins],
       exemptReduceOnlyFromNotionalCaps: true,
+      ...(extras.spotCoins && extras.spotCoins.length > 0 ? { allowedSpotCoins: [...extras.spotCoins] } : {}),
+      ...(extras.referralCode ? { referralCode: extras.referralCode } : {}),
     },
   });
 }
@@ -153,15 +172,20 @@ export function summarizeFramePolicy(policy: Policy, userLimits: UserLimits | nu
     ownSubAccountsAllowed: true,
     expiresAfterMs: EXPIRES_AFTER_MS,
     allowedOrigins: (policy.allowedOrigins ?? ["manual", "ai_ticket"]).filter((o): o is "manual" | "ai_ticket" => o !== "guardian"),
+    spotCoins: [...(policy.allowedSpotCoins ?? [])],
+    referralCode: policy.referralCode ?? null,
     userLimits: userLimits === null ? null : structuredClone(userLimits),
     accountLimits: Object.fromEntries([...accountLimits].map(([account, a]) => [account, structuredClone(a.limits)])) as Record<`0x${string}`, UserLimits>,
   };
 }
 
-/** Coins an action touches (from the compiled intent). */
-export function intentCoins(compiled: Pick<CompiledAction, "intent">): string[] {
+/** Coins an action touches (from the compiled intent). Account actions touch none. */
+export function intentCoins(compiled: { intent: ActionIntent | AccountIntent }): string[] {
   const i = compiled.intent;
   switch (i.kind) {
+    case "setReferrer":
+    case "startFeeTrial":
+      return [];
     case "order":
     case "updateLeverage":
     case "updateIsolatedMargin":
@@ -293,6 +317,11 @@ export function evaluateFramePolicy(input: FramePolicyInput): FramePolicyDecisio
     } else {
       allowedVaults = [owned];
     }
+    // Frame rule: stablecoin conversions are for the master account only.
+    const intent = input.compiled.intent;
+    if (intent.kind === "order" && input.registry.get(intent.coin)?.kind === "spot") {
+      add({ code: "VAULT_NOT_ALLOWED", message: "Stablecoin conversions are for the main account only." });
+    }
   }
   const policy: Policy = {
     ...input.policy,
@@ -338,6 +367,45 @@ export function evaluateFramePolicy(input: FramePolicyInput): FramePolicyDecisio
   );
   for (const v of wireDecision.violations) add(v);
   return { allowed: violations.length === 0, violations, actionType: wireDecision.actionType };
+}
+
+/** Inputs of {@link evaluateFrameAccountPolicy}. */
+export interface FrameAccountPolicyInput {
+  compiled: CompiledAccountAction;
+  expiresAfter: number;
+  now: number;
+  /** Effective policy of the master account (account actions never act for a sub-account). */
+  policy: Policy;
+  /**
+   * `setReferrer` only: what the frame itself read from HL `referral` for the master (true: a referrer is already set)
+   * and whether this key already signed one (persisted). Either one denies.
+   */
+  referrer?: { alreadyReferred: boolean; signedBefore: boolean };
+}
+
+/**
+ * Evaluates an account action (`setReferrer`, `startFeeTrial`) about to be signed: the shared policy on the exact wire
+ * action (no `vaultAddress`: the master account only), plus the frame's "once" rule for `setReferrer`.
+ */
+export function evaluateFrameAccountPolicy(input: FrameAccountPolicyInput): FramePolicyDecision {
+  const violations: PolicyViolation[] = [];
+  const add = (v: PolicyViolation) => {
+    if (!violations.some((x) => x.code === v.code && x.message === v.message)) violations.push(v);
+  };
+  const wireAction = input.compiled.action as unknown as { type: string } & Record<string, unknown>;
+  const decision = evaluatePolicy(
+    { kind: "wire", action: wireAction, expiresAfter: input.expiresAfter, origin: input.compiled.intent.origin },
+    { policy: { ...input.policy, allowedVaultAddresses: [] }, now: input.now, markPrices: {}, dailyNotionalUsedUsd: 0, ordersInLastMinute: 0, expiresAfter: input.expiresAfter },
+  );
+  for (const v of decision.violations) add(v);
+  if (wireAction.type === "setReferrer") {
+    if (!input.referrer) add({ code: "REFERRER_ACTION_DENIED", message: "The signer could not check the account's referrer." });
+    else {
+      if (input.referrer.alreadyReferred) add({ code: "REFERRER_ACTION_DENIED", message: "This account already has a referrer on Hyperliquid." });
+      if (input.referrer.signedBefore) add({ code: "REFERRER_ACTION_DENIED", message: "This trading key already set the referral code once." });
+    }
+  }
+  return { allowed: violations.length === 0, violations, actionType: decision.actionType };
 }
 
 function lowerOrUndefined(address: string | undefined): `0x${string}` | undefined {

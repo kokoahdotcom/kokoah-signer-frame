@@ -14,7 +14,16 @@
  *
  * @module
  */
-import { CompileError, compileAction, type CompiledAction } from "@kokoah/shared/actions";
+import {
+  type AccountIntent,
+  CompileError,
+  compileAccountAction,
+  compileAction,
+  type CompiledAccountAction,
+  type CompiledAction,
+  isAccountIntentKind,
+  safeParseAccountIntent,
+} from "@kokoah/shared/actions";
 import { parseExchangeResponse } from "@kokoah/shared/errors";
 import { safeParseActionIntent, type ActionIntent } from "@kokoah/shared/intents";
 import { deviceLinkCode } from "@kokoah/shared/link";
@@ -71,13 +80,14 @@ import { errorName, HlHttp, type FetchLike } from "./hl.js";
 import { silentLogger, type Logger } from "./log.js";
 import { MarketData, MarketDataError, type MarketSnapshot } from "./market-data.js";
 import { classifyMessage } from "./messages.js";
-import { SignerBusyError, SigningCoordinator, type LockManagerLike } from "./nonces.js";
+import { ReferrerAlreadySignedError, SignerBusyError, SigningCoordinator, type LockManagerLike } from "./nonces.js";
 import { PasskeyError, type PasskeyProvider } from "./passkey.js";
 import {
   type AccountLimits,
   actionNotionalUsd,
   applyUserLimits,
   createBaselinePolicy,
+  evaluateFrameAccountPolicy,
   evaluateFramePolicy,
   intentCoins,
   limitsForAccount,
@@ -228,10 +238,10 @@ export class FrameCore {
     this.now = deps.now ?? (() => Date.now());
     this.log = deps.logger ?? silentLogger;
     this.hl = new HlHttp({ fetch: deps.fetch, infoUrl: this.config.network.infoUrl, exchangeUrl: this.config.network.exchangeUrl });
-    this.market = new MarketData({ hl: this.hl, now: this.now });
+    this.market = new MarketData({ hl: this.hl, now: this.now, network: this.config.network.name });
     this.subAccounts = new SubAccountOwnership({ now: this.now, load: async (master) => await this.hl.info({ type: "subAccounts", user: master }) });
     this.coordinator = new SigningCoordinator({ store: deps.store, locks: deps.locks, lockPrefix: `kokoah-signer/v1/${this.config.network.name}` });
-    this.baseline = createBaselinePolicy(this.config.builder);
+    this.baseline = createBaselinePolicy(this.config.builder, { spotCoins: this.market.stablecoinPairCoins, referralCode: this.config.referralCode });
     this.policy = this.baseline;
     this.instanceId = bytesToHex(randomBytes(deps.crypto, 8));
     const root = deps.uiRoot ?? deps.document?.body ?? null;
@@ -1272,6 +1282,7 @@ export class FrameCore {
   private async runSignAndSubmit(p: SignAndSubmitParams, markConsumed: () => void): Promise<SignAndSubmitResult> {
     if (!isWriteAllowed(this.config.network)) throw new SignerFailure("MAINNET_WRITES_DISABLED", "This frame build does not allow mainnet writes.");
     const key = this.requireSigningKey();
+    if (isAccountIntentKind(p.intent)) return await this.runAccountAction(p, key, markConsumed);
 
     // 1. Validate the intent (strict: unknown keys, prices from the parent, builder fields… are all rejected).
     const parsed = safeParseActionIntent(p.intent);
@@ -1338,7 +1349,8 @@ export class FrameCore {
     const opensExposure = (intent.kind === "order" && !intent.reduceOnly) || (intent.kind === "modify" && !intent.order.reduceOnly);
     if (accountLimits?.maxLeverage !== undefined && opensExposure) {
       leverageByCoin = {};
-      for (const coin of coins) {
+      // Spot has no leverage: the stablecoin pairs are skipped.
+      for (const coin of coins.filter((c) => snapshot.registry.get(c)?.kind !== "spot")) {
         let lev: number | undefined;
         try {
           lev = await this.market.leverageFor(account, coin);
@@ -1412,12 +1424,94 @@ export class FrameCore {
     });
   }
 
+  /**
+   * `setReferrer` and `startFeeTrial` for the key's master account. The referral code is the frame's own
+   * (`VITE_HL_REFERRAL_CODE`); for `setReferrer` the frame also reads HL `referral` itself and signs only while no
+   * referrer is set, and at most once per key (recorded with the nonce, in the same IndexedDB transaction).
+   */
+  private async runAccountAction(p: SignAndSubmitParams, key: LoadedKey & { account: PrivateKeyAccount }, markConsumed: () => void): Promise<SignAndSubmitResult> {
+    const parsed = safeParseAccountIntent(p.intent);
+    if (!parsed.success) throw new SignerFailure("INVALID_INTENT", "The intent is not valid.", { details: { issues: parsed.issues.slice(0, 20) } });
+    const intent: AccountIntent = parsed.intent;
+    const master = key.meta.userAddress.toLowerCase() as `0x${string}`;
+    const deny = (message: string): never => {
+      this.metrics.policyDenials++;
+      this.log("sign.denied", { actionType: intent.kind, codes: "REFERRER_ACTION_DENIED" });
+      throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: "REFERRER_ACTION_DENIED", message }] } });
+    };
+    await this.ensureClock();
+
+    let compiled: CompiledAccountAction;
+    try {
+      compiled = compileAccountAction(intent, { referralCode: this.config.referralCode });
+    } catch (e) {
+      if (e instanceof CompileError && intent.kind === "setReferrer") deny("This signer has no Kokoah referral code configured.");
+      if (e instanceof CompileError) throw new SignerFailure("COMPILE_FAILED", e.message, { details: { compileCode: e.code } });
+      throw e;
+    }
+
+    // The account's referrer, read by the frame itself (never from the parent). Unreadable: nothing is signed.
+    let alreadyReferred = false;
+    if (intent.kind === "setReferrer") {
+      let r: unknown;
+      try {
+        r = await this.hl.info({ type: "referral", user: master });
+      } catch {
+        r = undefined;
+      }
+      if (!isRecord(r) || !("referredBy" in r)) {
+        throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Could not read the account's referrer from Hyperliquid; nothing was signed. Try again shortly.", { retryable: true });
+      }
+      alreadyReferred = r.referredBy !== null;
+    }
+
+    const agent = key.meta.agentAddress;
+    const generation = key.generation;
+    return await this.coordinator.withAgentLock(agent, async () => {
+      const current = this.key;
+      if (!current || current.generation !== generation || !current.account) {
+        throw new SignerFailure("KEY_CHANGED", "The trading key changed or was locked before signing.", { retryable: true });
+      }
+      const now = this.correctedNow();
+      if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
+      const expiresAfter = now + EXPIRES_AFTER_MS;
+      const referrer = intent.kind === "setReferrer" ? { alreadyReferred, signedBefore: await this.coordinator.referrerSigned(agent) } : undefined;
+      const decision = evaluateFrameAccountPolicy({ compiled, expiresAfter, now, policy: this.policy, ...(referrer ? { referrer } : {}) });
+      if (!decision.allowed) {
+        this.metrics.policyDenials++;
+        this.log("sign.denied", { actionType: decision.actionType, codes: decision.violations.map((v) => v.code).join(",") });
+        throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: decision.violations } });
+      }
+
+      let nonce: number;
+      try {
+        nonce = await this.coordinator.reserve(agent, { now, orders: 0, notionalUsd: 0, account: { account: master, master }, referrer: intent.kind === "setReferrer" });
+      } catch (e) {
+        // Another tab signed it between the check and the reservation.
+        if (e instanceof ReferrerAlreadySignedError) deny(e.message);
+        if (e instanceof RangeError) throw new SignerFailure("INTERNAL_ERROR", "Could not produce a valid nonce; check the device clock.");
+        throw new SignerFailure("STORAGE_FAILED", "Could not reserve a nonce on this device.", { retryable: true });
+      }
+
+      // Signs exactly `compiled.action` (the object the policy evaluated), for the master account.
+      const body = await prepareL1Request({ wallet: current.account, network: this.config.network, compiled: { action: compiled.action }, nonce, expiresAfter });
+      markConsumed();
+      this.metrics.submitted++;
+      this.log("sign.submitted", { actionType: decision.actionType, agent });
+      const transport = await this.hl.exchange(body);
+      const result = this.buildResult(p.requestId, decision.actionType, nonce, expiresAfter, { cloids: [] }, transport, 0);
+      this.log("sign.result", { status: result.status, actionType: result.actionType, ...(result.error ? { code: result.error.code } : {}) });
+      if (result.error && (result.error.code === "INVALID_NONCE" || result.error.code === "ACTION_EXPIRED")) void this.syncClock();
+      return result;
+    });
+  }
+
   private buildResult(
     requestId: string,
     actionType: string,
     nonce: number,
     expiresAfter: number,
-    compiled: CompiledAction,
+    compiled: Pick<CompiledAction, "cloids" | "marketOrder">,
     transport: Awaited<ReturnType<HlHttp["exchange"]>>,
     expectedCount: number,
   ): SignAndSubmitResult {

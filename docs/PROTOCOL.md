@@ -405,6 +405,29 @@ signature). This is how the app offers passkey protection as an optional upgrade
 
 `origin` must be `manual` or `ai_ticket`. Guardian intents are signed by the server, never by this frame.
 
+Or an **account action** (`@kokoah/shared/actions` `AccountIntentInput`), for the key's master account only, with no
+other fields (a code, a `vaultAddress` or another origin is `INVALID_INTENT`):
+- `{ "kind": "setReferrer", "origin": "manual" }` sets Kokoah's Hyperliquid referral code. The code is the frame's own
+  build value (`VITE_HL_REFERRAL_CODE`, shown as `status.policy.referralCode`), never the parent's. The frame first
+  reads HL `{"type":"referral","user":<master>}` itself: a referrer already set is `POLICY_DENIED`
+  (`REFERRER_ACTION_DENIED`), an unreadable answer `MARKET_DATA_UNAVAILABLE`. It signs at most **once per key**
+  (recorded in IndexedDB with the nonce, so reloads and other tabs see it). No code configured:
+  `REFERRER_ACTION_DENIED`.
+- `{ "kind": "startFeeTrial", "origin": "manual" }` starts Hyperliquid's fee trial (`{"type":"startFeeTrial"}`).
+
+Both results have `cloids: []`; they count toward neither the order rate nor the notional limits.
+
+**Convert stablecoins** is an ordinary `order` intent on one of the network's pinned stablecoin/USDC pairs
+(`status.policy.spotCoins`, e.g. `@166` USDT0/USDC on mainnet), for the master account: a market (or IOC limit)
+order, one leg, no TP/SL, not reduce-only. The frame reads `spotMetaAndAssetCtxs` itself and signs only when the pair,
+its token indices, names and token ids match the pins exactly (else `UNSUPPORTED_MARKET`). Buys carry no builder
+(Hyperliquid charges builder fees on spot sells only); sells carry the configured builder. Every other spot market is
+`UNSUPPORTED_MARKET`.
+
+```jsonc
+{ "kind": "order", "coin": "@166", "side": "buy", "orderType": "market", "size": "25", "slippageBps": 50, "origin": "manual" }
+```
+
 `intent.vaultAddress` trades for a **sub-account** ("strategy account") of the key's master. The frame signs it only
 when HL's own `{"type":"subAccounts","user":<master>}` lists that address with `master` equal to the key's master
 (read by the frame itself, cached 30 s, re-read on a miss once the list is 5 s old). Anything else — a vault the master
@@ -458,7 +481,8 @@ list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE`
 - Errors:
   - `NO_KEY`, `KEY_PENDING`, `KEY_EXPIRED`, `LOCKED`, `KEY_CHANGED`;
   - `INVALID_INTENT` (`details.issues`);
-  - `UNSUPPORTED_MARKET` (spot and outcome markets: the frame trades perps and HIP-3 perps only);
+  - `UNSUPPORTED_MARKET` (outcome markets, and every spot market except the pinned stablecoin pairs: the frame trades
+    perps, HIP-3 perps and stablecoin conversions only);
   - `COMPILE_FAILED` (`details.compileCode`: `UNKNOWN_MARKET`, `DELISTED_MARKET`, `SIZE_PRECISION`, `PRICE_PRECISION`, `CROSS_NOT_ALLOWED`, `MARGIN_PRECISION`, `SCHEDULE_TOO_SOON`, …; the message includes the rounded suggestion);
   - `POLICY_DENIED` (`details.violations`: every `{ code, message }` from shared `evaluatePolicy`, plus the frame's own rules);
   - `MARKET_DATA_UNAVAILABLE` (retryable);
@@ -613,7 +637,9 @@ The baseline is built into the frame and can't be loosened:
 
 | Rule | Baseline |
 |---|---|
-| Allowed action types | `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `updateLeverage`, `updateIsolatedMargin`, `scheduleCancel`, `noop`. Everything else is denied, and fund movements, vault/sub-account actions, approvals, TWAP etc. are hard-denied by the shared policy anyway |
+| Allowed action types | `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `updateLeverage`, `updateIsolatedMargin`, `scheduleCancel`, `noop`, `startFeeTrial`. Everything else is denied, and fund movements, vault/sub-account actions, approvals, TWAP etc. are hard-denied by the shared policy anyway |
+| `setReferrer` | Only with the frame's `VITE_HL_REFERRAL_CODE` (shared policy `referralCode`), for the master, while HL reports no referrer, once per key. No code configured: denied |
+| Spot | Only the network's pinned stablecoin/USDC pairs (shared `STABLECOIN_PAIRS`, checked against the frame's own `spotMetaAndAssetCtxs`), master account only: one IOC order, builder on sells and none on buys. Spot legs skip the leverage and stop-loss rules but count toward notional and rate limits. Every other spot market is denied |
 | Builder | Every `order` carries exactly `{ b: VITE_BUILDER_ADDRESS, f: VITE_BUILDER_FEE_TENTHS_BPS }` |
 | `vaultAddress` | Absent (the master), or one of the master's own sub-accounts as listed by HL `subAccounts`, read by the frame itself. Vaults and any other address are denied (`VAULT_NOT_ALLOWED`) |
 | Price band | Orders that execute now (market, IOC, and marketable limits: a buy at or above min(mark, mid), a sell at or below max(mark, mid)) within **10%** of HL's mark; market-order slippage ≤ 10%. Resting GTC/ALO limits that don't cross may sit up to **50%** from mark (shared `RESTING_PRICE_BAND_PCT`), which still stops typos like 8500 for 85000. Triggers: the limit within 10% of its trigger; an untriggered trigger up to 50% from mark; a trigger that would fire now banded at 10% from mark. Mark and mid come from the frame's own HL reads. `setLimits.priceBandPct` tightens the 10% band only |
@@ -628,11 +654,12 @@ their own:
 
 ```json
 {
-  "allowedActionTypes": ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop"],
+  "allowedActionTypes": ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop", "startFeeTrial"],
   "allowedCoins": "*", "maxOrderNotionalUsd": 1000000, "maxDailyNotionalUsd": 25000000, "maxLeverage": "market",
   "maxOrdersPerMinute": 60, "priceBandPct": 10, "requireStopLossForNewEntries": false,
   "builder": { "address": "0x…builder", "feeTenthsBps": 25 }, "vaultAddressAllowed": false, "ownSubAccountsAllowed": true,
-  "expiresAfterMs": 15000, "allowedOrigins": ["manual", "ai_ticket"], "userLimits": null,
+  "expiresAfterMs": 15000, "allowedOrigins": ["manual", "ai_ticket"], "spotCoins": ["@166", "@150"], "referralCode": null,
+  "userLimits": null,
   "accountLimits": { "0x…sub": { "maxOrderNotionalUsd": 1000 } }
 }
 ```
