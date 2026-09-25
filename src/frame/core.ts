@@ -1427,7 +1427,9 @@ export class FrameCore {
   /**
    * `setReferrer` and `startFeeTrial` for the key's master account. The referral code is the frame's own
    * (`VITE_HL_REFERRAL_CODE`); for `setReferrer` the frame also reads HL `referral` itself and signs only while no
-   * referrer is set, and at most once per key (recorded with the nonce, in the same IndexedDB transaction).
+   * referrer is set, and at most once per key (recorded with the nonce, in the same IndexedDB transaction). For
+   * `startFeeTrial` the frame reads HL `userFees` itself: the tier's rates come from that fee schedule, and nothing is
+   * signed while a trial runs or before `nextTrialAvailableTimestamp`.
    */
   private async runAccountAction(p: SignAndSubmitParams, key: LoadedKey & { account: PrivateKeyAccount }, markConsumed: () => void): Promise<SignAndSubmitResult> {
     const parsed = safeParseAccountIntent(p.intent);
@@ -1441,9 +1443,34 @@ export class FrameCore {
     };
     await this.ensureClock();
 
+    // The fee schedule and trial state, read by the frame itself (never from the parent).
+    let feeTiers: Array<{ cross: string; add: string }> | undefined;
+    if (intent.kind === "startFeeTrial") {
+      const fees = await this.readInfo({ type: "userFees", user: master }, "Could not read your fee tier from Hyperliquid; nothing was signed. Try again shortly.");
+      const vip = isRecord(fees) && isRecord(fees.feeSchedule) && isRecord(fees.feeSchedule.tiers) ? fees.feeSchedule.tiers.vip : undefined;
+      if (!isRecord(fees) || !("trial" in fees) || !Array.isArray(vip) || !vip.every((t) => isRecord(t) && typeof t.cross === "string" && typeof t.add === "string")) {
+        throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Hyperliquid's fee schedule was unreadable; nothing was signed. Try again shortly.", { retryable: true });
+      }
+      const next = fees.nextTrialAvailableTimestamp;
+      const unavailable =
+        fees.trial !== null
+          ? "A fee trial is already running on this account."
+          : typeof next === "number" && next > this.correctedNow()
+            ? "The next fee trial is not available yet (one every 90 days)."
+            : next !== null && next !== undefined && typeof next !== "number"
+              ? "Hyperliquid's fee trial state was unreadable."
+              : null;
+      if (unavailable) {
+        this.metrics.policyDenials++;
+        this.log("sign.denied", { actionType: intent.kind, codes: "FEE_TRIAL_UNAVAILABLE" });
+        throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: "FEE_TRIAL_UNAVAILABLE", message: unavailable }] } });
+      }
+      feeTiers = vip as Array<{ cross: string; add: string }>;
+    }
+
     let compiled: CompiledAccountAction;
     try {
-      compiled = compileAccountAction(intent, { referralCode: this.config.referralCode });
+      compiled = compileAccountAction(intent, { referralCode: this.config.referralCode, ...(feeTiers ? { feeTiers } : {}) });
     } catch (e) {
       if (e instanceof CompileError && intent.kind === "setReferrer") deny("This signer has no Kokoah referral code configured.");
       if (e instanceof CompileError) throw new SignerFailure("COMPILE_FAILED", e.message, { details: { compileCode: e.code } });
@@ -1453,12 +1480,7 @@ export class FrameCore {
     // The account's referrer, read by the frame itself (never from the parent). Unreadable: nothing is signed.
     let alreadyReferred = false;
     if (intent.kind === "setReferrer") {
-      let r: unknown;
-      try {
-        r = await this.hl.info({ type: "referral", user: master });
-      } catch {
-        r = undefined;
-      }
+      const r = await this.readInfo({ type: "referral", user: master }, "Could not read the account's referrer from Hyperliquid; nothing was signed. Try again shortly.");
       if (!isRecord(r) || !("referredBy" in r)) {
         throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Could not read the account's referrer from Hyperliquid; nothing was signed. Try again shortly.", { retryable: true });
       }
@@ -1504,6 +1526,15 @@ export class FrameCore {
       if (result.error && (result.error.code === "INVALID_NONCE" || result.error.code === "ACTION_EXPIRED")) void this.syncClock();
       return result;
     });
+  }
+
+  /** An HL `/info` read by the frame itself; a failed read signs nothing (`MARKET_DATA_UNAVAILABLE`, retryable). */
+  private async readInfo(body: Record<string, unknown>, message: string): Promise<unknown> {
+    try {
+      return await this.hl.info(body);
+    } catch {
+      throw new SignerFailure("MARKET_DATA_UNAVAILABLE", message, { retryable: true });
+    }
   }
 
   private buildResult(

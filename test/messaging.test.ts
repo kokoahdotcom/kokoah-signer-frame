@@ -170,8 +170,8 @@ describe("hello and status", () => {
       ownSubAccountsAllowed: true,
       expiresAfterMs: 15_000,
       allowedOrigins: ["manual", "ai_ticket"],
-      // Testnet has no pinned stablecoin pairs yet, and this build has no referral code.
-      spotCoins: [],
+      // Testnet's pinned stablecoin pairs; this build has no referral code.
+      spotCoins: ["@1115", "@1200"],
       referralCode: null,
       userLimits: null,
       accountLimits: {},

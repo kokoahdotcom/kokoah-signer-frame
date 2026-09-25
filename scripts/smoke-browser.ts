@@ -385,7 +385,7 @@ async function main(): Promise<number> {
     check("signAndSubmit: mock HL verified the agent signature", signed.status === "ok" && mock.state.exchangeCount === 1, signed);
     // Account actions (PHASE3 REV): the fee trial goes through the same path; without a configured referral code,
     // setReferrer is refused before anything is signed.
-    const trial = await evaluate<{ status: string; actionType: string }>('signer.signAndSubmit({ requestId: crypto.randomUUID(), intent: { kind: "startFeeTrial", origin: "manual" } })');
+    const trial = await evaluate<{ status: string; actionType: string }>('signer.signAndSubmit({ requestId: crypto.randomUUID(), intent: { kind: "startFeeTrial", origin: "manual", tier: 1 } })');
     check("startFeeTrial: mock HL verified the agent signature", trial.status === "ok" && trial.actionType === "startFeeTrial" && mock.state.exchangeCount === 2, trial);
     const referral = await evaluate<{ code?: string; violations?: string }>(
       'signer.signAndSubmit({ requestId: crypto.randomUUID(), intent: { kind: "setReferrer", origin: "manual" } }).then(() => ({}), (e) => ({ code: e.code, violations: JSON.stringify(e.details?.violations ?? []) }))',
