@@ -105,6 +105,8 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 const CLOCK_RESYNC_MS = 5 * 60 * 1000;
 const CONFIRM_POLL_MS = 1_000;
 const MAX_REMEMBERED_REQUESTS = 1_000;
+/** Hyperliquid's app refuses a referral code after this much traded volume (USD). */
+const REFERRAL_MAX_VOLUME_USD = 10_000;
 
 /** Where the frame posts messages (`window.parent`). */
 export interface ParentLike {
@@ -1485,6 +1487,8 @@ export class FrameCore {
         throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Could not read the account's referrer from Hyperliquid; nothing was signed. Try again shortly.", { retryable: true });
       }
       alreadyReferred = r.referredBy !== null;
+      // Hyperliquid takes a referral code only in an account's first $10,000 of volume (its app's rule).
+      if (!alreadyReferred && Number(r.cumVlm) > REFERRAL_MAX_VOLUME_USD) deny("Hyperliquid accepts a referral code only in an account's first $10,000 of volume.");
     }
 
     const agent = key.meta.agentAddress;

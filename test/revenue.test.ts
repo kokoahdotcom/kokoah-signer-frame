@@ -100,6 +100,16 @@ describe("setReferrer", () => {
     expect((await h.ok("signAndSubmit", { requestId: "r4", intent: referrer })).status).toBe("ok");
   });
 
+  it("is denied after the account's first $10,000 of volume, as Hyperliquid's app does", async () => {
+    h = await FrameHarness.create({ config: testConfig({ VITE_HL_REFERRAL_CODE: CODE }) });
+    await h.activeAgent();
+    h.hl.referral[USER] = { referredBy: null, cumVlm: "10000.5" };
+    const e = await h.fail("signAndSubmit", { requestId: "r1", intent: referrer });
+    expect(e.details?.violations?.[0]?.message).toMatch(/first \$10,000/);
+    h.hl.referral[USER] = { referredBy: null, cumVlm: "9999.0" };
+    expect((await h.ok("signAndSubmit", { requestId: "r2", intent: referrer })).status).toBe("ok");
+  });
+
   it("rejects an invalid VITE_HL_REFERRAL_CODE at startup", () => {
     expect(() => testConfig({ VITE_HL_REFERRAL_CODE: "has space" })).toThrow(/VITE_HL_REFERRAL_CODE/);
     expect(() => testConfig({ VITE_HL_REFERRAL_CODE: "x".repeat(21) })).toThrow(/VITE_HL_REFERRAL_CODE/);

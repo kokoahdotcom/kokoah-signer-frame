@@ -409,8 +409,9 @@ Or an **account action** (`@kokoah/shared/actions` `AccountIntentInput`), for th
 other fields (a code, a `vaultAddress` or another origin is `INVALID_INTENT`):
 - `{ "kind": "setReferrer", "origin": "manual" }` sets Kokoah's Hyperliquid referral code. The code is the frame's own
   build value (`VITE_HL_REFERRAL_CODE`, shown as `status.policy.referralCode`), never the parent's. The frame first
-  reads HL `{"type":"referral","user":<master>}` itself: a referrer already set is `POLICY_DENIED`
-  (`REFERRER_ACTION_DENIED`), an unreadable answer `MARKET_DATA_UNAVAILABLE`. It signs at most **once per key**
+  reads HL `{"type":"referral","user":<master>}` itself: a referrer already set, or more than $10,000 of volume
+  (Hyperliquid's app refuses codes after that), is `POLICY_DENIED` (`REFERRER_ACTION_DENIED`), an unreadable answer
+  `MARKET_DATA_UNAVAILABLE`. It signs at most **once per key**
   (recorded in IndexedDB with the nonce, so reloads and other tabs see it). No code configured:
   `REFERRER_ACTION_DENIED`.
 - `{ "kind": "startFeeTrial", "origin": "manual", "tier": 1 }` starts Hyperliquid's fee trial for VIP tier `tier`
