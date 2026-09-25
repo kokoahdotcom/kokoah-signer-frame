@@ -168,10 +168,21 @@ export interface PolicySummary {
   /** Intent origins the frame accepts. */
   allowedOrigins: Array<"manual" | "ai_ticket">;
   /**
-   * Spot pairs the frame may trade (HL coin names, e.g. `@166`): Convert's stablecoin pairs against USDC, with single
-   * IOC orders only, the builder on sells and none on buys. Every other spot market is denied.
+   * Spot pairs the frame signs for the master now (HL coin names, e.g. `@166`): Convert's stablecoin pairs against
+   * USDC, plus `spotTradingCoins` once spot trading is on. One order per action, the builder on sells and none on buys.
+   * Every other spot market is denied.
    */
   spotCoins: string[];
+  /**
+   * Spot trading is on for the master (`setLimits({ spotTrading: true })`): the pairs in `spotCoins` take market orders
+   * and IOC, GTC and post-only limits within the price bands. Off (the default): Convert's single IOC orders only.
+   */
+  spotTrading: boolean;
+  /**
+   * The verified token/USDC pairs this frame can trade once spot trading is on (shared `VERIFIED_SPOT_PAIRS`: Hyperliquid's
+   * "Strict" list). Each is signed only while the frame's own `spotMeta` read confirms it exactly.
+   */
+  spotTradingCoins: string[];
   /**
    * Kokoah's Hyperliquid referral code from the frame's own build configuration, the only code `setReferrer` may
    * carry (signed at most once per account). Null: `setReferrer` is denied.
@@ -416,6 +427,12 @@ export interface UserLimits {
   requireStopLossForNewEntries?: boolean;
   /** Subset of the baseline action types. */
   allowedActionTypes?: AllowedActionType[];
+  /**
+   * `true` turns spot trading on (off by default, so omitting it or `{}` turns it off): market orders and IOC, GTC and
+   * post-only limits on the pairs in `PolicySummary.spotTradingCoins`, for the master account only. It unlocks nothing
+   * beyond the frame's baseline; like every limit, the parent re-applies it after each load.
+   */
+  spotTrading?: boolean;
 }
 /**
  * `setLimits` replaces the previous limits of one account entirely. Without `account` (or with the key's master) it

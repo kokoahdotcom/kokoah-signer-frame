@@ -430,6 +430,24 @@ its token indices, names and token ids match the pins exactly (else `UNSUPPORTED
 (Hyperliquid charges builder fees on spot sells only); sells carry the configured builder. Every other spot market is
 `UNSUPPORTED_MARKET`.
 
+**Spot trading** (PHASE3 SPOT) is off until the parent calls `setLimits({ spotTrading: true })` for the master. Then
+`order` intents may also use the verified token/USDC pairs in `status.policy.spotTradingCoins` (shared
+`VERIFIED_SPOT_PAIRS`: Hyperliquid's own "Strict" spot list, e.g. `@107` HYPE/USDC and `@142` UBTC/USDC on mainnet,
+`PURR/USDC` and `@1035` HYPE/USDC on testnet), with the same checks against the frame's own `spotMetaAndAssetCtxs`
+(pair index and name, token indices, names and token ids; any mismatch or any other pair is `UNSUPPORTED_MARKET`):
+
+- market orders (IOC) and `limit` orders with `tif` `Gtc`, `Ioc` or `Alo`, within the price bands of §7;
+- one leg, not reduce-only, no trigger order types, no TP/SL legs, no `modify` (cancel and re-place instead):
+  `POLICY_DENIED` / `SPOT_NOT_ALLOWED`. Hyperliquid's own app offers no stop or take-profit orders on spot;
+- buys carry no builder; sells carry the configured builder;
+- master account only (`VAULT_NOT_ALLOWED` for a sub-account, whatever its own limits say);
+- mainnet: one order on a verified pair is at most **10% of the pair's 24 h notional volume** as the frame read it
+  (`POLICY_DENIED` / `ORDER_NOTIONAL_EXCEEDED`); stablecoin pairs and testnet have no such cap.
+
+```jsonc
+{ "kind": "order", "coin": "@107", "side": "sell", "orderType": "limit", "size": "1.5", "price": "41.2", "tif": "Alo", "origin": "manual" }
+```
+
 ```jsonc
 { "kind": "order", "coin": "@166", "side": "buy", "orderType": "market", "size": "25", "slippageBps": 50, "origin": "manual" }
 ```
@@ -487,8 +505,8 @@ list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE`
 - Errors:
   - `NO_KEY`, `KEY_PENDING`, `KEY_EXPIRED`, `LOCKED`, `KEY_CHANGED`;
   - `INVALID_INTENT` (`details.issues`);
-  - `UNSUPPORTED_MARKET` (outcome markets, and every spot market except the pinned stablecoin pairs: the frame trades
-    perps, HIP-3 perps and stablecoin conversions only);
+  - `UNSUPPORTED_MARKET` (outcome markets, and every spot market except the pinned stablecoin and verified pairs that
+    the frame's own `spotMeta` confirms: the frame trades perps, HIP-3 perps and verified spot pairs only);
   - `COMPILE_FAILED` (`details.compileCode`: `UNKNOWN_MARKET`, `DELISTED_MARKET`, `SIZE_PRECISION`, `PRICE_PRECISION`, `CROSS_NOT_ALLOWED`, `MARGIN_PRECISION`, `SCHEDULE_TOO_SOON`, …; the message includes the rounded suggestion);
   - `POLICY_DENIED` (`details.violations`: every `{ code, message }` from shared `evaluatePolicy`, plus the frame's own rules);
   - `MARKET_DATA_UNAVAILABLE` (retryable);
@@ -539,6 +557,7 @@ on HL at signing.
 | `allowedCoins` | Non-empty list of HL coin names (a subset of the baseline) |
 | `requireStopLossForNewEntries` | `true` tightens; `false` is a no-op |
 | `allowedActionTypes` | A subset of the baseline action types |
+| `spotTrading` | `true` turns spot trading on (the verified pairs in `spotTradingCoins`, see `signAndSubmit`); omitted or `false`: off, the default. It is the one setting that starts off, and it never goes beyond the baseline |
 | `account` | Optional sub-account address (see above) |
 
 - User limits live in the frame's memory: re-apply them (the master's and every sub-account's) after `hello` on every load and on `reconnected` (store them in settings).
@@ -615,7 +634,7 @@ Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event":
 | `AGENT_NOT_FOUND` | HL doesn't list the agent yet | Retry `confirmAgent` (maybe with `timeoutMs`) |
 | `AGENT_MISMATCH` | HL lists the agent under another name | Revoke and re-create |
 | `INVALID_INTENT` | Intent failed shared validation | Bug in the intent builder; show `details.issues` in dev |
-| `UNSUPPORTED_MARKET` | Spot or outcome market | Don't offer the ticket |
+| `UNSUPPORTED_MARKET` | Outcome market, or a spot pair the frame can't verify | Don't offer the ticket |
 | `COMPILE_FAILED` | Market unknown/delisted, precision, margin mode… (`details.compileCode`) | Show the message (it carries the rounded suggestion) |
 | `POLICY_DENIED` | Policy refused (`details.violations`) | Show each violation's `message` |
 | `MARKET_DATA_UNAVAILABLE` | HL `/info` failed | Retry later |
@@ -645,7 +664,7 @@ The baseline is built into the frame and can't be loosened:
 |---|---|
 | Allowed action types | `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `updateLeverage`, `updateIsolatedMargin`, `scheduleCancel`, `noop`, `startFeeTrial`. Everything else is denied, and fund movements, vault/sub-account actions, approvals, TWAP etc. are hard-denied by the shared policy anyway |
 | `setReferrer` | Only with the frame's `VITE_HL_REFERRAL_CODE` (shared policy `referralCode`), for the master, while HL reports no referrer, once per key. No code configured: denied |
-| Spot | Only the network's pinned stablecoin/USDC pairs (shared `STABLECOIN_PAIRS`, checked against the frame's own `spotMetaAndAssetCtxs`), master account only: one IOC order, builder on sells and none on buys. Spot legs skip the leverage and stop-loss rules but count toward notional and rate limits. Every other spot market is denied |
+| Spot | The network's pinned stablecoin/USDC pairs (shared `STABLECOIN_PAIRS`) with one IOC order; once the parent sets `spotTrading: true`, also the verified token/USDC pairs (shared `VERIFIED_SPOT_PAIRS`) with market orders and GTC, IOC and post-only limits. Every pair is checked against the frame's own `spotMetaAndAssetCtxs`; master account only; no triggers, reduce-only, TP/SL or modify; builder on sells and none on buys; on mainnet one order on a verified pair ≤ 10% of its 24 h volume. Spot legs skip the leverage and stop-loss rules but count toward notional and rate limits. Every other spot market is denied |
 | Builder | Every `order` carries exactly `{ b: VITE_BUILDER_ADDRESS, f: VITE_BUILDER_FEE_TENTHS_BPS }` |
 | `vaultAddress` | Absent (the master), or one of the master's own sub-accounts as listed by HL `subAccounts`, read by the frame itself. Vaults and any other address are denied (`VAULT_NOT_ALLOWED`) |
 | Price band | Orders that execute now (market, IOC, and marketable limits: a buy at or above min(mark, mid), a sell at or below max(mark, mid)) within **10%** of HL's mark; market-order slippage ≤ 10%. Resting GTC/ALO limits that don't cross may sit up to **50%** from mark (shared `RESTING_PRICE_BAND_PCT`), which still stops typos like 8500 for 85000. Triggers: the limit within 10% of its trigger; an untriggered trigger up to 50% from mark; a trigger that would fire now banded at 10% from mark. Mark and mid come from the frame's own HL reads. `setLimits.priceBandPct` tightens the 10% band only |
@@ -664,7 +683,7 @@ their own:
   "allowedCoins": "*", "maxOrderNotionalUsd": 1000000, "maxDailyNotionalUsd": 25000000, "maxLeverage": "market",
   "maxOrdersPerMinute": 60, "priceBandPct": 10, "requireStopLossForNewEntries": false,
   "builder": { "address": "0x…builder", "feeTenthsBps": 25 }, "vaultAddressAllowed": false, "ownSubAccountsAllowed": true,
-  "expiresAfterMs": 15000, "allowedOrigins": ["manual", "ai_ticket"], "spotCoins": ["@166", "@150"], "referralCode": null,
+  "expiresAfterMs": 15000, "allowedOrigins": ["manual", "ai_ticket"], "spotCoins": ["@166", "@150"], "spotTrading": false, "spotTradingCoins": ["PURR/USDC", "@1", "…", "@107", "@142"], "referralCode": null,
   "userLimits": null,
   "accountLimits": { "0x…sub": { "maxOrderNotionalUsd": 1000 } }
 }

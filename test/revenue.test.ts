@@ -206,9 +206,14 @@ describe("Convert stablecoins (spot)", () => {
   it("refuses every other spot market before signing", async () => {
     h = await FrameHarness.create({ config: mainnet() });
     await h.activeAgent();
-    for (const [i, coin] of ["@107", "PURR/USDC", "@999"].entries()) {
+    // Unverified (@999), or a verified pair the mock's spotMeta doesn't list (PURR/USDC): refused before any policy.
+    for (const [i, coin] of ["PURR/USDC", "@999"].entries()) {
       expect((await h.fail("signAndSubmit", { requestId: `x${i}`, intent: convert({ coin, size: "1" }) })).code).toBe("UNSUPPORTED_MARKET");
     }
+    // A verified pair (HYPE/USDC) while spot trading is off: denied by the policy.
+    const hype = await h.fail("signAndSubmit", { requestId: "x3", intent: convert({ coin: "@107", size: "1" }) });
+    expect(hype.code).toBe("POLICY_DENIED");
+    expect(codes(hype)).toEqual(["SPOT_NOT_ALLOWED"]);
     expect(h.hl.exchangeCalls).toHaveLength(0);
   });
 
