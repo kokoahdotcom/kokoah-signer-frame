@@ -6,7 +6,7 @@ import { IDBFactory } from "fake-indexeddb";
 import { recoverL1Signer } from "@kokoah/shared/signing";
 import { afterEach, describe, expect, it } from "vitest";
 import { IdbSignerStore } from "../src/frame/storage.js";
-import { BUILDER, Clock, FrameHarness, limitOrder, MockHl, SPOT_META, SPOT_META_AND_CTXS, subAccountEntry, T0, testConfig, USER } from "./helpers.js";
+import { BUILDER, Clock, FrameHarness, limitOrder, MockHl, SPOT_META, SPOT_META_AND_CTXS, subAccountEntry, T0, testConfig, USER, USER_FEES } from "./helpers.js";
 
 let h: FrameHarness;
 afterEach(() => h?.destroy());
@@ -14,7 +14,7 @@ afterEach(() => h?.destroy());
 const CODE = "KOKOAH";
 const MAINNET = { VITE_HL_NETWORK: "mainnet", VITE_ALLOW_MAINNET_WRITES: "true" };
 const referrer = { kind: "setReferrer", origin: "manual" };
-const feeTrial = { kind: "startFeeTrial", origin: "manual" };
+const feeTrial = { kind: "startFeeTrial", origin: "manual", tier: 1 };
 const convert = (o: Record<string, unknown> = {}) => ({ kind: "order", coin: "@166", side: "buy", orderType: "market", size: "25", slippageBps: 50, origin: "manual", ...o });
 const codes = (e: { details?: { violations?: Array<{ code: string }> } }) => (e.details?.violations ?? []).map((v) => v.code);
 
@@ -108,22 +108,53 @@ describe("setReferrer", () => {
 });
 
 describe("startFeeTrial", () => {
-  it("signs the bare action for the master account", async () => {
+  it("signs the chosen VIP tier's rates from the fee schedule the frame read itself, for the master account", async () => {
     h = await FrameHarness.create();
     await h.activeAgent();
     const r = await h.ok("signAndSubmit", { requestId: "t1", intent: feeTrial });
-    expect(r).toMatchObject({ status: "ok", actionType: "startFeeTrial" });
-    expect(h.hl.exchangeCalls[0]!.body.action).toEqual({ type: "startFeeTrial" });
+    expect(r).toMatchObject({ status: "ok", actionType: "startFeeTrial", cloids: [] });
+    expect(h.hl.exchangeCalls[0]!.body.action).toEqual({ type: "startFeeTrial", addBaseRate: "0.00012", crossBaseRate: "0.0004" });
+    expect(Object.keys(h.hl.exchangeCalls[0]!.body.action)).toEqual(["type", "addBaseRate", "crossBaseRate"]);
     expect(h.hl.exchangeCalls[0]!.body.vaultAddress).toBeUndefined();
+    expect(h.hl.infoCalls.some((c) => c.type === "userFees" && String(c.user).toLowerCase() === USER)).toBe(true);
+    await h.ok("signAndSubmit", { requestId: "t2", intent: { ...feeTrial, tier: 4 } });
+    expect(h.hl.exchangeCalls[1]!.body.action).toEqual({ type: "startFeeTrial", addBaseRate: "0.0", crossBaseRate: "0.00028" });
   });
 
-  it("respects limits that leave it out, and takes no parameters", async () => {
+  it("takes rates only from Hyperliquid: no rate fields, no tier outside the schedule", async () => {
+    h = await FrameHarness.create();
+    await h.activeAgent();
+    expect((await h.fail("signAndSubmit", { requestId: "t1", intent: { ...feeTrial, crossBaseRate: "0.0" } })).code).toBe("INVALID_INTENT");
+    expect((await h.fail("signAndSubmit", { requestId: "t2", intent: { ...feeTrial, tier: 9 } })).code).toBe("COMPILE_FAILED");
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+  });
+
+  it("is refused while a trial runs or before the next one is available, and when HL can't be read", async () => {
+    h = await FrameHarness.create();
+    await h.activeAgent();
+    const fees = h.hl.userFees as Record<string, unknown>;
+    fees.trial = { perpCrossBaseRate: "0.0004", perpAddBaseRate: "0.00012", spotCrossBaseRate: "0.0006", spotAddBaseRate: "0.0003", endTimestamp: T0 + 86_400_000 };
+    expect(codes(await h.fail("signAndSubmit", { requestId: "t1", intent: feeTrial }))).toEqual(["FEE_TRIAL_UNAVAILABLE"]);
+    fees.trial = null;
+    fees.nextTrialAvailableTimestamp = T0 + 3_600_000;
+    expect(codes(await h.fail("signAndSubmit", { requestId: "t2", intent: feeTrial }))).toEqual(["FEE_TRIAL_UNAVAILABLE"]);
+    fees.nextTrialAvailableTimestamp = T0 - 1;
+    h.hl.infoFailure = (b) => b.type === "userFees";
+    expect(await h.fail("signAndSubmit", { requestId: "t3", intent: feeTrial })).toMatchObject({ code: "MARKET_DATA_UNAVAILABLE", retryable: true });
+    h.hl.infoFailure = null;
+    h.hl.userFees = { trial: null };
+    expect((await h.fail("signAndSubmit", { requestId: "t4", intent: feeTrial })).code).toBe("MARKET_DATA_UNAVAILABLE");
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    // Once available again, it signs.
+    h.hl.userFees = { ...structuredClone(USER_FEES), nextTrialAvailableTimestamp: T0 - 1 };
+    expect((await h.ok("signAndSubmit", { requestId: "t5", intent: feeTrial })).status).toBe("ok");
+  });
+
+  it("respects limits that leave it out", async () => {
     h = await FrameHarness.create();
     await h.activeAgent();
     await h.ok("setLimits", { allowedActionTypes: ["order", "cancel", "cancelByCloid"] });
-    const e = await h.fail("signAndSubmit", { requestId: "t1", intent: feeTrial });
-    expect(codes(e)).toEqual(["ACTION_TYPE_NOT_ALLOWED"]);
-    expect((await h.fail("signAndSubmit", { requestId: "t2", intent: { ...feeTrial, tier: 3 } })).code).toBe("INVALID_INTENT");
+    expect(codes(await h.fail("signAndSubmit", { requestId: "t1", intent: feeTrial }))).toEqual(["ACTION_TYPE_NOT_ALLOWED"]);
     expect(h.hl.exchangeCalls).toHaveLength(0);
   });
 });
@@ -200,9 +231,13 @@ describe("Convert stablecoins (spot)", () => {
     expect(h.hl.exchangeCalls).toHaveLength(0);
   });
 
-  it("has no spot pairs on testnet yet", async () => {
+  it("uses the testnet pins on testnet, never the mainnet ones", async () => {
     h = await FrameHarness.create();
     await h.activeAgent();
+    expect((await h.ok("getStatus")).policy.spotCoins).toEqual(["@1115", "@1200"]);
+    // @166 is a mainnet pair; the mock's spot meta has no testnet pairs, so nothing matches.
     expect((await h.fail("signAndSubmit", { requestId: "c1", intent: convert() })).code).toBe("UNSUPPORTED_MARKET");
+    expect((await h.fail("signAndSubmit", { requestId: "c2", intent: convert({ coin: "@1115" }) })).code).toBe("UNSUPPORTED_MARKET");
+    expect(h.hl.exchangeCalls).toHaveLength(0);
   });
 });

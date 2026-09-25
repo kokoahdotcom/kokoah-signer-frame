@@ -78,6 +78,17 @@ export function createMockHl(options: { mode: MockMode; log?: (line: string) => 
         return state.agents.get(String(body.user).toLowerCase()) ?? [];
       case "activeAssetData":
         return { user: body.user, coin: body.coin, leverage: { type: "cross", value: 10 }, maxTradeSzs: ["1", "1"], availableToTrade: ["1", "1"], markPx: state.mark[String(body.coin)] ?? "1" };
+      case "userFees":
+        return {
+          feeSchedule: { cross: "0.00045", add: "0.00015", tiers: { vip: [{ ntlCutoff: "5000000.0", cross: "0.0004", add: "0.00012" }], mm: [] } },
+          userCrossRate: "0.00045",
+          userAddRate: "0.00015",
+          trial: null,
+          feeTrialEscrow: "0.0",
+          nextTrialAvailableTimestamp: null,
+        };
+      case "referral":
+        return { referredBy: null, cumVlm: "0.0", unclaimedRewards: "0.0", claimedRewards: "0.0", builderRewards: "0.0", referrerState: { stage: "needToCreateCode" }, rewardHistory: [] };
       default:
         return null;
     }

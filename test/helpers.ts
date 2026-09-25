@@ -116,6 +116,28 @@ export const SPOT_META_AND_CTXS = [
     { coin: "@166", markPx: "0.9998", midPx: "0.99985", prevDayPx: "0.9997", dayNtlVlm: "50000000" },
   ],
 ];
+/** HL `userFees` excerpt: the VIP tiers, no trial running and one available now. */
+export const USER_FEES = {
+  feeSchedule: {
+    cross: "0.00045",
+    add: "0.00015",
+    tiers: {
+      vip: [
+        { ntlCutoff: "5000000.0", cross: "0.0004", add: "0.00012" },
+        { ntlCutoff: "25000000.0", cross: "0.00035", add: "0.00008" },
+        { ntlCutoff: "100000000.0", cross: "0.0003", add: "0.00004" },
+        { ntlCutoff: "500000000.0", cross: "0.00028", add: "0.0" },
+      ],
+      mm: [{ makerFractionCutoff: "0.005", add: "-0.00001" }],
+    },
+  },
+  userCrossRate: "0.00045",
+  userAddRate: "0.00015",
+  activeReferralDiscount: "0.0",
+  trial: null,
+  feeTrialEscrow: "0.0",
+  nextTrialAvailableTimestamp: null,
+};
 export const PERP_DEXS = [null, { name: "xyz", fullName: "XYZ", deployer: "0x2222222222222222222222222222222222222222", assetToStreamingOiCap: [], assetToFundingMultiplier: [] }];
 
 /** In-memory stand-in for api.hyperliquid-testnet.xyz. */
@@ -135,6 +157,8 @@ export class MockHl {
   referral: Record<string, unknown> = {};
   /** HL `spotMetaAndAssetCtxs` answer (Convert); default: the pinned mainnet stablecoin pairs plus HYPE/USDC. */
   spot: unknown = SPOT_META_AND_CTXS;
+  /** HL `userFees` answer (fee trial). */
+  userFees: unknown = structuredClone(USER_FEES);
   infoCalls: Array<Record<string, unknown>> = [];
   exchangeCalls: ExchangeCall[] = [];
   infoFailure: ((body: Record<string, unknown>) => boolean) | null = null;
@@ -188,6 +212,8 @@ export class MockHl {
         return this.referral[String(body.user).toLowerCase()] ?? { referredBy: null, cumVlm: "0", unclaimedRewards: "0", claimedRewards: "0", builderRewards: "0", referrerState: { stage: "needToCreateCode" }, rewardHistory: [] };
       case "spotMetaAndAssetCtxs":
         return this.spot;
+      case "userFees":
+        return this.userFees;
       case "activeAssetData": {
         const lev = this.leverageByUser[String(body.user).toLowerCase()]?.[String(body.coin)] ?? this.leverage[String(body.coin)] ?? 10;
         return { user: body.user, coin: body.coin, leverage: { type: "cross", value: lev }, maxTradeSzs: ["1", "1"], availableToTrade: ["1", "1"], markPx: this.mark[String(body.coin)] };

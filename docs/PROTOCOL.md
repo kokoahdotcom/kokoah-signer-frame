@@ -413,7 +413,12 @@ other fields (a code, a `vaultAddress` or another origin is `INVALID_INTENT`):
   (`REFERRER_ACTION_DENIED`), an unreadable answer `MARKET_DATA_UNAVAILABLE`. It signs at most **once per key**
   (recorded in IndexedDB with the nonce, so reloads and other tabs see it). No code configured:
   `REFERRER_ACTION_DENIED`.
-- `{ "kind": "startFeeTrial", "origin": "manual" }` starts Hyperliquid's fee trial (`{"type":"startFeeTrial"}`).
+- `{ "kind": "startFeeTrial", "origin": "manual", "tier": 1 }` starts Hyperliquid's fee trial for VIP tier `tier`
+  (1 = the first entry of `userFees.feeSchedule.tiers.vip`). The frame reads `userFees` for the master itself, takes
+  that tier's rates from it and signs `{"type":"startFeeTrial","addBaseRate":"0.00012","crossBaseRate":"0.0004"}`
+  (the shape Hyperliquid's app sends). While a trial runs (`trial` not null) or before `nextTrialAvailableTimestamp`
+  it answers `POLICY_DENIED` (`FEE_TRIAL_UNAVAILABLE`); an unreadable answer is `MARKET_DATA_UNAVAILABLE`; a tier
+  outside the schedule is `COMPILE_FAILED`.
 
 Both results have `cloids: []`; they count toward neither the order rate nor the notional limits.
 
