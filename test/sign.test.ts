@@ -293,12 +293,15 @@ describe("signAndSubmit preconditions", () => {
     expect(h.hl.exchangeCalls).toHaveLength(0);
   });
 
-  it("uses origin rules from the baseline policy (guardian intents are refused)", async () => {
+  it("uses origin rules from the baseline policy (guardian, bot and telegram intents are refused)", async () => {
     h = await FrameHarness.create();
     await h.activeAgent("device");
-    const e = await h.fail("signAndSubmit", { requestId: "g", intent: limitOrder({ origin: "guardian", cloid: cloid() }) });
-    expect(e.code).toBe("POLICY_DENIED");
-    expect(e.details?.violations?.map((v) => v.code)).toContain("ORIGIN_NOT_ALLOWED");
+    for (const origin of ["guardian", "bot", "telegram"]) {
+      const e = await h.fail("signAndSubmit", { requestId: `o-${origin}`, intent: limitOrder({ origin, cloid: cloid() }) });
+      expect(e.code).toBe("POLICY_DENIED");
+      expect(e.details?.violations?.map((v) => v.code)).toContain("ORIGIN_NOT_ALLOWED");
+    }
+    expect(h.hl.exchangeCalls).toHaveLength(0);
   });
 });
 
