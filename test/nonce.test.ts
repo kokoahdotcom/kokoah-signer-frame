@@ -1,6 +1,6 @@
 import { IDBFactory } from "fake-indexeddb";
 import { afterEach, describe, expect, it } from "vitest";
-import { nextUsage, SignerBusyError, SigningCoordinator, usageOf } from "../src/frame/nonces.js";
+import { nextUsage, SignerBusyError, SigningCoordinator, UsageLimitError, usageOf } from "../src/frame/nonces.js";
 import { IdbSignerStore, MemorySignerStore } from "../src/frame/storage.js";
 import { Clock, FakeLocks, FrameHarness, limitOrder, MockHl, T0 } from "./helpers.js";
 
@@ -92,7 +92,24 @@ describe("nonces across two tabs sharing IndexedDB", () => {
     expect(Math.min(...nonces)).toBe(T0);
     expect(Math.max(...nonces)).toBe(T0 + 49);
     const usage = usageOf(await s1.readUsage("0xabc"), T0);
-    expect(usage).toEqual({ ordersInLastMinute: 50, dailyNotionalUsedUsd: 500, accountDailyNotionalUsd: 500 });
+    expect(usage).toEqual({ ordersInLastMinute: 50, actionsInLastMinute: 50, dailyNotionalUsedUsd: 500, accountDailyNotionalUsd: 500 });
+  });
+
+  it("checks the limits again inside the reservation, so tabs without a shared lock can't both pass", async () => {
+    const idb = new IDBFactory();
+    const tabs = await Promise.all([IdbSignerStore.open(idb), IdbSignerStore.open(idb)]);
+    const [c1, c2] = tabs.map((store) => new SigningCoordinator({ store, locks: undefined, lockPrefix: "t" }));
+    const limits = { maxOrdersPerMinute: 60, maxActionsPerMinute: 120, maxDailyNotionalUsd: 1_000, maxAgentDailyNotionalUsd: 25_000_000 };
+    // Both tabs checked the policy on "nothing used yet"; only $1,000 of the two $600 orders fits.
+    const results = await Promise.allSettled([c1!, c2!].map((c) => c.reserve("0xabc", { now: T0, orders: 1, notionalUsd: 600, limits })));
+    expect(results.map((r) => r.status).sort()).toEqual(["fulfilled", "rejected"]);
+    expect((results.find((r) => r.status === "rejected") as PromiseRejectedResult).reason).toBeInstanceOf(UsageLimitError);
+    // Every signed action counts toward the action rate, cancels included.
+    const few = { ...limits, maxActionsPerMinute: 3 };
+    for (let i = 0; i < 2; i++) await c1!.reserve("0xdef", { now: T0, orders: 0, notionalUsd: 0, limits: few });
+    await c1!.reserve("0xdef", { now: T0, orders: 0, notionalUsd: 0, limits: few });
+    await expect(c2!.reserve("0xdef", { now: T0, orders: 0, notionalUsd: 0, limits: few })).rejects.toThrow("signed actions per minute");
+    expect(usageOf(await tabs[0]!.readUsage("0xdef"), T0 + 61_000).actionsInLastMinute).toBe(0);
   });
 });
 
