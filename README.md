@@ -124,6 +124,7 @@ Post-build variables (not in the bundle):
   - attests it with Sigstore and publishes it on tags.
   
   After deploying, run `monitor-deploy` from kokoah-infra against the signer domain.
+- **Vercel.** `kokoah-infra/vercel` builds the frame from its commit with the deployment's origins in `_headers`, serves those headers through the Build Output routes and checks the live headers after each deploy.
 - **Mainnet.** Set `VITE_HL_NETWORK=mainnet` **and** `VITE_ALLOW_MAINNET_WRITES=true`, the real builder and the real app origin, in the production pipeline only.
 
 ### Requested kokoah-infra changes
