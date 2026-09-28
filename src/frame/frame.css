@@ -134,3 +134,40 @@ body {
     animation: none !important;
   }
 }
+
+/*
+ * A prompt that weakens the key's protection (passkey → device) ignores the parent's theme: literal colors and sizes,
+ * so the parent's --ks-* values can't hide or disguise it.
+ */
+.ks-prompt.ks-prompt--fixed {
+  background: #ffffff;
+  color: #14161a;
+  border: 2px solid #b3261e;
+  border-radius: 10px;
+  padding: 16px;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 15px;
+}
+.ks-prompt--fixed .ks-title,
+.ks-prompt--fixed .ks-body,
+.ks-prompt--fixed .ks-status {
+  color: #14161a;
+  font-size: 15px;
+}
+.ks-prompt--fixed .ks-title {
+  font-size: 17px;
+}
+.ks-prompt--fixed .ks-button {
+  border-radius: 10px;
+  font-size: 15px;
+}
+.ks-prompt--fixed .ks-primary {
+  background: #b3261e;
+  border-color: #b3261e;
+  color: #ffffff;
+}
+.ks-prompt--fixed .ks-secondary {
+  background: #ffffff;
+  border-color: #5b6270;
+  color: #14161a;
+}
