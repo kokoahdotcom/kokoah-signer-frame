@@ -13,7 +13,7 @@
  * @module
  */
 import { MarketRegistry, parseCoin, type PerpDexLike, type PerpMetaLike, type SpotMetaLike } from "@kokoah/shared/markets";
-import { STABLECOIN_PAIRS, VERIFIED_SPOT_PAIRS, verifiedSpotPairs } from "@kokoah/shared/policy";
+import { perpDexProblem, STABLECOIN_PAIRS, VERIFIED_SPOT_PAIRS, verifiedSpotPairs } from "@kokoah/shared/policy";
 import type { HlHttp } from "./hl.js";
 
 /** Everything the signing pipeline needs about the markets an intent touches. */
@@ -128,7 +128,11 @@ export class MarketData {
     const perpDexs = hip3.length > 0 ? await this.perpDexs() : undefined;
     if (perpDexs) {
       for (const d of hip3) {
-        if (!perpDexs.some((x, i) => i > 0 && x !== null && x.name === d)) throw new MarketDataError("UNKNOWN_DEX", `Unknown HIP-3 dex "${d}"`);
+        const live = perpDexs.find((x, i) => i > 0 && x !== null && x.name === d) ?? undefined;
+        if (!live) throw new MarketDataError("UNKNOWN_DEX", `Unknown HIP-3 dex "${d}"`);
+        // On mainnet only the pinned dexes, while their deployer (who sets the mark) is unchanged (shared perpDexs.ts).
+        const problem = perpDexProblem(this.opts.network, d, live);
+        if (problem) throw new MarketDataError("UNSUPPORTED_MARKET", problem);
       }
     }
     const [snaps, spot] = await Promise.all([

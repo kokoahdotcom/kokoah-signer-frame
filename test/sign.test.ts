@@ -1,5 +1,6 @@
 import { compileAction } from "@kokoah/shared/actions";
 import { MarketRegistry } from "@kokoah/shared/markets";
+import { VERIFIED_PERP_DEXS } from "@kokoah/shared/policy";
 import { buildExchangeRequest, recoverL1Signer } from "@kokoah/shared/signing";
 import { afterEach, describe, expect, it } from "vitest";
 import { testConfig, BUILDER, FrameHarness, limitOrder, META0, META_XYZ, PERP_DEXS, cloid, T0, USER, MockHl, Clock } from "./helpers.js";
@@ -63,6 +64,25 @@ describe("signAndSubmit happy path", () => {
     expect(h.hl.infoCalls).toContainEqual({ type: "perpDexs" });
     const registry = MarketRegistry.fromInfo({ dexMetas: { xyz: META_XYZ }, perpDexs: PERP_DEXS });
     expect(registry.require("xyz:GOLD").assetId).toBe(110001);
+  });
+
+  it("on mainnet signs HIP-3 orders only on a pinned dex whose deployer is unchanged", async () => {
+    h = await FrameHarness.create({ config: testConfig({ VITE_HL_NETWORK: "mainnet", VITE_ALLOW_MAINNET_WRITES: "true" }) });
+    await h.activeAgent("device");
+    const gold = () => limitOrder({ coin: "xyz:GOLD", price: "3000", size: "0.01" });
+    // The mock's "xyz" names another deployer than the pinned one: whoever sets the mark now is unknown.
+    expect(await h.fail("signAndSubmit", { requestId: "x0", intent: gold() })).toMatchObject({ code: "UNSUPPORTED_MARKET", message: expect.stringContaining("new deployer") });
+    const baseInfo = h.hl.info.bind(h.hl);
+    const pinned = VERIFIED_PERP_DEXS.mainnet.find((d) => d.name === "xyz")!.deployer;
+    h.hl.info = (body) => (body.type === "perpDexs" ? [null, { ...PERP_DEXS[1], deployer: pinned }] : baseInfo(body));
+    await h.clock.advance(61_000); // past the dex list cache
+    expect((await h.ok("signAndSubmit", { requestId: "x1", intent: gold() })).status).toBe("ok");
+    // A dex Kokoah never verified is refused even when HL lists it.
+    h.hl.info = (body) =>
+      body.type === "perpDexs" ? [null, { ...PERP_DEXS[1], name: "evil", deployer: pinned }] : body.type === "metaAndAssetCtxs" && body.dex === "evil" ? baseInfo({ ...body, dex: "xyz" }) : baseInfo(body);
+    await h.clock.advance(61_000);
+    expect(await h.fail("signAndSubmit", { requestId: "x2", intent: limitOrder({ coin: "evil:GOLD", price: "3000", size: "0.01" }) })).toMatchObject({ code: "UNSUPPORTED_MARKET", message: expect.stringContaining("not verified") });
+    expect(h.hl.exchangeCalls).toHaveLength(1);
   });
 
   it("attaches TP/SL legs and returns every cloid", async () => {
