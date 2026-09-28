@@ -307,7 +307,10 @@ describe("setStorageMode (passkey protection without a new approveAgent)", () =>
     const a = await frame({ passkeys });
     const { address } = await a.activeAgent("passkey");
     const changing = a.ok("setStorageMode", { to: "device" });
-    await waitFor(() => a.root?.querySelector(".ks-title")?.textContent === "Remove passkey protection");
+    await waitFor(() => a.root?.querySelector(".ks-title")?.textContent === "Remove passkey protection?");
+    // Shown in the frame's own fixed style, whatever theme the parent set.
+    expect(a.root?.querySelector(".ks-prompt")?.classList.contains("ks-prompt--fixed")).toBe(true);
+    expect(a.root?.querySelector(".ks-primary")?.textContent).toBe("Remove protection");
     await a.clickPrompt();
     expect(await changing).toMatchObject({ storageMode: "device", locked: false, agentAddress: address });
     a.destroy();

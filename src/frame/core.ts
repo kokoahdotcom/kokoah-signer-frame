@@ -80,11 +80,12 @@ import { errorName, HlHttp, type FetchLike } from "./hl.js";
 import { silentLogger, type Logger } from "./log.js";
 import { MarketData, MarketDataError, type MarketSnapshot } from "./market-data.js";
 import { classifyMessage } from "./messages.js";
-import { ReferrerAlreadySignedError, SignerBusyError, SigningCoordinator, type LockManagerLike } from "./nonces.js";
+import { ReferrerAlreadySignedError, SignerBusyError, SigningCoordinator, UsageLimitError, type LockManagerLike } from "./nonces.js";
 import { PasskeyError, type PasskeyProvider } from "./passkey.js";
 import {
   type AccountLimits,
   actionNotionalUsd,
+  BASELINE_LIMITS,
   applyUserLimits,
   createBaselinePolicy,
   evaluateFrameAccountPolicy,
@@ -820,7 +821,7 @@ export class FrameCore {
     return this.ui;
   }
 
-  private async prompt<T>(kind: PromptKind, texts: { title: string; body: string; actionLabel: string }, action: () => Promise<T>): Promise<T> {
+  private async prompt<T>(kind: PromptKind, texts: { title: string; body: string; actionLabel: string; fixedStyle?: boolean }, action: () => Promise<T>): Promise<T> {
     const ui = this.requirePromptUi();
     return await ui.run({ kind, ...texts, cancelLabel: "Cancel", timeoutMs: this.deps.promptTimeoutMs ?? 120_000 }, action, (e) => this.promptFailure(e));
   }
@@ -1108,7 +1109,12 @@ export class FrameCore {
         try {
           secret = await this.prompt(
             "passkey-unlock",
-            { title: "Remove passkey protection", body: "Use your passkey once more. After this, the trading key unlocks on this device without a passkey.", actionLabel: "Use passkey" },
+            {
+              title: "Remove passkey protection?",
+              body: "After this, the trading key on this device unlocks without your passkey. Continue only if you asked for this.",
+              actionLabel: "Remove protection",
+              fixedStyle: true,
+            },
             async () => {
               const { prfFirst } = await this.deps.passkeys.get({ rpId: pk.rpId, credentialId: pk.credentialId, prfSalt: pk.prfSalt, timeoutMs: 60_000 });
               try {
@@ -1376,7 +1382,8 @@ export class FrameCore {
       const now = this.correctedNow();
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
       const expiresAfter = now + EXPIRES_AFTER_MS;
-      const usageAccount = { account, master };
+      // Sub-accounts without limits of their own share the master's daily counter.
+      const usageAccount = { account, master, separate: [...this.accountLimits.keys()] };
       const usage = await this.coordinator.usage(agent, now, usageAccount);
       const decision = evaluateFramePolicy({
         compiled,
@@ -1408,8 +1415,18 @@ export class FrameCore {
           orders: orderCount(action),
           notionalUsd: actionNotionalUsd(action, snapshot.registry, snapshot.markPrices),
           account: usageAccount,
+          limits: {
+            maxOrdersPerMinute: accountPolicy.maxOrdersPerMinute,
+            maxActionsPerMinute: BASELINE_LIMITS.maxActionsPerMinute,
+            maxDailyNotionalUsd: accountPolicy.maxDailyNotionalUsd,
+            maxAgentDailyNotionalUsd: BASELINE_LIMITS.maxDailyNotionalUsd,
+          },
         });
       } catch (e) {
+        if (e instanceof UsageLimitError) {
+          this.metrics.policyDenials++;
+          throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: e.code, message: e.message }] } });
+        }
         if (e instanceof RangeError) throw new SignerFailure("INTERNAL_ERROR", "Could not produce a valid nonce; check the device clock.");
         throw new SignerFailure("STORAGE_FAILED", "Could not reserve a nonce on this device.", { retryable: true });
       }
@@ -1514,8 +1531,16 @@ export class FrameCore {
 
       let nonce: number;
       try {
-        nonce = await this.coordinator.reserve(agent, { now, orders: 0, notionalUsd: 0, account: { account: master, master }, referrer: intent.kind === "setReferrer" });
+        nonce = await this.coordinator.reserve(agent, {
+          now,
+          orders: 0,
+          notionalUsd: 0,
+          account: { account: master, master },
+          referrer: intent.kind === "setReferrer",
+          limits: { maxOrdersPerMinute: Infinity, maxActionsPerMinute: BASELINE_LIMITS.maxActionsPerMinute, maxDailyNotionalUsd: Infinity, maxAgentDailyNotionalUsd: Infinity },
+        });
       } catch (e) {
+        if (e instanceof UsageLimitError) deny(e.message);
         // Another tab signed it between the check and the reservation.
         if (e instanceof ReferrerAlreadySignedError) deny(e.message);
         if (e instanceof RangeError) throw new SignerFailure("INTERNAL_ERROR", "Could not produce a valid nonce; check the device clock.");

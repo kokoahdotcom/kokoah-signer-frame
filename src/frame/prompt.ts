@@ -19,6 +19,11 @@ export interface PromptRequest {
   actionLabel: string;
   cancelLabel: string;
   timeoutMs: number;
+  /**
+   * Shown in the frame's own fixed colors and size, whatever the parent's `setTheme` set: for a step that weakens the
+   * key's protection, so the parent can't hide or disguise what the user is agreeing to.
+   */
+  fixedStyle?: boolean;
 }
 
 /** Why a prompt ended without success. */
@@ -142,6 +147,7 @@ export class PromptUi {
   }
 
   private show(req: PromptRequest): void {
+    this.panel.classList.toggle("ks-prompt--fixed", req.fixedStyle === true);
     this.title.textContent = req.title;
     this.body.textContent = req.body;
     this.primary.textContent = req.actionLabel;
