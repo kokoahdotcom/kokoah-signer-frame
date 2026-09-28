@@ -41,6 +41,28 @@ export class ReferrerAlreadySignedError extends Error {
 
 const MINUTE = 60_000;
 
+/** A limit the reservation found exceeded (checked again inside the storage transaction; see {@link SigningCoordinator.reserve}). */
+export class UsageLimitError extends Error {
+  /** The shared policy code (the action rate reports as ORDER_RATE_EXCEEDED, with its own message). */
+  readonly code: "ORDER_RATE_EXCEEDED" | "DAILY_NOTIONAL_EXCEEDED";
+  constructor(code: UsageLimitError["code"], message: string) {
+    super(message);
+    this.name = "UsageLimitError";
+    this.code = code;
+  }
+}
+
+/** The limits a reservation must stay within. */
+export interface ReserveLimits {
+  maxOrdersPerMinute: number;
+  /** Signed actions of any kind (orders, cancels, leverage, noop…) per minute. */
+  maxActionsPerMinute: number;
+  /** The account's own daily limit (its pool's, for sub-accounts without limits of their own). */
+  maxDailyNotionalUsd: number;
+  /** The agent's daily limit across every account. */
+  maxAgentDailyNotionalUsd: number;
+}
+
 /** UTC day key. */
 export function utcDay(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
@@ -49,6 +71,8 @@ export function utcDay(ms: number): string {
 export interface Usage {
   /** Orders this agent signed in the last minute, across every account. */
   ordersInLastMinute: number;
+  /** Actions of any kind this agent signed in the last minute, across every account. */
+  actionsInLastMinute: number;
   /** Notional this agent signed today, across every account. */
   dailyNotionalUsedUsd: number;
   /** Notional signed today for the account asked about (the master when none was given). */
@@ -61,6 +85,11 @@ export interface UsageAccount {
   account: string;
   /** The key's master (records from before sub-accounts count everything for it). */
   master: string;
+  /**
+   * Sub-accounts with daily limits of their own (lowercase). Every other account shares the master's limit, so its
+   * notional is counted together with the master's and that of every other account without limits of its own.
+   */
+  separate?: readonly string[];
 }
 
 export interface SigningCoordinatorOptions {
@@ -122,20 +151,29 @@ export class SigningCoordinator {
    * {@link ReferrerAlreadySignedError} when the agent already signed one.
    * Throws if the nonce would fall outside HL's accepted window.
    */
-  async reserve(agent: string, params: { now: number; orders: number; notionalUsd: number; account?: UsageAccount; referrer?: boolean }): Promise<number> {
+  async reserve(
+    agent: string,
+    params: { now: number; orders: number; notionalUsd: number; account?: UsageAccount; referrer?: boolean; limits?: ReserveLimits },
+  ): Promise<number> {
     const now = Math.floor(params.now);
     let already = false;
+    let exceeded: UsageLimitError | undefined;
     const record = await this.store.updateUsage(agent, (prev) => {
       if (params.referrer && typeof prev?.referrerSignedAt === "number") {
         already = true;
         // Unchanged: nothing is reserved.
         return prev;
       }
+      // The limits again, in the same transaction that records this action: tabs without a shared lock (no Web Locks)
+      // can't both pass on the same usage.
+      exceeded = params.limits ? limitProblem(usageOf(prev, now, params.account), params) : undefined;
+      if (exceeded) return prev ?? { agent: agent.toLowerCase(), lastNonce: 0, orderTimes: [], day: utcDay(now), dayNotionalUsd: 0 };
       const next = nextUsage(agent, prev, now, params.orders, params.notionalUsd, params.account);
       if (params.referrer) next.referrerSignedAt = now;
       return next;
     });
     if (already) throw new ReferrerAlreadySignedError();
+    if (exceeded) throw exceeded;
     if (!isNonceInWindow(record.lastNonce, now)) throw new RangeError("Nonce outside Hyperliquid's accepted window; check the device clock");
     return record.lastNonce;
   }
@@ -172,10 +210,12 @@ export class SigningCoordinator {
 
 /** Usage counters of a record at `now`. Without `account`, the account figure is the master's. */
 export function usageOf(record: UsageRecord | undefined, now: number, account?: UsageAccount): Usage {
-  if (!record) return { ordersInLastMinute: 0, dailyNotionalUsedUsd: 0, accountDailyNotionalUsd: 0 };
+  if (!record) return { ordersInLastMinute: 0, actionsInLastMinute: 0, dailyNotionalUsedUsd: 0, accountDailyNotionalUsd: 0 };
   const today = record.day === utcDay(now);
+  const inLastMinute = (t: number) => t > now - MINUTE && t <= now + MINUTE;
   return {
-    ordersInLastMinute: record.orderTimes.filter((t) => t > now - MINUTE && t <= now + MINUTE).length,
+    ordersInLastMinute: record.orderTimes.filter(inLastMinute).length,
+    actionsInLastMinute: (record.actionTimes ?? []).filter(inLastMinute).length,
     dailyNotionalUsedUsd: today ? record.dayNotionalUsd : 0,
     accountDailyNotionalUsd: today ? accountNotional(record, account) : 0,
   };
@@ -185,8 +225,30 @@ function accountNotional(record: UsageRecord, account: UsageAccount | undefined)
   const byAccount = record.accountNotionalUsd;
   if (byAccount === undefined) return account === undefined || account.account.toLowerCase() === account.master.toLowerCase() ? record.dayNotionalUsd : 0;
   if (account === undefined) return record.dayNotionalUsd;
-  const value = byAccount[account.account.toLowerCase()];
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  const amount = (a: string) => {
+    const value = byAccount[a];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  };
+  const key = account.account.toLowerCase();
+  if (account.separate === undefined) return amount(key);
+  const separate = new Set(account.separate.map((a) => a.toLowerCase()));
+  if (separate.has(key)) return amount(key);
+  // The master's limit is shared by every account without limits of its own.
+  return Object.keys(byAccount)
+    .filter((a) => !separate.has(a))
+    .reduce((sum, a) => sum + amount(a), 0);
+}
+
+/** The limit this reservation would exceed, if any. */
+function limitProblem(usage: Usage, p: { orders: number; notionalUsd: number; limits?: ReserveLimits }): UsageLimitError | undefined {
+  const l = p.limits;
+  if (!l) return undefined;
+  if (usage.actionsInLastMinute + 1 > l.maxActionsPerMinute) return new UsageLimitError("ORDER_RATE_EXCEEDED", `More than ${l.maxActionsPerMinute} signed actions per minute.`);
+  if (p.orders > 0 && usage.ordersInLastMinute + p.orders > l.maxOrdersPerMinute) return new UsageLimitError("ORDER_RATE_EXCEEDED", `More than ${l.maxOrdersPerMinute} orders per minute.`);
+  const added = Number.isFinite(p.notionalUsd) && p.notionalUsd > 0 ? p.notionalUsd : 0;
+  if (added > 0 && usage.accountDailyNotionalUsd + added > l.maxDailyNotionalUsd) return new UsageLimitError("DAILY_NOTIONAL_EXCEEDED", `Daily notional would pass the $${l.maxDailyNotionalUsd} limit.`);
+  if (added > 0 && usage.dailyNotionalUsedUsd + added > l.maxAgentDailyNotionalUsd) return new UsageLimitError("DAILY_NOTIONAL_EXCEEDED", `This device's key would pass its daily limit of $${l.maxAgentDailyNotionalUsd} across all accounts.`);
+  return undefined;
 }
 
 /** Pure update of the usage record (runs inside the IndexedDB transaction). */
@@ -203,7 +265,9 @@ export function nextUsage(agent: string, prev: UsageRecord | undefined, now: num
   const added = Number.isFinite(notionalUsd) && notionalUsd > 0 ? notionalUsd : 0;
   const sameDay = prev !== undefined && prev.day === today;
   const dayNotionalUsd = (sameDay ? prev.dayNotionalUsd : 0) + added;
-  const record: UsageRecord = { agent: agent.toLowerCase(), lastNonce: nonce, orderTimes: recent.slice(-10_000), day: today, dayNotionalUsd };
+  const actions = (prev?.actionTimes ?? []).filter((t) => t > now - MINUTE && t <= now + MINUTE);
+  actions.push(now);
+  const record: UsageRecord = { agent: agent.toLowerCase(), lastNonce: nonce, orderTimes: recent.slice(-10_000), actionTimes: actions.slice(-10_000), day: today, dayNotionalUsd };
   if (typeof prev?.referrerSignedAt === "number") record.referrerSignedAt = prev.referrerSignedAt;
   if (account !== undefined || prev?.accountNotionalUsd !== undefined) {
     const byAccount: Record<string, number> = {};

@@ -53,6 +53,8 @@ export interface UsageRecord {
   lastNonce: number;
   /** Times (ms, corrected clock) of orders signed in roughly the last minute, one entry per order. */
   orderTimes: number[];
+  /** Times (ms, corrected clock) of every action signed in roughly the last minute (missing in older records). */
+  actionTimes?: number[];
   /** UTC day (YYYY-MM-DD) of `dayNotionalUsd` and `accountNotionalUsd`. */
   day: string;
   /** Notional signed on `day` across every account. */

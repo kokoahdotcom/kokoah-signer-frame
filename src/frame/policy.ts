@@ -54,6 +54,8 @@ export const BASELINE_LIMITS = Object.freeze({
   maxOrderNotionalUsd: 1_000_000,
   maxDailyNotionalUsd: 25_000_000,
   maxOrdersPerMinute: 60,
+  /** Signed actions of any kind (cancels, leverage, noop… too) per minute, so none can be looped without limit. */
+  maxActionsPerMinute: 120,
   priceBandPct: 10,
   requireStopLossForNewEntries: false,
   /** `expiresAfter` is mandatory and at most this far ahead (the frame itself uses 15 s). */
