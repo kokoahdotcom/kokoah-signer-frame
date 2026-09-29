@@ -3,7 +3,9 @@
  * frame fetches them from Hyperliquid `/info` itself, per perp dex (HIP-3 dexes separately), and caches them briefly.
  *
  * - `metaAndAssetCtxs` (per dex) gives the dex's `meta` (for `MarketRegistry`) and each asset's mark and mid price.
- * - `perpDexs` gives dex indices, needed for HIP-3 asset ids (cached longer; the registry cross-checks names).
+ * - `perpDexs` gives dex indices, needed for HIP-3 asset ids (cached longer; the registry cross-checks names), and each
+ *   dex's deployer: on mainnet a snapshot reports the dexes that aren't pinned or have a new deployer (shared
+ *   `perpDexs.ts`), and the core signs only cancels and reduce-only orders on them.
  * - `activeAssetData` gives the user's current leverage for a market (only needed when the parent tightened
  *   `maxLeverage` below the market maximum).
  * - `spotMetaAndAssetCtxs` (Convert and spot trading) gives the spot pairs, their mark and mid and 24 h volume. Only
@@ -27,6 +29,12 @@ export interface MarketSnapshot {
   spotDayVolumes: Record<string, number>;
   /** Verified (non-stablecoin) spot pairs in the registry. */
   verifiedSpotCoins: string[];
+  /**
+   * HIP-3 dexes in the registry that aren't pinned in shared `perpDexs.ts` or whose deployer isn't the pinned one, with
+   * the reason. Empty on testnet. On them a mainnet signer signs only cancels and reduce-only orders, so a user can
+   * always leave such a dex.
+   */
+  dexProblems: Record<string, string>;
 }
 
 /** Thrown when market data can't be fetched or is malformed. */
@@ -125,14 +133,17 @@ export class MarketData {
     }
     if (dexes.size === 0) dexes.add("");
     const hip3 = [...dexes].filter((d) => d !== "");
+    // HIP-3 asset ids need the dex's position in `perpDexs`: when it can't be read, nothing on a HIP-3 dex is signed.
     const perpDexs = hip3.length > 0 ? await this.perpDexs() : undefined;
+    const dexProblems: Record<string, string> = {};
     if (perpDexs) {
       for (const d of hip3) {
         const live = perpDexs.find((x, i) => i > 0 && x !== null && x.name === d) ?? undefined;
         if (!live) throw new MarketDataError("UNKNOWN_DEX", `Unknown HIP-3 dex "${d}"`);
         // On mainnet only the pinned dexes, while their deployer (who sets the mark) is unchanged (shared perpDexs.ts).
+        // Reported rather than thrown: cancels and reduce-only orders stay possible there (core.ts).
         const problem = perpDexProblem(this.opts.network, d, live);
-        if (problem) throw new MarketDataError("UNSUPPORTED_MARKET", problem);
+        if (problem) dexProblems[d] = problem;
       }
     }
     const [snaps, spot] = await Promise.all([
@@ -171,7 +182,7 @@ export class MarketData {
       const volume = spot?.dayVolumes[coin];
       if (volume !== undefined) spotDayVolumes[coin] = volume;
     }
-    return { registry, markPrices, midPrices, spotDayVolumes, verifiedSpotCoins: spotCoins.filter((c) => spot?.verified.includes(c)) };
+    return { registry, markPrices, midPrices, spotDayVolumes, verifiedSpotCoins: spotCoins.filter((c) => spot?.verified.includes(c)), dexProblems };
   }
 
   /** The user's current leverage setting for `coin`, or undefined when HL doesn't report one. */
@@ -222,7 +233,13 @@ export class MarketData {
     const now = this.opts.now();
     if (this.perpDexsCache && now - this.perpDexsCache.at < this.opts.dexListTtlMs) return await this.perpDexsCache.value;
     const value = (async () => {
-      const r = await this.opts.hl.info({ type: "perpDexs" });
+      let r: unknown;
+      try {
+        r = await this.opts.hl.info({ type: "perpDexs" });
+      } catch (e) {
+        // A failed read is retryable, like every other market data read.
+        throw new MarketDataError("MARKET_DATA_UNAVAILABLE", e instanceof Error ? e.message : "perpDexs unavailable");
+      }
       if (!Array.isArray(r) || r.length === 0) throw new MarketDataError("MARKET_DATA_UNAVAILABLE", "Malformed perpDexs response");
       for (const d of r) {
         if (d !== null && (!isRecord(d) || typeof d.name !== "string")) throw new MarketDataError("MARKET_DATA_UNAVAILABLE", "Malformed perpDexs entry");

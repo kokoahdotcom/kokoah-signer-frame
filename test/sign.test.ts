@@ -78,11 +78,69 @@ describe("signAndSubmit happy path", () => {
     await h.clock.advance(61_000); // past the dex list cache
     expect((await h.ok("signAndSubmit", { requestId: "x1", intent: gold() })).status).toBe("ok");
     // A dex Kokoah never verified is refused even when HL lists it.
+    const evilMeta = { ...META_XYZ, universe: META_XYZ.universe.map((u) => ({ ...u, name: u.name.replace("xyz:", "evil:") })) };
+    h.hl.mark["evil:GOLD"] = "3000";
     h.hl.info = (body) =>
-      body.type === "perpDexs" ? [null, { ...PERP_DEXS[1], name: "evil", deployer: pinned }] : body.type === "metaAndAssetCtxs" && body.dex === "evil" ? baseInfo({ ...body, dex: "xyz" }) : baseInfo(body);
+      body.type === "perpDexs" ? [null, { ...PERP_DEXS[1], name: "evil", deployer: pinned }] : body.type === "metaAndAssetCtxs" && body.dex === "evil" ? [evilMeta, h.hl.ctxs(evilMeta)] : baseInfo(body);
     await h.clock.advance(61_000);
     expect(await h.fail("signAndSubmit", { requestId: "x2", intent: limitOrder({ coin: "evil:GOLD", price: "3000", size: "0.01" }) })).toMatchObject({ code: "UNSUPPORTED_MARKET", message: expect.stringContaining("not verified") });
     expect(h.hl.exchangeCalls).toHaveLength(1);
+  });
+
+  it("on mainnet signs only cancels and reduce-only orders on a HIP-3 dex that isn't pinned or has a new deployer", async () => {
+    h = await FrameHarness.create({ config: testConfig({ VITE_HL_NETWORK: "mainnet", VITE_ALLOW_MAINNET_WRITES: "true" }) });
+    await h.activeAgent("device");
+    // The mock's "xyz" names another deployer than the pinned one.
+    const unsupported = async (requestId: string, intent: Record<string, unknown>) =>
+      expect(await h.fail("signAndSubmit", { requestId, intent })).toMatchObject({ code: "UNSUPPORTED_MARKET", message: expect.stringContaining("new deployer") });
+    const gold = { coin: "xyz:GOLD", side: "sell", orderType: "limit", size: "0.01", price: "3000" };
+    // Refused: entries, modifies that aren't reduce-only, and every leverage or isolated-margin change, either way.
+    await unsupported("e1", limitOrder({ coin: "xyz:GOLD", price: "3000", size: "0.01" }));
+    await unsupported("e2", { kind: "modify", target: { oid: 7 }, order: { ...gold, reduceOnly: false }, origin: "manual" });
+    await unsupported("e3", { kind: "updateIsolatedMargin", coin: "xyz:GOLD", amountUsd: "-25", origin: "manual" });
+    await unsupported("e4", { kind: "updateIsolatedMargin", coin: "xyz:GOLD", amountUsd: "25", origin: "manual" });
+    h.hl.leverage["xyz:GOLD"] = 5;
+    await unsupported("e5", { kind: "updateLeverage", coin: "xyz:GOLD", leverage: 8, marginMode: "isolated", origin: "manual" });
+    await unsupported("e6", { kind: "updateLeverage", coin: "xyz:GOLD", leverage: 2, marginMode: "isolated", origin: "manual" });
+    await unsupported("e7", { kind: "updateLeverage", coin: "xyz:GOLD", leverage: 2, marginMode: "cross", origin: "manual" });
+    // TP/SL legs are reduce-only, the entry they're attached to isn't.
+    await unsupported("e8", limitOrder({ coin: "xyz:GOLD", price: "3000", size: "0.01", stopLoss: { triggerPrice: "2900" } }));
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    // The frame doesn't need the account's leverage to refuse them.
+    expect(h.hl.infoCalls.filter((c) => c.type === "activeAssetData")).toHaveLength(0);
+
+    // Exits still go through: cancels, the dead-man's switch, reduce-only closes and position TP/SL, reduce-only modifies.
+    const exits: Array<Record<string, unknown>> = [
+      { kind: "cancel", cancels: [{ coin: "xyz:GOLD", oid: 7 }], origin: "manual" },
+      { kind: "cancel", cancels: [{ coin: "xyz:GOLD", cloid: cloid() }], origin: "manual" },
+      { kind: "scheduleCancel", time: T0 + 60_000, origin: "manual" },
+      { kind: "order", coin: "xyz:GOLD", side: "sell", orderType: "market", size: "0.01", reduceOnly: true, slippageBps: 100, origin: "manual" },
+      { ...gold, kind: "order", reduceOnly: true, origin: "manual" },
+      { kind: "order", coin: "xyz:GOLD", side: "sell", orderType: "stopMarket", size: "0.01", triggerPrice: "2800", reduceOnly: true, positionTpsl: true, origin: "manual" },
+      { kind: "modify", target: { oid: 7 }, order: { ...gold, reduceOnly: true }, origin: "manual" },
+    ];
+    for (const [i, intent] of exits.entries()) expect((await h.ok("signAndSubmit", { requestId: `x${i}`, intent })).status).toBe("ok");
+    expect(h.hl.exchangeCalls.map((c) => c.body.action.type)).toEqual(["cancel", "cancelByCloid", "scheduleCancel", "order", "order", "order", "modify"]);
+    expect(h.hl.exchangeCalls[3]!.body.action.orders).toMatchObject([{ a: 110001, r: true }]);
+
+    // Without HL's dex list the frame can't place anything on a HIP-3 dex, exits included: it fails closed.
+    h.hl.infoFailure = (b) => b.type === "perpDexs";
+    await h.clock.advance(61_000);
+    for (const [id, intent] of [
+      ["p1", limitOrder({ coin: "xyz:GOLD", price: "3000", size: "0.01" })],
+      ["p2", { kind: "cancel", cancels: [{ coin: "xyz:GOLD", oid: 7 }], origin: "manual" }],
+    ] as const) {
+      expect(await h.fail("signAndSubmit", { requestId: id, intent })).toMatchObject({ code: "MARKET_DATA_UNAVAILABLE", retryable: true });
+    }
+    expect(h.hl.exchangeCalls).toHaveLength(7);
+  });
+
+  it("on testnet signs leverage and margin changes on every HIP-3 dex", async () => {
+    h = await FrameHarness.create();
+    await h.activeAgent("device");
+    expect((await h.ok("signAndSubmit", { requestId: "t1", intent: { kind: "updateLeverage", coin: "xyz:GOLD", leverage: 8, marginMode: "isolated", origin: "manual" } })).status).toBe("ok");
+    expect((await h.ok("signAndSubmit", { requestId: "t2", intent: { kind: "updateIsolatedMargin", coin: "xyz:GOLD", amountUsd: "-5", origin: "manual" } })).status).toBe("ok");
+    expect((await h.ok("signAndSubmit", { requestId: "t3", intent: { kind: "updateIsolatedMargin", coin: "xyz:GOLD", amountUsd: "5", origin: "manual" } })).status).toBe("ok");
   });
 
   it("attaches TP/SL legs and returns every cloid", async () => {

@@ -190,7 +190,10 @@ export interface PolicySummary {
   referralCode: string | null;
   /** The master account's limits last applied with `setLimits` (null: baseline only). */
   userLimits: UserLimits | null;
-  /** Sub-accounts with their own limits (`setLimits` with `account`); any other sub-account uses `userLimits`. */
+  /**
+   * Sub-accounts with their own limits (`setLimits` with `account`), as set. They apply on top of `userLimits`: a field
+   * left out keeps the master's value. Any other sub-account uses `userLimits`.
+   */
   accountLimits: Record<Hex, UserLimits>;
 }
 
@@ -437,7 +440,10 @@ export interface UserLimits {
 /**
  * `setLimits` replaces the previous limits of one account entirely. Without `account` (or with the key's master) it
  * sets the master's limits (`{}` resets them to the baseline). With a sub-account address it sets that sub-account's
- * own limits; `{ account }` alone removes them, so the sub-account uses the master's again.
+ * own limits, which apply on top of the master's: each field set replaces the master's value for that sub-account,
+ * each field left out keeps the master's. A sub-account has a daily counter of its own only when its own limits set
+ * `maxDailyNotionalUsd`; otherwise it shares the master's. `{ account }` alone removes them, so the sub-account uses
+ * the master's again.
  */
 export type SetLimitsParams = UserLimits & {
   /** A sub-account of the key's master. Omit for the master account. */

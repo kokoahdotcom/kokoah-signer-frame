@@ -2,8 +2,8 @@ import { compileAction, type CompiledAction } from "@kokoah/shared/actions";
 import { parseActionIntent } from "@kokoah/shared/intents";
 import { MarketRegistry } from "@kokoah/shared/markets";
 import { afterEach, describe, expect, it } from "vitest";
-import { applyUserLimits, BASELINE_LIMITS, createBaselinePolicy, evaluateFramePolicy } from "../src/frame/policy.js";
-import { BUILDER, cloid, FrameHarness, limitOrder, META0, T0 } from "./helpers.js";
+import { applyUserLimits, BASELINE_LIMITS, createBaselinePolicy, evaluateFramePolicy, hip3PinnedLegs } from "../src/frame/policy.js";
+import { BUILDER, cloid, FrameHarness, limitOrder, META0, META_XYZ, PERP_DEXS, T0 } from "./helpers.js";
 
 let h: FrameHarness;
 afterEach(() => h?.destroy());
@@ -259,5 +259,35 @@ describe("setLimits", () => {
     const strict = { ...baseline, requireStopLossForNewEntries: true, allowedCoins: ["BTC"] };
     expect(applyUserLimits(strict, { requireStopLossForNewEntries: false })).toMatchObject({ ok: false, fields: ["requireStopLossForNewEntries"] });
     expect(applyUserLimits(strict, { allowedCoins: ["BTC", "ETH"] })).toMatchObject({ ok: false, fields: ["allowedCoins"] });
+  });
+});
+
+describe("HIP-3 legs the mainnet dex pin applies to", () => {
+  const hip3 = MarketRegistry.fromInfo({ meta: META0, dexMetas: { xyz: META_XYZ }, perpDexs: PERP_DEXS });
+  const GOLD = 110001;
+  const ETH = 1;
+  const leg = (a: number, r: boolean) => ({ a, b: false, p: "3000", s: "0.01", r, t: { limit: { tif: "Gtc" } } });
+  const gold = [{ coin: "xyz:GOLD", dex: "xyz" }];
+
+  it("covers everything but cancels and reduce-only orders: entries, modifies that aren't reduce-only, every leverage and margin change", () => {
+    expect(hip3PinnedLegs({ type: "order", orders: [leg(GOLD, false), leg(GOLD, true)], grouping: "normalTpsl" }, hip3)).toEqual(gold);
+    expect(hip3PinnedLegs({ type: "modify", oid: 7, order: leg(GOLD, false) }, hip3)).toEqual(gold);
+    expect(hip3PinnedLegs({ type: "batchModify", modifies: [{ oid: 7, order: leg(GOLD, true) }, { oid: 8, order: leg(GOLD, false) }] }, hip3)).toEqual(gold);
+    expect(hip3PinnedLegs({ type: "updateLeverage", asset: GOLD, isCross: false, leverage: 3 }, hip3)).toEqual(gold);
+    expect(hip3PinnedLegs({ type: "updateLeverage", asset: GOLD, isCross: false, leverage: 1 }, hip3)).toEqual(gold);
+    expect(hip3PinnedLegs({ type: "updateIsolatedMargin", asset: GOLD, isBuy: true, ntli: -25_000_000 }, hip3)).toEqual(gold);
+    expect(hip3PinnedLegs({ type: "updateIsolatedMargin", asset: GOLD, isBuy: true, ntli: 25_000_000 }, hip3)).toEqual(gold);
+  });
+
+  it("leaves out cancels, reduce-only orders and everything off HIP-3 dexes", () => {
+    expect(hip3PinnedLegs({ type: "order", orders: [leg(GOLD, true)], grouping: "positionTpsl" }, hip3)).toEqual([]);
+    expect(hip3PinnedLegs({ type: "modify", oid: 7, order: leg(GOLD, true) }, hip3)).toEqual([]);
+    expect(hip3PinnedLegs({ type: "cancel", cancels: [{ a: GOLD, o: 7 }] }, hip3)).toEqual([]);
+    expect(hip3PinnedLegs({ type: "cancelByCloid", cancels: [{ asset: GOLD, cloid: cloid() }] }, hip3)).toEqual([]);
+    expect(hip3PinnedLegs({ type: "scheduleCancel", time: T0 + 60_000 }, hip3)).toEqual([]);
+    expect(hip3PinnedLegs({ type: "noop" }, hip3)).toEqual([]);
+    expect(hip3PinnedLegs({ type: "order", orders: [leg(ETH, false)], grouping: "na" }, hip3)).toEqual([]);
+    expect(hip3PinnedLegs({ type: "updateLeverage", asset: ETH, isCross: true, leverage: 3 }, hip3)).toEqual([]);
+    expect(hip3PinnedLegs({ type: "updateIsolatedMargin", asset: ETH, isBuy: true, ntli: -1_000_000 }, hip3)).toEqual([]);
   });
 });
