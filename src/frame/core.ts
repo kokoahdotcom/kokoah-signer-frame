@@ -1211,6 +1211,9 @@ export class FrameCore {
 
   private setLimits(p: SetLimitsParams): SetLimitsResult {
     const { account, ...limits } = p;
+    // Sub-account limits belong to a key's user: without a key there is no master to tell a sub-account from (limits
+    // meant for the master would be stored as a sub-account's, and the master would trade on the baseline).
+    if (account !== undefined && !this.key) throw new SignerFailure("NO_KEY", "Create or unlock a trading key before setting an account's limits.");
     const r = applyUserLimits(this.baseline, limits, { tradingCoins: this.market.tradingPairCoins });
     if (!r.ok) throw new SignerFailure("LIMIT_LOOSENING_REJECTED", r.message, { details: { fields: r.fields } });
     const sub = account?.toLowerCase();

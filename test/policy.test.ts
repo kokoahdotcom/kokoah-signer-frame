@@ -210,6 +210,14 @@ describe("setLimits", () => {
     expect((await h.fail("setLimits", { allowedActionTypes: ["order", "vaultTransfer"] })).code).toBe("INVALID_REQUEST");
   });
 
+  it("refuses an account's limits while there is no key (no master to tell a sub-account from)", async () => {
+    h = await FrameHarness.create();
+    await h.ok("hello", { protocolVersion: 1 });
+    const e = await h.fail("setLimits", { account: "0x" + "b".repeat(40), maxOrdersPerMinute: 10 });
+    expect(e.code).toBe("NO_KEY");
+    expect((await h.ok("getStatus")).policy.maxOrdersPerMinute).not.toBe(10);
+  });
+
   it("applies tightening, reports it in status and emits statusChanged", async () => {
     h = await FrameHarness.create();
     await h.activeAgent("device");
