@@ -181,6 +181,32 @@ describe("passkey storage (mocked WebAuthn PRF)", () => {
     expect((await a.ok("getStatus")).locked).toBe(true);
   });
 
+  it("recovers from a lost passkey: the key stays locked, is removed while locked, and a new key works", async () => {
+    const passkeys = new MockPasskeys();
+    const a = await frame({ passkeys });
+    const lost = await a.activeAgent("passkey");
+    a.destroy();
+    // A new session, and the passkey is gone (a reset phone, a deleted credential): another secret answers.
+    passkeys.secret = new Uint8Array(32).fill(9);
+    const b = await frame({ idb: a.idb, clock: a.clock, hl: a.hl, passkeys });
+    await b.ok("hello", { protocolVersion: 1 });
+    const unlocking = b.request("unlock", {});
+    await b.clickPrompt();
+    const failed = await unlocking;
+    expect(!failed.ok && failed.error.code).toBe("UNLOCK_FAILED");
+    // Nothing is thrown away on a failed unlock.
+    expect(await b.ok("getStatus")).toMatchObject({ hasKey: true, locked: true, agentAddress: lost.address });
+    // The way out needs no passkey: remove this device's key (the app has the main wallet sign revokeAgent)…
+    const revoked = await b.ok("revoke", {});
+    expect(revoked).toMatchObject({ wiped: true, agentAddress: lost.address, agentName: "kokoah-web" });
+    expect(revoked.revokeAgent.action.agentName).toBe("kokoah-web");
+    expect(await b.ok("getStatus")).toMatchObject({ hasKey: false });
+    // …then create a new key, protected on this device, that signs.
+    const fresh = await b.activeAgent("device");
+    expect(fresh.address).not.toBe(lost.address);
+    expect((await b.ok("signAndSubmit", { requestId: "after-recovery", intent: limitOrder() })).status).toBe("ok");
+  });
+
   it("lets the user retry after dismissing the passkey dialog, and cancel", async () => {
     const passkeys = new MockPasskeys();
     const a = await frame({ passkeys });
