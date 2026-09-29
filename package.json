@@ -42,14 +42,14 @@
   "dependencies": {
     "@kokoah/shared": "link:../kokoah-shared",
     "valibot": "1.5.0",
-    "viem": "2.56.8"
+    "viem": "2.56.9"
   },
   "devDependencies": {
     "@types/node": "24.13.6",
     "fake-indexeddb": "6.2.5",
-    "jsdom": "30.1.0",
+    "jsdom": "30.1.1",
     "typescript": "6.0.3",
-    "vite": "8.3.0",
+    "vite": "8.3.1",
     "vitest": "5.0.1"
   }
 }
