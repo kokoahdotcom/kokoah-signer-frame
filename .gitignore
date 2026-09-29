@@ -12,3 +12,14 @@ coverage/
 !.env.development
 *.log
 .vite/
+
+# Secrets never belong in git (examples and the frame's public build defaults are tracked on purpose).
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+id_rsa*
+!.env.development
+!.env.production
