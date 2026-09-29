@@ -71,6 +71,14 @@ export type ClientEventName = keyof ClientEventData;
 export type ClientErrorCode =
   /** No response within the timeout. For `signAndSubmit`, the action may still have been submitted: call again with the same `requestId`. */
   | "TIMEOUT"
+  /**
+   * The frame reloaded while the request was out: the old frame document can no longer answer it, so it fails at once
+   * instead of waiting for the timeout. Reads and settings are sent again to the new frame by the client itself; for
+   * `signAndSubmit` (and the other methods with effects) the action may have been submitted before the reload. Check
+   * it by cloid, and don't send it again under the same `requestId` expecting a replay: the new frame has forgotten
+   * the requestIds it held in memory.
+   */
+  | "FRAME_RELOADED"
   /** `destroy()` was called. */
   | "DESTROYED"
   /** The frame answered `hello` with an unexpected protocol version or origin. */
@@ -122,6 +130,9 @@ interface Pending {
   reject: (error: SignerRequestError) => void;
   timer: ReturnType<typeof setTimeout>;
 }
+
+/** Methods without effects outside the frame's memory: after a reload the client sends them again to the new frame. */
+const RESEND_AFTER_RELOAD: ReadonlySet<MethodName> = new Set<MethodName>(["getStatus", "setLimits", "setTheme", "lock", "confirmAgent"]);
 
 type Listener<E extends ClientEventName> = (data: ClientEventData[E]) => void;
 
@@ -301,7 +312,10 @@ export class KokoahSignerClient {
     try {
       return await this.send(method, params, timeout);
     } catch (e) {
-      if (!(e instanceof SignerRequestError) || e.code !== "NOT_CONNECTED" || this.destroyed) throw e;
+      if (!(e instanceof SignerRequestError) || this.destroyed) throw e;
+      // Lost with the old frame document: only what has no effect outside the frame is sent to the new one.
+      if (e.code === "FRAME_RELOADED" && !RESEND_AFTER_RELOAD.has(method)) throw e;
+      if (e.code !== "NOT_CONNECTED" && e.code !== "FRAME_RELOADED") throw e;
       if (this.helloResult !== null) this.reconnect();
       await this.hello();
       return await this.send(method, params, timeout);
@@ -354,12 +368,26 @@ export class KokoahSignerClient {
   // Internals
   // -------------------------------------------------------------------------------------------
 
-  /** The frame reloaded after a completed handshake: forget it and handshake again (`reconnected` on success). */
+  /**
+   * The frame reloaded after a completed handshake: forget it and handshake again (`reconnected` on success). What was
+   * still waiting for the old frame document fails now with `FRAME_RELOADED` (it would only time out).
+   */
   private reconnect(): void {
     if (this.destroyed || this.helloResult === null) return;
     this.helloResult = null;
     this.helloPromise = null;
     this.reconnectPending = true;
+    for (const [id, p] of this.pending) {
+      clearTimeout(p.timer);
+      this.pending.delete(id);
+      p.reject(
+        new SignerRequestError(p.method, {
+          code: "FRAME_RELOADED",
+          message: `The signer frame reloaded before it answered ${p.method}.`,
+          retryable: RESEND_AFTER_RELOAD.has(p.method),
+        }),
+      );
+    }
     // Failures surface on the next request, which retries the handshake (and still emits `reconnected`).
     this.hello().catch(() => {});
   }
@@ -391,7 +419,7 @@ export class KokoahSignerClient {
         }
         return r;
       } catch (e) {
-        if (!(e instanceof SignerRequestError) || e.code !== "TIMEOUT") throw e;
+        if (!(e instanceof SignerRequestError) || (e.code !== "TIMEOUT" && e.code !== "FRAME_RELOADED")) throw e;
         last = e;
       }
     }

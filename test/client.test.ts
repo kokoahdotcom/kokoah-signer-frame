@@ -222,6 +222,24 @@ describe("KokoahSignerClient", () => {
     expect(reconnected).toHaveBeenCalledTimes(1);
   });
 
+  it("fails what the old frame never answered as soon as it reloads, and sends reads again to the new frame", async () => {
+    const { client, reload, frameWindow } = await connected({ clientOptions: { requestTimeoutMs: 20_000 } });
+    await client.hello();
+    const deliver = (frameWindow as unknown as { postMessage: (m: unknown, o: string) => void }).postMessage;
+    // The old frame document receives these requests but is replaced before it answers.
+    Object.defineProperty(frameWindow, "postMessage", { configurable: true, value: () => {} });
+    const started = Date.now();
+    const sign = client.signAndSubmit({ requestId: "in-flight", intent: limitOrder() as never }).catch((e: unknown) => e);
+    const status = client.getStatus();
+    await new Promise((r) => setTimeout(r, 10));
+    Object.defineProperty(frameWindow, "postMessage", { configurable: true, value: deliver });
+    await reload();
+    // At once, not after the 20 s timeout: the action may have gone out, so it is not sent again.
+    expect(await sign).toMatchObject({ code: "FRAME_RELOADED", method: "signAndSubmit", retryable: false });
+    expect(await status).toMatchObject({ hasKey: false });
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
   it("the frame can't fire the client's reconnected event", async () => {
     const { client, frameWindow } = await connected();
     await client.hello();

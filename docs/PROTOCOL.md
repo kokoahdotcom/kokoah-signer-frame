@@ -102,7 +102,7 @@ store.setSignerStatus(hello.status);                 // includes expiringSoon / 
 | `connection` | The last `hello` result, or `null` (before the handshake and while reconnecting). |
 | `destroy()` | Removes the iframe; pending requests fail with `DESTROYED`. |
 
-**Reconnecting.** When the frame reloads (a `ready` after a completed handshake, or a `NOT_CONNECTED` answer), the client re-runs `hello` with the params of the first `hello` and, once it succeeds, emits the client-side event **`reconnected`** with the new `HelloResult` (`ClientEventData["reconnected"]`). The frame can't send this event; it isn't part of the wire protocol.
+**Reconnecting.** When the frame reloads (a `ready` after a completed handshake, or a `NOT_CONNECTED` answer), the client re-runs `hello` with the params of the first `hello` and, once it succeeds, emits the client-side event **`reconnected`** with the new `HelloResult` (`ClientEventData["reconnected"]`). The frame can't send this event; it isn't part of the wire protocol. Requests still waiting for the old frame document fail at once with the client code **`FRAME_RELOADED`** instead of timing out. `getStatus`, `setLimits`, `setTheme`, `lock` and `confirmAgent` have no effect outside the frame, so the client sends them again to the new frame and the caller never sees the reload. Every other method (above all `signAndSubmit`) surfaces `FRAME_RELOADED`: the action may have been submitted before the reload, and the new frame has forgotten its `requestId`s, so check the order by cloid instead of sending it again.
 
 ```ts
 signer.on("reconnected", (hello) => {
