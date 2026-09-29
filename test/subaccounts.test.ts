@@ -10,7 +10,7 @@ type Signature = Parameters<typeof recoverL1Signer>[0]["signature"];
 import { TESTNET } from "@kokoah/shared/network";
 import { afterEach, describe, expect, it } from "vitest";
 import { nextUsage, usageOf } from "../src/frame/nonces.js";
-import { BASELINE_LIMITS, createBaselinePolicy, evaluateFramePolicy, limitsForAccount, policyForAccount } from "../src/frame/policy.js";
+import { applyUserLimits, BASELINE_LIMITS, createBaselinePolicy, evaluateFramePolicy, limitsForAccount, policyForAccount, separateDailyAccounts } from "../src/frame/policy.js";
 import { BUILDER, FrameHarness, limitOrder, META0, subAccountEntry, T0, USER } from "./helpers.js";
 
 let h: FrameHarness;
@@ -64,15 +64,37 @@ describe("frame policy: vaultAddress", () => {
     expect(evalFor(SUB, { ownedSubAccount: SUB, dailyNotionalUsedUsd: 0, agentDailyNotionalUsedUsd: near - 200 }).allowed).toBe(true);
   });
 
-  it("picks an account's own limits, else the master's", () => {
-    const master = { ...baseline, maxOrderNotionalUsd: 500 };
-    const own = { ...baseline, maxOrderNotionalUsd: 50 };
-    const map = new Map([[SUB, { policy: own, limits: { maxOrderNotionalUsd: 50 } }]]);
+  it("picks an account's own limits on top of the master's, else the master's", () => {
+    const masterLimits = { maxOrderNotionalUsd: 500, maxDailyNotionalUsd: 10_000, requireStopLossForNewEntries: true as const };
+    const applied = applyUserLimits(baseline, masterLimits);
+    if (!applied.ok) throw new Error("master limits");
+    const master = applied.policy;
+    const map = new Map([
+      [SUB, { limits: { maxOrderNotionalUsd: 50 } }],
+      [SUB2, { limits: { maxLeverage: 3 } }],
+    ]);
+    const OTHER = "0x5ab0000000000000000000000000000000000009";
     expect(policyForAccount(master, map, undefined)).toBe(master);
-    expect(policyForAccount(master, map, SUB.toUpperCase().replace("0X", "0x"))).toBe(own);
-    expect(policyForAccount(master, map, SUB2)).toBe(master);
-    expect(limitsForAccount({ maxOrderNotionalUsd: 500 }, map, SUB)).toEqual({ maxOrderNotionalUsd: 50 });
-    expect(limitsForAccount(null, map, SUB2)).toBeNull();
+    expect(policyForAccount(master, map, OTHER)).toBe(master);
+    // A field the sub-account sets replaces the master's; every other field keeps the master's value, not the baseline's.
+    const own = policyForAccount(master, map, SUB.toUpperCase().replace("0X", "0x"));
+    expect(own).toMatchObject({ maxOrderNotionalUsd: 50, maxDailyNotionalUsd: 10_000, requireStopLossForNewEntries: true, maxLeverage: baseline.maxLeverage });
+    expect(policyForAccount(master, map, SUB2)).toMatchObject({ maxOrderNotionalUsd: 500, maxDailyNotionalUsd: 10_000, requireStopLossForNewEntries: true, maxLeverage: 3 });
+    expect(policyForAccount(baseline, map, SUB2)).toMatchObject({ maxOrderNotionalUsd: baseline.maxOrderNotionalUsd, maxDailyNotionalUsd: baseline.maxDailyNotionalUsd, maxLeverage: 3 });
+    expect(limitsForAccount(masterLimits, map, SUB)).toEqual({ ...masterLimits, maxOrderNotionalUsd: 50 });
+    expect(limitsForAccount(masterLimits, map, SUB2)).toEqual({ ...masterLimits, maxLeverage: 3 });
+    expect(limitsForAccount(null, map, SUB2)).toEqual({ maxLeverage: 3 });
+    expect(limitsForAccount(masterLimits, map, OTHER)).toBe(masterLimits);
+    expect(limitsForAccount(null, map, OTHER)).toBeNull();
+  });
+
+  it("gives a sub-account a daily counter of its own only when its own limits set a daily limit", () => {
+    const map = new Map([
+      [SUB, { limits: { maxLeverage: 3, maxOrderNotionalUsd: 100, requireStopLossForNewEntries: true as const } }],
+      [SUB2, { limits: { maxDailyNotionalUsd: 1_000 } }],
+    ]);
+    expect(separateDailyAccounts(map)).toEqual([SUB2]);
+    expect(separateDailyAccounts(new Map())).toEqual([]);
   });
 });
 
@@ -215,6 +237,48 @@ describe("limits per account", () => {
     h.hl.leverageByUser[SUB] = { ETH: 5 };
     h.clock.advance(5_000);
     expect((await h.ok("signAndSubmit", { requestId: "b", intent: limitOrder({ vaultAddress: SUB }) })).status).toBe("ok");
+  });
+
+  it("keeps a sub-account that sets only other limits on the master's daily limit and counter", async () => {
+    await ready();
+    await h.ok("setLimits", { maxDailyNotionalUsd: 1_000 });
+    // Only a leverage cap: the sub-account doesn't get a daily counter (or the baseline's $25M) of its own.
+    const r = await h.ok("setLimits", { account: SUB, maxLeverage: 20 });
+    expect(r.policy.accountLimits).toEqual({ [SUB]: { maxLeverage: 20 } });
+    expect((await h.ok("signAndSubmit", { requestId: "m1", intent: limitOrder({ size: "0.4" }) })).status).toBe("ok"); // master $800
+    expect(violationCodes(await h.fail("signAndSubmit", { requestId: "s1", intent: limitOrder({ vaultAddress: SUB, size: "0.2" }) }))).toContain("DAILY_NOTIONAL_EXCEEDED");
+    expect((await h.ok("signAndSubmit", { requestId: "s2", intent: limitOrder({ vaultAddress: SUB, size: "0.05" }) })).status).toBe("ok"); // shared: $900
+    // …and the sub-account's orders count toward the master's own limit.
+    expect(violationCodes(await h.fail("signAndSubmit", { requestId: "m2", intent: limitOrder({ size: "0.1" }) }))).toContain("DAILY_NOTIONAL_EXCEEDED");
+    // A daily limit of its own gives it its own counter.
+    await h.ok("setLimits", { account: SUB, maxLeverage: 20, maxDailyNotionalUsd: 500 });
+    expect((await h.ok("signAndSubmit", { requestId: "s3", intent: limitOrder({ vaultAddress: SUB, size: "0.2" }) })).status).toBe("ok"); // SUB: $500
+    expect(violationCodes(await h.fail("signAndSubmit", { requestId: "s4", intent: limitOrder({ vaultAddress: SUB, size: "0.01" }) }))).toContain("DAILY_NOTIONAL_EXCEEDED");
+  });
+
+  it("inherits the master's limits for every field a sub-account leaves out, whatever the order of the calls", async () => {
+    await ready();
+    // The sub-account's limits first: the master's, set afterwards, still apply to the fields it leaves out.
+    await h.ok("setLimits", { account: SUB, maxLeverage: 20 });
+    await h.ok("setLimits", { maxOrderNotionalUsd: 500, requireStopLossForNewEntries: true });
+    // $600 order: above the master's $500 per order, which the sub-account inherits.
+    expect(violationCodes(await h.fail("signAndSubmit", { requestId: "a", intent: limitOrder({ vaultAddress: SUB, size: "0.3" }) }))).toEqual(
+      expect.arrayContaining(["ORDER_NOTIONAL_EXCEEDED", "STOP_LOSS_REQUIRED"]),
+    );
+    // A field it sets replaces the master's value for it (still within the baseline).
+    await h.ok("setLimits", { account: SUB, maxLeverage: 20, maxOrderNotionalUsd: 1_000 });
+    expect(violationCodes(await h.fail("signAndSubmit", { requestId: "b", intent: limitOrder({ vaultAddress: SUB, size: "0.3" }) }))).toEqual(["STOP_LOSS_REQUIRED"]);
+    expect((await h.ok("signAndSubmit", { requestId: "c", intent: limitOrder({ vaultAddress: SUB, size: "0.3", stopLoss: { triggerPrice: "1900" } }) })).status).toBe("ok");
+    // The master's leverage cap reaches a sub-account whose own limits don't set one.
+    await h.ok("setLimits", { account: SUB2, maxOrderNotionalUsd: 1_000 });
+    await h.ok("setLimits", { maxLeverage: 5 });
+    h.hl.leverageByUser[SUB2] = { ETH: 10 };
+    expect(violationCodes(await h.fail("signAndSubmit", { requestId: "d", intent: limitOrder({ vaultAddress: SUB2 }) }))).toContain("LEVERAGE_EXCEEDED");
+    expect(h.hl.infoCalls.filter((c) => c.type === "activeAssetData").map((c) => c.user)).toContain(SUB2);
+    // The master back to the baseline: the sub-account keeps only its own fields.
+    await h.ok("setLimits", {});
+    expect((await h.ok("signAndSubmit", { requestId: "e", intent: limitOrder({ vaultAddress: SUB2 }) })).status).toBe("ok");
+    expect(violationCodes(await h.fail("signAndSubmit", { requestId: "f", intent: limitOrder({ vaultAddress: SUB2, size: "0.6" }) }))).toContain("ORDER_NOTIONAL_EXCEEDED");
   });
 
   it("counts daily notional per account for personal limits", async () => {

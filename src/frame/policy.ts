@@ -17,9 +17,11 @@
  * frame itself found in HL's `subAccounts` list of the key's master; HL vaults and anything else are denied), the
  * notional counted against the daily limit, and the agent-wide baseline daily cap across all accounts.
  *
- * Personal limits (`setLimits`) are kept per account: the master's, and optionally one set per sub-account (a
- * sub-account without its own uses the master's). Orders per minute are counted per agent across accounts; daily
- * notional per account for personal limits, and per agent for the baseline cap.
+ * Personal limits (`setLimits`) are kept per account: the master's, and optionally one set per sub-account, applied on
+ * top of the master's (a field the sub-account leaves out keeps the master's value; without limits of its own it uses
+ * the master's). Orders per minute are counted per agent across accounts. Daily notional is counted per agent for the
+ * baseline cap, and for personal limits once for the master and every sub-account without a daily limit of its own
+ * (they share the master's), and separately for each sub-account that sets `maxDailyNotionalUsd`.
  *
  * Spot, for the master account only:
  * - Convert stablecoins (PHASE3 REV): orders only on the pinned stablecoin/USDC pairs of the frame's network
@@ -143,34 +145,61 @@ export function applyUserLimits(baseline: Policy, limits: UserLimits, spot: { tr
   if (limits.requireStopLossForNewEntries === true) cleaned.requireStopLossForNewEntries = true;
   if (limits.allowedActionTypes !== undefined) cleaned.allowedActionTypes = [...new Set(limits.allowedActionTypes)];
   if (limits.spotTrading === true) cleaned.spotTrading = true;
-  const { spotTrading: _flag, ...policyLimits } = cleaned;
-  const policy = parsePolicy({
-    ...baseline,
+  return { ok: true, policy: withLimits(baseline, cleaned, spot.tradingCoins), limits: Object.keys(cleaned).length > 0 ? cleaned : null };
+}
+
+/**
+ * `policy` with already validated limits on top: each field set in `limits` replaces the policy's, every other field
+ * keeps the policy's value.
+ */
+function withLimits(policy: Policy, limits: UserLimits, tradingCoins: readonly string[]): Policy {
+  const { spotTrading, ...policyLimits } = limits;
+  return parsePolicy({
+    ...policy,
     ...policyLimits,
-    ...(cleaned.spotTrading ? { allowedSpotCoins: [...new Set([...(baseline.allowedSpotCoins ?? []), ...spot.tradingCoins])], spotTrading: true } : {}),
+    ...(spotTrading ? { allowedSpotCoins: [...new Set([...(policy.allowedSpotCoins ?? []), ...tradingCoins])], spotTrading: true } : {}),
   });
-  return { ok: true, policy, limits: Object.keys(cleaned).length > 0 ? cleaned : null };
 }
 
 /** Most sub-accounts with their own limits a frame keeps (HL allows 50 per master). */
 export const MAX_ACCOUNT_LIMITS = 64;
 
-/** Per-sub-account limits set with `setLimits({ account, … })`. */
+/**
+ * A sub-account's own limits, set with `setLimits({ account, … })` and checked against the baseline. They apply on top
+ * of the master's: a field left out keeps the master's value (see {@link policyForAccount}).
+ */
 export interface AccountLimits {
-  policy: Policy;
   limits: UserLimits;
 }
 
-/** The policy for an account: the sub-account's own limits when set, else the master's. */
-export function policyForAccount(masterPolicy: Policy, accountLimits: ReadonlyMap<string, AccountLimits>, subAccount: string | undefined): Policy {
-  if (subAccount === undefined) return masterPolicy;
-  return accountLimits.get(subAccount.toLowerCase())?.policy ?? masterPolicy;
+/**
+ * The policy for an account: the master's, with a sub-account's own limits on top. A field the sub-account sets
+ * replaces the master's value for that sub-account; every other field (and a sub-account without limits of its own)
+ * keeps the master's, so a sub-account that sets only `maxLeverage` still has the master's notional and stop-loss rules.
+ * `tradingCoins`: the verified spot pairs `spotTrading` adds (see {@link applyUserLimits}).
+ */
+export function policyForAccount(
+  masterPolicy: Policy,
+  accountLimits: ReadonlyMap<string, AccountLimits>,
+  subAccount: string | undefined,
+  tradingCoins: readonly string[] = [],
+): Policy {
+  const own = subAccount === undefined ? undefined : accountLimits.get(subAccount.toLowerCase());
+  return own === undefined ? masterPolicy : withLimits(masterPolicy, own.limits, tradingCoins);
 }
 
-/** The limits for an account (see {@link policyForAccount}). */
+/** The limits in force for an account: the master's, with a sub-account's own fields on top (see {@link policyForAccount}). */
 export function limitsForAccount(masterLimits: UserLimits | null, accountLimits: ReadonlyMap<string, AccountLimits>, subAccount: string | undefined): UserLimits | null {
-  if (subAccount === undefined) return masterLimits;
-  return accountLimits.get(subAccount.toLowerCase())?.limits ?? masterLimits;
+  const own = subAccount === undefined ? undefined : accountLimits.get(subAccount.toLowerCase());
+  return own === undefined ? masterLimits : { ...masterLimits, ...own.limits };
+}
+
+/**
+ * Sub-accounts whose own limits set `maxDailyNotionalUsd` (lowercase): each has its own daily counter. Every other
+ * sub-account shares the master's daily limit and counter, whatever else its own limits set.
+ */
+export function separateDailyAccounts(accountLimits: ReadonlyMap<string, AccountLimits>): string[] {
+  return [...accountLimits].filter(([, a]) => a.limits.maxDailyNotionalUsd !== undefined).map(([account]) => account.toLowerCase());
 }
 
 /** Summary of the effective policy for `getStatus`. `spotTradingCoins`: the verified pairs spot trading would add. */
@@ -255,6 +284,40 @@ function spotLegs(action: Record<string, unknown>, registry: MarketRegistry): Ar
     const size = Number(o.s);
     const price = Number(o.p);
     legs.push({ coin: market.coin, size: Number.isFinite(size) ? size : 0, price: Number.isFinite(price) ? price : 0 });
+  }
+  return legs;
+}
+
+/** A HIP-3 leg of a wire action that the mainnet dex pin applies to. */
+export interface PinnedLeg {
+  coin: string;
+  /** The HIP-3 dex's name. */
+  dex: string;
+}
+
+/**
+ * The HIP-3 legs of a wire action that the mainnet dex pin (shared `perpDexs.ts`) applies to: everything but cancels
+ * and reduce-only orders, that is orders and modifies that aren't reduce-only, and every leverage or isolated-margin
+ * change (either way: adding margin or lowering leverage would move more of the account into a market whose mark the
+ * deployer sets). Cancels and reduce-only orders (closes, position TP/SL) only take risk off, so they stay possible on
+ * a dex that isn't pinned or whose deployer changed. `scheduleCancel` and `noop` touch no market.
+ */
+export function hip3PinnedLegs(action: Record<string, unknown>, registry: MarketRegistry): PinnedLeg[] {
+  const legs: PinnedLeg[] = [];
+  const add = (asset: unknown) => {
+    const market = typeof asset === "number" ? registry.getByAssetId(asset) : undefined;
+    if (market?.kind === "hip3") legs.push({ coin: market.coin, dex: market.dex });
+  };
+  switch (action.type) {
+    case "order":
+    case "modify":
+    case "batchModify":
+      for (const o of wireOrders(action)) if (o.r !== true) add(o.a);
+      break;
+    case "updateLeverage":
+    case "updateIsolatedMargin":
+      add(action.asset);
+      break;
   }
   return legs;
 }

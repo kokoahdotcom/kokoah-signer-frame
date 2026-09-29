@@ -90,11 +90,13 @@ import {
   createBaselinePolicy,
   evaluateFrameAccountPolicy,
   evaluateFramePolicy,
+  hip3PinnedLegs,
   intentCoins,
   limitsForAccount,
   MAX_ACCOUNT_LIMITS,
   orderCount,
   policyForAccount,
+  separateDailyAccounts,
   summarizeFramePolicy,
 } from "./policy.js";
 import { applyTheme, invalidThemeVariables, PromptError, PromptUi, type ActionFailure, type PromptKind } from "./prompt.js";
@@ -216,7 +218,7 @@ export class FrameCore {
   private readonly instanceId: string;
   private policy: Policy;
   private userLimits: UserLimits | null = null;
-  /** Sub-accounts with their own limits (lowercase address → limits); others use the master's. */
+  /** Sub-accounts with their own limits (lowercase address → limits), applied on top of the master's. */
   private readonly accountLimits = new Map<string, AccountLimits>();
   /** The master's sub-accounts, read from HL by the frame itself (never from the parent). */
   private readonly subAccounts: SubAccountOwnership;
@@ -1227,7 +1229,8 @@ export class FrameCore {
       if (!this.accountLimits.has(sub) && this.accountLimits.size >= MAX_ACCOUNT_LIMITS) {
         throw new SignerFailure("INVALID_REQUEST", `At most ${MAX_ACCOUNT_LIMITS} sub-accounts can have their own limits.`);
       }
-      this.accountLimits.set(sub, { policy: r.policy, limits: r.limits });
+      // Checked against the baseline above; at signing they apply on top of the master's limits of that moment.
+      this.accountLimits.set(sub, { limits: r.limits });
     }
     this.statusChanged();
     return { policy: summarizeFramePolicy(this.policy, this.userLimits, this.accountLimits, this.market.tradingPairCoins) };
@@ -1316,7 +1319,7 @@ export class FrameCore {
       }
     }
     const account = vault ?? master;
-    const accountPolicy = policyForAccount(this.policy, this.accountLimits, vault);
+    const accountPolicy = policyForAccount(this.policy, this.accountLimits, vault, this.market.tradingPairCoins);
     const accountLimits = limitsForAccount(this.userLimits, this.accountLimits, vault);
 
     // 2. The frame's own clock, market metadata and prices.
@@ -1355,6 +1358,13 @@ export class FrameCore {
       throw e;
     }
 
+    // 3b. Mainnet: on a HIP-3 dex that isn't pinned or has a new deployer (shared perpDexs.ts; the deployer sets the
+    // mark the price band trusts), only cancels and reduce-only orders, so the user can always leave such a dex.
+    for (const leg of hip3PinnedLegs(compiled.action as unknown as Record<string, unknown>, snapshot.registry)) {
+      const problem = snapshot.dexProblems[leg.dex];
+      if (problem !== undefined) throw new SignerFailure("UNSUPPORTED_MARKET", problem);
+    }
+
     // 4. The user's current leverage, only needed when the parent tightened maxLeverage below the market maximum.
     let leverageByCoin: Record<string, number> | undefined;
     const opensExposure = (intent.kind === "order" && !intent.reduceOnly) || (intent.kind === "modify" && !intent.order.reduceOnly);
@@ -1385,8 +1395,8 @@ export class FrameCore {
       const now = this.correctedNow();
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
       const expiresAfter = now + EXPIRES_AFTER_MS;
-      // Sub-accounts without limits of their own share the master's daily counter.
-      const usageAccount = { account, master, separate: [...this.accountLimits.keys()] };
+      // Sub-accounts without a daily limit of their own share the master's daily limit and counter.
+      const usageAccount = { account, master, separate: separateDailyAccounts(this.accountLimits) };
       const usage = await this.coordinator.usage(agent, now, usageAccount);
       const decision = evaluateFramePolicy({
         compiled,

@@ -57,7 +57,7 @@ export interface ReserveLimits {
   maxOrdersPerMinute: number;
   /** Signed actions of any kind (orders, cancels, leverage, noop…) per minute. */
   maxActionsPerMinute: number;
-  /** The account's own daily limit (its pool's, for sub-accounts without limits of their own). */
+  /** The account's own daily limit (the master's, for sub-accounts without a daily limit of their own). */
   maxDailyNotionalUsd: number;
   /** The agent's daily limit across every account. */
   maxAgentDailyNotionalUsd: number;
@@ -86,8 +86,9 @@ export interface UsageAccount {
   /** The key's master (records from before sub-accounts count everything for it). */
   master: string;
   /**
-   * Sub-accounts with daily limits of their own (lowercase). Every other account shares the master's limit, so its
-   * notional is counted together with the master's and that of every other account without limits of its own.
+   * Sub-accounts with daily limits of their own (`maxDailyNotionalUsd` in their own limits; lowercase). Every other
+   * account shares the master's limit, so its notional is counted together with the master's and that of every other
+   * account without a daily limit of its own.
    */
   separate?: readonly string[];
 }
@@ -233,7 +234,7 @@ function accountNotional(record: UsageRecord, account: UsageAccount | undefined)
   if (account.separate === undefined) return amount(key);
   const separate = new Set(account.separate.map((a) => a.toLowerCase()));
   if (separate.has(key)) return amount(key);
-  // The master's limit is shared by every account without limits of its own.
+  // The master's limit is shared by every account without a daily limit of its own.
   return Object.keys(byAccount)
     .filter((a) => !separate.has(a))
     .reduce((sum, a) => sum + amount(a), 0);

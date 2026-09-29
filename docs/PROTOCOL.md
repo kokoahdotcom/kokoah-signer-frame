@@ -506,7 +506,9 @@ list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE`
   - `NO_KEY`, `KEY_PENDING`, `KEY_EXPIRED`, `LOCKED`, `KEY_CHANGED`;
   - `INVALID_INTENT` (`details.issues`);
   - `UNSUPPORTED_MARKET` (outcome markets, and every spot market except the pinned stablecoin and verified pairs that
-    the frame's own `spotMeta` confirms: the frame trades perps, HIP-3 perps and verified spot pairs only);
+    the frame's own `spotMeta` confirms: the frame trades perps, HIP-3 perps and verified spot pairs only; on mainnet,
+    anything but cancels and reduce-only orders on a HIP-3 dex that isn't pinned or has a new deployer, see
+    [§7](#7-policy));
   - `COMPILE_FAILED` (`details.compileCode`: `UNKNOWN_MARKET`, `DELISTED_MARKET`, `SIZE_PRECISION`, `PRICE_PRECISION`, `CROSS_NOT_ALLOWED`, `MARGIN_PRECISION`, `SCHEDULE_TOO_SOON`, …; the message includes the rounded suggestion);
   - `POLICY_DENIED` (`details.violations`: every `{ code, message }` from shared `evaluatePolicy`, plus the frame's own rules);
   - `MARKET_DATA_UNAVAILABLE` (retryable);
@@ -542,11 +544,13 @@ Personal limits (Settings, §B11.4). They can only **tighten** the frame's basel
 → `{ "maxOrderNotionalUsd": 5000, "maxDailyNotionalUsd": 50000, "maxLeverage": 10, "requireStopLossForNewEntries": true }`
 
 Limits are kept **per account**. Without `account` (or with the key's master) the call sets the master's limits. With a
-sub-account's address it sets that sub-account's own limits, which replace the master's for it:
-`{ "account": "0x…sub", "maxOrderNotionalUsd": 1000 }`. `{ "account": "0x…sub" }` alone removes them, so the
-sub-account uses the master's limits again. A sub-account without its own limits always uses the master's. At most 64
-sub-accounts can have their own limits. Setting limits for an address grants nothing: `vaultAddress` is still checked
-on HL at signing.
+sub-account's address it sets that sub-account's own limits, which apply **on top of the master's**:
+`{ "account": "0x…sub", "maxOrderNotionalUsd": 1000 }`. Each field set replaces the master's value for that
+sub-account (still within the baseline); each field left out keeps the master's value, whenever the master's limits
+are set or changed. So a sub-account that sets only `maxLeverage` keeps the master's notional limits, stop-loss rule
+and daily counter. `{ "account": "0x…sub" }` alone removes them, so the sub-account uses the master's limits again. A
+sub-account without its own limits always uses the master's. At most 64 sub-accounts can have their own limits.
+Setting limits for an address grants nothing: `vaultAddress` is still checked on HL at signing.
 
 ← `{ "policy": PolicySummary }` ([§7](#7-policy)). The frame also emits `statusChanged`.
 
@@ -561,8 +565,10 @@ on HL at signing.
 | `account` | Optional sub-account address (see above) |
 
 - User limits live in the frame's memory: re-apply them (the master's and every sub-account's) after `hello` on every load and on `reconnected` (store them in settings).
-- Counting: orders per minute are counted per key across all accounts. Daily notional is counted per account for its
-  own `maxDailyNotionalUsd`, and per key across all accounts for the baseline $25M.
+- Counting: orders per minute are counted per key across all accounts. Daily notional is counted per key across all
+  accounts for the baseline $25M. For personal limits, a sub-account whose own limits set `maxDailyNotionalUsd` has a
+  counter of its own against that limit; the master and every other sub-account share one counter against the
+  master's `maxDailyNotionalUsd`.
 - Errors:
   - `LIMIT_LOOSENING_REJECTED`, with `details.fields` listing the fields that would loosen;
   - `INVALID_REQUEST`.
@@ -634,7 +640,7 @@ Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event":
 | `AGENT_NOT_FOUND` | HL doesn't list the agent yet | Retry `confirmAgent` (maybe with `timeoutMs`) |
 | `AGENT_MISMATCH` | HL lists the agent under another name | Revoke and re-create |
 | `INVALID_INTENT` | Intent failed shared validation | Bug in the intent builder; show `details.issues` in dev |
-| `UNSUPPORTED_MARKET` | Outcome market, or a spot pair the frame can't verify | Don't offer the ticket |
+| `UNSUPPORTED_MARKET` | Outcome market, a spot pair the frame can't verify, or (mainnet) anything but a cancel or reduce-only order on a HIP-3 dex that isn't pinned or has a new deployer | Don't offer the ticket; on such a dex, offer only cancels and reduce-only closes (leverage and margin changes go through Hyperliquid itself) |
 | `COMPILE_FAILED` | Market unknown/delisted, precision, margin mode… (`details.compileCode`) | Show the message (it carries the rounded suggestion) |
 | `POLICY_DENIED` | Policy refused (`details.violations`) | Show each violation's `message` |
 | `MARKET_DATA_UNAVAILABLE` | HL `/info` failed | Retry later |
@@ -665,6 +671,7 @@ The baseline is built into the frame and can't be loosened:
 | Allowed action types | `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `updateLeverage`, `updateIsolatedMargin`, `scheduleCancel`, `noop`, `startFeeTrial`. Everything else is denied, and fund movements, vault/sub-account actions, approvals, TWAP etc. are hard-denied by the shared policy anyway |
 | `setReferrer` | Only with the frame's `VITE_HL_REFERRAL_CODE` (shared policy `referralCode`), for the master, while HL reports no referrer, once per key. No code configured: denied |
 | Spot | The network's pinned stablecoin/USDC pairs (shared `STABLECOIN_PAIRS`) with one IOC order; once the parent sets `spotTrading: true`, also the verified token/USDC pairs (shared `VERIFIED_SPOT_PAIRS`) with market orders and GTC, IOC and post-only limits. Every pair is checked against the frame's own `spotMetaAndAssetCtxs`; master account only; no triggers, reduce-only, TP/SL or modify; builder on sells and none on buys; on mainnet one order on a verified pair ≤ 10% of its 24 h volume. Spot legs skip the leverage and stop-loss rules but count toward notional and rate limits. Every other spot market is denied |
+| HIP-3 (mainnet) | Only the dexes pinned in shared `perpDexs.ts` (name and deployer), checked against the `perpDexs` the frame reads itself. On any other dex HL lists (not pinned, or a new deployer) only cancels (`cancel`, `cancelByCloid`; `scheduleCancel` touches no market) and reduce-only orders (closes, position TP/SL, reduce-only modifies) are signed, so a user can leave it; entries, modifies that aren't reduce-only and every `updateLeverage` and `updateIsolatedMargin` (either way) are `UNSUPPORTED_MARKET`. Without HL's `perpDexs` nothing on a HIP-3 dex is signed (its asset ids need it). Testnet: every dex |
 | Builder | Every `order` carries exactly `{ b: VITE_BUILDER_ADDRESS, f: VITE_BUILDER_FEE_TENTHS_BPS }` |
 | `vaultAddress` | Absent (the master), or one of the master's own sub-accounts as listed by HL `subAccounts`, read by the frame itself. Vaults and any other address are denied (`VAULT_NOT_ALLOWED`) |
 | Price band | Orders that execute now (market, IOC, and marketable limits: a buy at or above min(mark, mid), a sell at or below max(mark, mid)) within **10%** of HL's mark; market-order slippage ≤ 10%. Resting GTC/ALO limits that don't cross may sit up to **50%** from mark (shared `RESTING_PRICE_BAND_PCT`), which still stops typos like 8500 for 85000. Triggers: the limit within 10% of its trigger; an untriggered trigger up to 50% from mark; a trigger that would fire now banded at 10% from mark. Mark and mid come from the frame's own HL reads. `setLimits.priceBandPct` tightens the 10% band only |
