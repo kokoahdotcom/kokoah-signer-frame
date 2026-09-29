@@ -701,7 +701,7 @@ Denials come back as `POLICY_DENIED` with every violation, for example:
 | Mode | At rest | After a reload | Protects against | Doesn't protect against |
 |---|---|---|---|---|
 | `passkey` | Key encrypted with AES-GCM; the wrapping key is `HKDF(WebAuthn PRF output)`; non-extractable | **Locked** until the user unlocks with the passkey (user verification) | Stolen disk or profile copy; silent use of the stored key by code that runs later | Script running on the signer origin **after** unlock (the key is in memory) |
-| `device` | Key encrypted with a **non-extractable** AES-GCM `CryptoKey` stored in IndexedDB | Unlocked automatically | Offline theft of the storage files | **Any script running on the signer origin** (it can call `decrypt`). That is why the frame's origin, CSP, SRI and deploy integrity matter |
+| `device` | Key encrypted with a **non-extractable** AES-GCM `CryptoKey` stored in IndexedDB | Unlocked automatically | Other origins and JavaScript export of the key | **A copy of the browser profile** (Chromium stores the CryptoKey's bytes in the same IndexedDB files: THREAT_MODEL A5) and **any script running on the signer origin** (it can call `decrypt`). That is why the frame's origin, CSP, SRI and deploy integrity matter, and why `passkey` is the stronger choice |
 | `session` | Nothing stored | Gone (create a new key) | Anything at rest | Script on the signer origin while the tab is open |
 
 **Passkey ceremonies:**
