@@ -1,6 +1,6 @@
 # Kokoah CODEOWNERS template. Copy to .github/CODEOWNERS in each repo.
 #
-# PLACEHOLDERS: replace @concil859856 and @concil859856
+# PLACEHOLDERS: replace @zenith10007 and @zenith10007
 # with real GitHub teams (each team needs write access to the repo). Then turn on
 # branch protection for main (a ruleset): "Require a pull request", "Require review
 # from Code Owners", 2 approvals where the team is big enough, "Dismiss stale
@@ -9,23 +9,23 @@
 # The last matching pattern wins, so the general rule comes first.
 
 # Everything: at least one maintainer.
-*                                   @concil859856
+*                                   @zenith10007
 
 # Supply chain: any dependency change needs the security owners. This enforces the
 # rule that a human reviews every new or AI-suggested dependency.
-/package.json                       @concil859856
-/pnpm-lock.yaml                     @concil859856
-/pnpm-workspace.yaml                @concil859856
-/.npmrc                             @concil859856
-/.nvmrc                             @concil859856
-/Dockerfile                         @concil859856
-/.dockerignore                      @concil859856
+/package.json                       @zenith10007
+/pnpm-lock.yaml                     @zenith10007
+/pnpm-workspace.yaml                @zenith10007
+/.npmrc                             @zenith10007
+/.nvmrc                             @zenith10007
+/Dockerfile                         @zenith10007
+/.dockerignore                      @zenith10007
 
 # CI and repository settings: a change here can leak secrets or skip checks.
-/.github/                           @concil859856
+/.github/                           @zenith10007
 
 # Security headers and CSP (static sites): public/_headers, header policy code.
-/public/_headers                    @concil859856
+/public/_headers                    @zenith10007
 
 # Security-critical code paths. Adjust to each repo's layout, for example:
 #   kokoah-signer-frame:   /src/                  (the whole frame)  <- applied below
@@ -35,9 +35,9 @@
 #   kokoah-infra:          /headers/ /scripts/src/ /docs/SECURITY_BASELINE.md
 
 # kokoah-signer-frame: the whole frame, the protocol, the build and its integrity checks are security-critical.
-/src/                               @concil859856
-/scripts/                           @concil859856
-/vite.config.ts                     @concil859856
-/index.html                         @concil859856
-/.env.production                    @concil859856
-/tools/                             @concil859856
+/src/                               @zenith10007
+/scripts/                           @zenith10007
+/vite.config.ts                     @zenith10007
+/index.html                         @zenith10007
+/.env.production                    @zenith10007
+/tools/                             @zenith10007
