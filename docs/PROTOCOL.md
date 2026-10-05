@@ -421,7 +421,22 @@ other fields (a code, a `vaultAddress` or another origin is `INVALID_INTENT`):
   it answers `POLICY_DENIED` (`FEE_TRIAL_UNAVAILABLE`); an unreadable answer is `MARKET_DATA_UNAVAILABLE`; a tier
   outside the schedule is `COMPILE_FAILED`.
 
-Both results have `cloids: []`; they count toward neither the order rate nor the notional limits.
+- `{ "kind": "hlpDeposit", "origin": "manual", "usd": "250" }` deposits `usd` USDC (at most 6 decimals) into HLP,
+  Hyperliquid's own vault. There is no vault field: the frame signs its own HLP address for its network (shared
+  `HLP_VAULT_ADDRESSES`). The frame reads `{"type":"userNonFundingLedgerUpdates","user":<master>,"startTime":<now−24 h>}`
+  itself and adds the deposits it sent in the last 5 minutes (the ledger can lag); more than 10,000 USDC at once or
+  25,000 in 24 hours, or less than 5, is `POLICY_DENIED` (`VAULT_DEPOSIT_LIMIT`), checked before anything is shown.
+  Then it shows its own prompt (`promptChanged` kind `vault-deposit`, fixed styling) naming the amount and the 4-day
+  lock-up; only the user's click in the frame signs `{"type":"vaultTransfer","vaultAddress":<HLP>,"isDeposit":true,
+  "usd":250000000}` (USDC × 10^6), after reading the ledger again under the agent lock. Cancel: `USER_CANCELLED`.
+- `{ "kind": "vaultWithdraw", "origin": "manual", "vaultAddress": "0x…", "usd": "120.5" }` withdraws from a vault back
+  into the account. The frame reads `{"type":"userVaultEquities","user":<master>}` itself: a vault the account doesn't
+  hold, or more than its equity there, is `POLICY_DENIED` (`VAULT_NOT_ALLOWED`). No prompt (the money comes back to the
+  account). Hyperliquid itself refuses a withdrawal inside the lock-up.
+
+An unreadable ledger or vault list is `MARKET_DATA_UNAVAILABLE`; nothing is signed.
+
+All four results have `cloids: []`; they count toward neither the order rate nor the notional limits.
 
 **Convert stablecoins** is an ordinary `order` intent on one of the network's pinned stablecoin/USDC pairs
 (`status.policy.spotCoins`, e.g. `@166` USDT0/USDC on mainnet), for the master account: a market (or IOC limit)
@@ -615,7 +630,7 @@ Allowed variables:
 | `statusChanged` | `SignerStatus` | Key created, confirmed, locked, unlocked, revoked, expired, changed in another tab; limits changed |
 | `keyExpiringSoon` | `{ agentAddress, validUntil, msRemaining }` | Once per key per frame load, when it expires within 7 days (right after `hello`, and on a timer). Show the renew banner. Also in `status.expiringSoon` |
 | `keyExpired` | `{ agentAddress, validUntil }` | Once per key per frame load, at `validUntil − 15 s`. The frame refuses to sign from then on. Also in `status.expired` |
-| `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true** |
+| `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| "vault-deposit" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true** |
 | `reconnected` (client-side, not sent by the frame) | `HelloResult` | `KokoahSignerClient` re-ran `hello` after the frame reloaded ([§3](#3-the-client)). Re-apply `setLimits` and `setTheme` |
 
 Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event": "promptChanged", "data": { "visible": true, "kind": "passkey-unlock" } }`

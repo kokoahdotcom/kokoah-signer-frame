@@ -376,6 +376,13 @@ export interface SignAndSubmitParams {
    * `{ kind: "setReferrer", origin: "manual" }` sets the frame's configured referral code (never one from the parent),
    * only while HL reports no referrer and only once per key; `{ kind: "startFeeTrial", origin: "manual" }` starts
    * Hyperliquid's fee trial.
+   *
+   * Vault transfers, the one fund movement a trading key may make (shared `vaults/hlp.ts`):
+   * `{ kind: "hlpDeposit", origin: "manual", usd }` deposits into HLP: the vault is the frame's own HLP address for
+   * its network, the frame reads the last 24 hours of HLP deposits from HL itself (caps: 10,000 USDC per deposit,
+   * 25,000 per 24 hours) and the user confirms in the frame's own prompt (`promptChanged` kind `vault-deposit`), which
+   * names the amount and the 4-day lock-up; `{ kind: "vaultWithdraw", origin: "manual", vaultAddress, usd }`
+   * withdraws from a vault the frame reads on HL that the account holds, up to its equity there.
    */
   intent: ActionIntentInput | AccountIntentInput;
 }
@@ -596,7 +603,7 @@ export interface EventData {
   /** The key has expired; the frame refuses to sign with it. */
   keyExpired: { agentAddress: Hex; validUntil: number };
   /** The frame needs (or no longer needs) the user to click inside it. Show the iframe while `visible` is true. */
-  promptChanged: { visible: boolean; kind: "passkey-create" | "passkey-unlock" | null };
+  promptChanged: { visible: boolean; kind: "passkey-create" | "passkey-unlock" | "vault-deposit" | null };
 }
 
 // ---------------------------------------------------------------------------------------------

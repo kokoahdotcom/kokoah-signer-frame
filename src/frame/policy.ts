@@ -43,6 +43,7 @@
 import type { AccountIntent, CompiledAccountAction, CompiledAction } from "@kokoah/shared/actions";
 import type { ActionIntent } from "@kokoah/shared/intents";
 import type { MarketRegistry } from "@kokoah/shared/markets";
+import { vaultTransferProblems } from "@kokoah/shared/vaults";
 import { createManualTradingPolicy, evaluatePolicy, parsePolicy, type Policy, type PolicyViolation, spotOrderVolumeProblem } from "@kokoah/shared/policy";
 import { BASELINE_ACTION_TYPES, EXPIRES_AFTER_MS, type AllowedActionType, type PolicySummary, type UserLimits } from "../protocol/index.js";
 
@@ -241,6 +242,8 @@ export function intentCoins(compiled: { intent: ActionIntent | AccountIntent }):
   switch (i.kind) {
     case "setReferrer":
     case "startFeeTrial":
+    case "hlpDeposit":
+    case "vaultWithdraw":
       return [];
     case "order":
     case "updateLeverage":
@@ -504,11 +507,18 @@ export interface FrameAccountPolicyInput {
    * and whether this key already signed one (persisted). Either one denies.
    */
   referrer?: { alreadyReferred: boolean; signedBefore: boolean };
+  /**
+   * `vaultTransfer` only: the facts the frame itself read from HL for the master (HLP deposits in the last 24 hours,
+   * plus deposits this frame sent that the ledger may not show yet; or the account's equity in the vault it withdraws
+   * from) and the frame's network. Missing facts deny.
+   */
+  vault?: { network: "mainnet" | "testnet"; hlpDepositedLast24hUsd?: number; heldEquityUsd?: number };
 }
 
 /**
- * Evaluates an account action (`setReferrer`, `startFeeTrial`) about to be signed: the shared policy on the exact wire
- * action (no `vaultAddress`: the master account only), plus the frame's "once" rule for `setReferrer`.
+ * Evaluates an account action (`setReferrer`, `startFeeTrial`, vault transfers) about to be signed: the shared policy
+ * on the exact wire action (no `vaultAddress`: the master account only), plus the frame's "once" rule for
+ * `setReferrer`; vault transfers on their own rules (see below).
  */
 export function evaluateFrameAccountPolicy(input: FrameAccountPolicyInput): FramePolicyDecision {
   const violations: PolicyViolation[] = [];
@@ -516,6 +526,27 @@ export function evaluateFrameAccountPolicy(input: FrameAccountPolicyInput): Fram
     if (!violations.some((x) => x.code === v.code && x.message === v.message)) violations.push(v);
   };
   const wireAction = input.compiled.action as unknown as { type: string } & Record<string, unknown>;
+  // Vault transfers are the one fund movement a trading key may sign (HLP deposits within caps, withdrawals from a
+  // vault the account holds; shared vaults/hlp.ts). The shared policy denies them for every other path, so they are
+  // checked here on their own rules, with the same expiresAfter bounds as everything else.
+  if (wireAction.type === "vaultTransfer") {
+    const kind = input.compiled.intent.kind;
+    if (kind !== "hlpDeposit" && kind !== "vaultWithdraw") add({ code: "VAULT_ACTION_DENIED", message: "Vault transfers come only from an HLP deposit or a vault withdrawal." });
+    const window = input.policy.maxExpiresAfterWindowMs ?? BASELINE_LIMITS.maxExpiresAfterWindowMs;
+    if (input.expiresAfter <= input.now) add({ code: "EXPIRES_AFTER_IN_PAST", message: "expiresAfter is already in the past." });
+    else if (input.expiresAfter - input.now > window) add({ code: "EXPIRES_AFTER_TOO_FAR", message: `expiresAfter is more than ${window} ms in the future.` });
+    if (!input.vault) add({ code: "VAULT_ACTION_DENIED", message: "The signer could not check the vault transfer." });
+    else {
+      const problems = vaultTransferProblems({
+        network: input.vault.network,
+        action: wireAction,
+        ...(input.vault.hlpDepositedLast24hUsd !== undefined ? { hlpDepositedLast24hUsd: input.vault.hlpDepositedLast24hUsd } : {}),
+        ...(input.vault.heldEquityUsd !== undefined ? { heldEquityUsd: input.vault.heldEquityUsd } : {}),
+      });
+      for (const p of problems) add({ code: p.code, message: p.message });
+    }
+    return { allowed: violations.length === 0, violations, actionType: "vaultTransfer" };
+  }
   const decision = evaluatePolicy(
     { kind: "wire", action: wireAction, expiresAfter: input.expiresAfter, origin: input.compiled.intent.origin },
     { policy: { ...input.policy, allowedVaultAddresses: [] }, now: input.now, markPrices: {}, dailyNotionalUsedUsd: 0, ordersInLastMinute: 0, expiresAfter: input.expiresAfter },

@@ -159,6 +159,10 @@ export class MockHl {
   spot: unknown = SPOT_META_AND_CTXS;
   /** HL `userFees` answer (fee trial). */
   userFees: unknown = structuredClone(USER_FEES);
+  /** HL `userNonFundingLedgerUpdates` answer (HLP deposit caps). */
+  ledger: unknown = [];
+  /** HL `userVaultEquities` answer (vault withdrawals). */
+  vaultEquities: unknown = [];
   infoCalls: Array<Record<string, unknown>> = [];
   exchangeCalls: ExchangeCall[] = [];
   infoFailure: ((body: Record<string, unknown>) => boolean) | null = null;
@@ -214,6 +218,10 @@ export class MockHl {
         return this.spot;
       case "userFees":
         return this.userFees;
+      case "userNonFundingLedgerUpdates":
+        return this.ledger;
+      case "userVaultEquities":
+        return this.vaultEquities;
       case "activeAssetData": {
         const lev = this.leverageByUser[String(body.user).toLowerCase()]?.[String(body.coin)] ?? this.leverage[String(body.coin)] ?? 10;
         return { user: body.user, coin: body.coin, leverage: { type: "cross", value: lev }, maxTradeSzs: ["1", "1"], availableToTrade: ["1", "1"], markPx: this.mark[String(body.coin)] };
