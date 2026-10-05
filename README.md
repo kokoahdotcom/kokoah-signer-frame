@@ -28,7 +28,7 @@ This repo also ships **`KokoahSignerClient`**, the typed, dependency-free client
 - **Separate origin.** App code can't read the frame's memory or storage.
 - **What the frame accepts.** Messages from `window.parent` only, and only from the exact origins in the build-time allowlist. Replies go to that origin, never `*`. Every message is validated against a strict schema and capped at 64 KB. Anything else is dropped and counted.
 - **What the frame trusts.** It never trusts prices, market metadata, builder or nonce from the parent. It fetches HL `/info` itself and compiles with shared `compileAction` using the configured builder.
-- **Baseline policy** (shared `evaluatePolicy`), which the parent can only tighten:
+- **Baseline policy** (shared `evaluatePolicy`), which the parent can only tighten, with the user's **personal limits** on top. The frame stores those itself (IndexedDB on its origin, per network): they survive reloads and bind every tab; tightening applies silently, loosening only after the user's click on the frame's own prompt. The baseline:
   - trading actions only;
   - builder required;
   - no `vaultAddress`;
@@ -170,9 +170,9 @@ These aren't in this repo's power; they are for the kokoah-infra owners.
    - `keyExpiringSoon` / `keyExpired`: renew banner. They fire once per key per frame load; `hello.status` and `getStatus()` carry the same state (`expiringSoon`, `expired`, `expiresAt`), so drive the banner from the status.
    - `promptChanged`: while `visible`, the iframe **must be shown and clickable**. The client unhides it and sets `data-kokoah-signer-prompt`; style it as a modal:
      ```css
-     iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min(420px, 92vw); height: 240px; border: 0; border-radius: 12px; z-index: 1000; box-shadow: 0 10px 40px rgb(0 0 0 / 0.5); }
+     iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min(420px, 92vw); height: min(480px, 92vh); border: 0; border-radius: 12px; z-index: 1000; box-shadow: 0 10px 40px rgb(0 0 0 / 0.5); }
      ```
-   - `reconnected` (client-side, payload: the new `HelloResult`): the frame reloaded and the client re-ran `hello` with the same params. The new frame has forgotten user limits, theme, remembered `requestId`s and an unlocked passkey key. Re-check `network`/`builder`, re-apply `setLimits` and `setTheme` in the listener (requests the listener starts synchronously go out before requests that waited for the reconnect), and refresh the status from `hello.status`:
+   - `reconnected` (client-side, payload: the new `HelloResult`): the frame reloaded and the client re-ran `hello` with the same params. The new frame has forgotten the theme, remembered `requestId`s and an unlocked passkey key; it keeps the user limits it stores. Re-check `network`/`builder`, re-apply `setLimits` (a no-op when unchanged) and `setTheme` in the listener (requests the listener starts synchronously go out before requests that waited for the reconnect), and refresh the status from `hello.status`:
      ```ts
      signer.on("reconnected", (hello) => { checkHello(hello); void signer.setLimits(limits); void signer.setTheme(theme); setSignerStatus(hello.status); });
      ```
@@ -197,7 +197,7 @@ These aren't in this repo's power; they are for the kokoah-infra owners.
    Show `r.marketOrder` (mid and IOC price signed) for market orders, `r.outcome.statuses` for `ok`, and `r.error` for `rejected`. The final state comes from the WebSocket.
 7. **Security center (J11):** `revoke()` → sign `revokeAgent.typedData` → post it like step 5. If the result has `wipeError` (`wiped: false`), the stored copy couldn't be deleted: still post `revokeAgent`, tell the user, and call `revoke()` again.
 8. **Link phone:** on the phone, after claiming the pairing, `createLinkedAgent({ userAddress, agentName, validForDays: 30, storageMode: "device", link: { pairingId, secret } })` returns the pending key's address, expiry and the 6-digit `matchCode` to show; the computer approves the key with its main wallet, then the phone calls `confirmAgent`. See [PROTOCOL §12](docs/PROTOCOL.md#12-link-phone).
-9. **Settings (§B11.4):** `setLimits({...})` after every `hello` and on every `reconnected`. Loosening fails with `LIMIT_LOOSENING_REJECTED`.
+9. **Settings (§B11.4):** `setLimits({...})` after every `hello` and on every `reconnected`; the frame stores the limits, so identical ones change nothing. Tightening applies at once. With `hello.capabilities.confirmsLooserLimits`, anything looser (a higher number, `{}`, spot trading on, …) waits for the user's click on the frame's prompt (`promptChanged` kind `limits`; tell the user to confirm in the signer window), and cancel or timeout leave the limits as they were (`USER_CANCELLED` / `USER_TIMEOUT`). Above the baseline: `LIMIT_LOOSENING_REJECTED`. See [PROTOCOL `setLimits`](docs/PROTOCOL.md#setlimits).
 10. **Errors:** `SignerRequestError.code` is one of the `SignerErrorCode`s in [PROTOCOL §6](docs/PROTOCOL.md#6-errors), with recommended handling.
 
 ## Dev harness
@@ -229,7 +229,8 @@ Ports can be changed with `DEV_HARNESS_PORT` and `DEV_FRAME_PORT`; `0` picks fre
 - **`createLinkedAgent`** (Link phone): a fresh pending key, the matching code over exactly that key, no typed data, the link secret never echoed, strict params;
 - **signing happy path**: signer recovered with shared `recoverL1Signer` equals the agent; body equals shared `buildExchangeRequest` of shared `compileAction`; builder present;
 - **results**: `ok`, `rejected`, `unknown`; `requestId` idempotency;
-- **policy denials**: vault/transfer/withdraw wire actions, builder mismatch or missing, price band, leverage (market maximum and tightened), per-minute rate (persisted across reloads), notional, coins, stop-loss, origin; `setLimits` loosening rejected and tightening applied;
+- **policy denials**: vault/transfer/withdraw wire actions, builder mismatch or missing, price band, leverage (market maximum and tightened), per-minute rate (persisted across reloads), notional, coins, stop-loss, origin; `setLimits` above the baseline rejected and tightening applied;
+- **stored limits**: survive a reload and need no key; bind another tab (with and without BroadcastChannel, and while a signature waits for the lock); tightening and identical limits never prompt; every kind of loosening prompts and lists its changes; cancel and timeout change nothing; a confirmation against limits changed meanwhile is refused; the same for sub-account limits;
 - **prices**: parent-supplied prices impossible or ignored; HL's mark is used;
 - **expiry**: an expired key refuses to sign; `keyExpiringSoon` / `keyExpired`;
 - **storage**: `device` round-trip (ciphertext only, non-extractable key, tamper detection); `session` wiped on reload; `passkey` with a mocked PRF (prompt, second click, cancel/retry, timeout, wrong PRF, fallbacks, credential reuse);
@@ -280,7 +281,7 @@ Two more suites run on demand:
 - **In-frame confirmation for large or out-of-policy orders** (SECURITY_BASELINE §3 asks for it). v1 denies instead.
 - **Tune the baseline limits.** $1M per order, $25M per day and a 10% band are wide backstops.
 - **Clickjacking hardening of the in-frame prompt** (IntersectionObserver v2 visibility checks).
-- **User limits aren't persisted by the frame**; the parent re-applies them after each `hello` and on `reconnected`.
+- **Loosening limits relies on the user reading the frame's prompt**; the clickjacking caveat above applies (THREAT_MODEL A23).
 - **Outcome markets aren't supported, nor unverified spot tokens** (`UNSUPPORTED_MARKET`): spot is limited to
   Convert's stablecoin pairs and, once the user turns spot trading on, the verified pairs (Hyperliquid's "Strict" list),
   with no trigger orders.

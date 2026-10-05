@@ -68,7 +68,7 @@ parent                                     frame (iframe, other origin)
 - Until `hello` succeeds, every other method answers `NOT_CONNECTED`.
 - `hello` may be repeated; it is idempotent.
 - The frame buffers messages that arrive while it is still starting, so sending `hello` right after the iframe's `load` event is safe. `KokoahSignerClient` also retries `hello`.
-- The frame posts `ready` before it answers any `hello`. A `ready` **after** a completed handshake therefore means the iframe reloaded: the new frame document has forgotten the handshake (every method answers `NOT_CONNECTED`), user limits, theme, remembered `requestId`s and an unlocked passkey key. `KokoahSignerClient` then re-runs `hello` with the same params and emits its own `reconnected` event ([§3](#3-the-client)); re-apply `setLimits` and `setTheme` there.
+- The frame posts `ready` before it answers any `hello`. A `ready` **after** a completed handshake therefore means the iframe reloaded: the new frame document has forgotten the handshake (every method answers `NOT_CONNECTED`), theme, remembered `requestId`s and an unlocked passkey key. It keeps the user's limits, which it stores itself (`setLimits`, [§4](#setlimits)). `KokoahSignerClient` then re-runs `hello` with the same params and emits its own `reconnected` event ([§3](#3-the-client)); re-apply `setLimits` (a no-op when nothing changed) and `setTheme` there.
 - After `hello`, the frame immediately emits `keyExpiringSoon` or `keyExpired` if they apply. These are emitted once per key per frame load, so **register listeners before calling `hello`** (`client.on()` works before the handshake). The same state is in `hello.status` and `getStatus` (`expiringSoon`, `expired`, `expiresAt`): an app that subscribed late reads it from there.
 
 ## 3. The client
@@ -91,7 +91,7 @@ store.setSignerStatus(hello.status);                 // includes expiringSoon / 
 
 | Member | Notes |
 |---|---|
-| `new KokoahSignerClient(options)` | `frameUrl` (required; https, or http for localhost). Optional: `container` (default `document.body`), `requestTimeoutMs` (30 s), `interactiveTimeoutMs` (300 s, used by `unlock` and passkey `createAgent`), `helloTimeoutMs` (15 s), `autoShowOnPrompt` (true), `iframeTitle`, `clientInfo`. |
+| `new KokoahSignerClient(options)` | `frameUrl` (required; https, or http for localhost). Optional: `container` (default `document.body`), `requestTimeoutMs` (30 s), `interactiveTimeoutMs` (300 s, used by `unlock`, `setStorageMode`, `setLimits` and passkey `createAgent`), `helloTimeoutMs` (15 s), `autoShowOnPrompt` (true), `iframeTitle`, `clientInfo`. |
 | `iframe` | The `<iframe data-kokoah-signer>`. Hidden (`hidden` attribute) except while the frame shows a prompt. Style it in the app. |
 | `frameOrigin` | The only origin the client sends to and accepts messages from. |
 | `hello(params?)` | Handshake; cached. Called automatically before the first other request. Repeated automatically, with the same params, when the frame reloads (see `reconnected`). |
@@ -107,7 +107,7 @@ store.setSignerStatus(hello.status);                 // includes expiringSoon / 
 ```ts
 signer.on("reconnected", (hello) => {
   if (!helloMatchesConfig(hello)) blockTrading();      // same checks as after the first hello
-  void signer.setLimits(userLimits);                   // the new frame runs the baseline policy until then
+  void signer.setLimits(userLimits);                   // a no-op: the frame kept the limits it stores
   void signer.setTheme(theme);
   store.setSignerStatus(hello.status);                 // e.g. a passkey key is locked again
 });
@@ -133,10 +133,10 @@ signer.on("reconnected", (hello) => {
 
 The client sets no `sandbox`. If the app adds one, it must include `allow-scripts allow-same-origin`; without `allow-same-origin` the frame loses its origin and its storage. Passkeys in sandboxed iframes are unverified.
 
-**Showing the prompt.** When the frame needs a click (passkey ceremonies), it emits `promptChanged {visible: true}`. The client then removes `hidden` from the iframe and sets `data-kokoah-signer-prompt="<kind>"`. Style that state as a modal, for example:
+**Showing the prompt.** When the frame needs a click (passkey ceremonies, an HLP deposit, a loosening of the user's limits), it emits `promptChanged {visible: true}`. The client then removes `hidden` from the iframe and sets `data-kokoah-signer-prompt="<kind>"`. Style that state as a modal, for example:
 
 ```css
-iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min(420px, 92vw); height: 240px; border: 0; border-radius: 12px; z-index: 1000; }
+iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min(420px, 92vw); height: min(480px, 92vh); border: 0; border-radius: 12px; z-index: 1000; }
 ```
 
 The iframe must be visible, on top and clickable. Don't cover it or make it transparent.
@@ -163,7 +163,8 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
     "webLocks": true,
     "indexedDB": true,
     "broadcastChannel": true,
-    "vaultTransfers": true
+    "vaultTransfers": true,
+    "confirmsLooserLimits": true
   },
   "builder": { "address": "0x…builder", "feeTenthsBps": 25 },
   "status": { "hasKey": true, "keyState": "active", "expiringSoon": true, "expired": false, "…": "SignerStatus, see getStatus" },
@@ -176,6 +177,10 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
 - `storageModes` lists what can work here. Offer only those, in that order of preference.
 - `vaultTransfers` is true when the frame signs `hlpDeposit` and `vaultWithdraw` (absent in older frames): show HLP
   deposits and vault withdrawals only then.
+- `confirmsLooserLimits` is true when the frame stores the user's limits itself and applies a looser `setLimits` only
+  after the user's click on its own prompt (see `setLimits`). Only then tell the user to confirm in the signer window.
+  Absent in older frames: they keep limits in memory, apply anything within the baseline at once, and the app must
+  re-apply limits after every load.
 - `status` is the frame's `SignerStatus` at the handshake (see `getStatus`), including the key's expiry state.
 - Errors: `UNSUPPORTED_VERSION`.
 
@@ -482,8 +487,8 @@ list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE`
 2. Fetches its **own** market metadata and mark/mid prices from HL `/info` (`metaAndAssetCtxs`, per perp dex; `perpDexs` for HIP-3; cached about 3 s). It syncs its clock with `exchangeStatus`.
 3. Compiles with `compileAction`, using the configured builder `{b, f}`. Market orders become IOC limits at the frame's own mid ± `slippageBps`.
 4. Takes the per-agent Web Lock (serialized across tabs).
-5. Evaluates the policy ([§7](#7-policy)) of the account the intent is for, on the compiled action and again on the
-   exact wire action.
+5. Reads the user's stored limits again (another tab may have changed them) and evaluates the policy
+   ([§7](#7-policy)) of the account the intent is for, on the compiled action and again on the exact wire action.
 6. Reserves a nonce, `max(now + clockOffset, last + 1)`, persisted in IndexedDB. One key signs for every account, so
    nonces stay unique and increasing across accounts (HL tracks nonces per signer).
 7. Signs with `expiresAfter = now + 15 s` (and `vaultAddress` for a sub-account, inside the signed hash).
@@ -533,7 +538,7 @@ list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE`
   - `SIGNER_BUSY` (retryable; the signing lock wasn't free within 20 s);
   - `REQUEST_ID_REUSED`;
   - `MAINNET_WRITES_DISABLED`;
-  - `STORAGE_FAILED`.
+  - `STORAGE_FAILED` (retryable; the nonce, or the user's stored limits, could not be read or written: nothing was signed).
 
 **Intent examples (J5):**
 
@@ -557,7 +562,9 @@ Sizes and prices must already be valid for the market (shared `formatSize`, `che
 
 ### `setLimits`
 
-Personal limits (Settings, §B11.4). They can only **tighten** the frame's baseline, and they **replace** the previous limits of that account (`{}` resets the master to the baseline). Loosening anything rejects the whole call and changes nothing.
+Personal limits (Settings, §B11.4). They **replace** the previous limits of one account (`{}` resets the master to the
+baseline) and can never go beyond the frame's baseline: a value above it rejects the whole call
+(`LIMIT_LOOSENING_REJECTED`) and changes nothing.
 
 → `{ "maxOrderNotionalUsd": 5000, "maxDailyNotionalUsd": 50000, "maxLeverage": 10, "requireStopLossForNewEntries": true }`
 
@@ -570,26 +577,76 @@ and daily counter. `{ "account": "0x…sub" }` alone removes them, so the sub-ac
 sub-account without its own limits always uses the master's. At most 64 sub-accounts can have their own limits.
 Setting limits for an address grants nothing: `vaultAddress` is still checked on HL at signing.
 
-← `{ "policy": PolicySummary }` ([§7](#7-policy)). The frame also emits `statusChanged`.
+← `{ "policy": PolicySummary }` ([§7](#7-policy)). The frame also emits `statusChanged` when the limits changed.
 
 | Field | Constraint (the baseline is in §7) |
 |---|---|
 | `maxOrderNotionalUsd`, `maxDailyNotionalUsd`, `maxOrdersPerMinute`, `priceBandPct` | ≤ baseline |
 | `maxLeverage` | Integer ≥ 1. Effective cap per market = `min(value, market maximum)`. For new orders the frame reads the account's current leverage (`activeAssetData`) |
 | `allowedCoins` | Non-empty list of HL coin names (a subset of the baseline) |
-| `requireStopLossForNewEntries` | `true` tightens; `false` is a no-op |
+| `requireStopLossForNewEntries` | `true` tightens; `false` or omitted: not required |
 | `allowedActionTypes` | A subset of the baseline action types |
 | `spotTrading` | `true` turns spot trading on (the verified pairs in `spotTradingCoins`, see `signAndSubmit`); omitted or `false`: off, the default. It is the one setting that starts off, and it never goes beyond the baseline |
 | `account` | Optional sub-account address (see above) |
 
-- User limits live in the frame's memory: re-apply them (the master's and every sub-account's) after `hello` on every load and on `reconnected` (store them in settings).
+**Stored by the frame** (`hello.capabilities.confirmsLooserLimits`). The frame keeps the limits in its own IndexedDB on
+the signer origin, **per network** (the master's, each sub-account's own, and `spotTrading`):
+- they survive reloads of the frame or the app;
+- they bind every tab: a change made in one tab applies to the next signature in every other tab (the frame reads the
+  stored limits again before each signature, under the agent's signing lock), and the other tabs emit `statusChanged`;
+- they need no key: the app may set the master's limits before a key exists, and they outlive a revoked or renewed
+  key. A sub-account's limits still need a key (`NO_KEY`), to tell the master from its sub-accounts;
+- they are per network, not per wallet: in a browser where two wallets trade one after the other, the stored master
+  limits apply to whichever wallet's key the frame holds, and switching to a wallet whose limits in the app's settings
+  are looser shows the loosening prompt once.
+
+**Tighten silently, loosen with a click.** Each call is compared with the limits stored now, on the values in force
+for that account (its own, else the master's, else the baseline's):
+
+| Change | What happens | Answer |
+|---|---|---|
+| Identical to the stored limits (the app sends them again at every handshake) | Nothing: no write, no `statusChanged`, no prompt | At once |
+| Only tightens (lower numbers, fewer coins or action types, stop-loss required, spot trading off) | Stored and applied | At once |
+| Loosens anything | The frame shows its own prompt (`promptChanged` kind `limits`, fixed styling the parent's theme can't change) listing every change in plain words, for example `Largest order: $100 → $5,000`. Applied only when the user clicks **Loosen limits** | After the click, or `USER_CANCELLED` / `USER_TIMEOUT` (120 s) with nothing changed |
+
+Loosening means any of:
+- a higher number;
+- a field removed (the baseline, or for a sub-account the master's value, applies again), including `{}`;
+- `spotTrading: true` while it is off;
+- more `allowedCoins` or `allowedActionTypes` (or the list removed);
+- `requireStopLossForNewEntries` dropped while it is required;
+- `{ "account": "0x…sub" }` alone while the master's values are looser than the sub-account's own;
+- a sub-account getting `maxDailyNotionalUsd` of its own while the master has a daily limit: it then has a daily
+  counter of its own on top of the master's, so the day's total can grow.
+
+Timing and order:
+- While the prompt is open, the stored (stricter) limits keep applying to every signature, in every tab.
+- Calls from one tab are compared and stored in the order they arrive; a request sent after a tightening (for example
+  `signAndSubmit` or `getStatus`) sees it. A tightening sent while a loosening waits for the user is applied at once.
+- A second loosening from the same tab waits for the first prompt to close, then is compared again and shows its own
+  prompt. `PROMPT_BUSY` only when another kind of prompt (passkey, HLP deposit) is open.
+- If the stored limits change (another tab, or a tightening from this one) while the user is looking at the prompt,
+  the confirmed loosening is not applied: `SIGNER_BUSY` (retryable). Send it again to show the current changes.
+- Keep the iframe visible while `promptChanged.visible` is true (the client does). The prompt has one line per changed
+  field (up to nine), so give the iframe room for it or let it scroll.
+
+Re-applying: send the user's limits after `hello` on every load and on `reconnected`, as before. With a frame that
+stores them, that is a no-op unless the app's settings differ from the frame's (for example after a change on another
+device): a tightening applies, a loosening asks the user. When the user cancels, read `status.policy.userLimits` and
+`accountLimits` for the limits in force. Without IndexedDB in the frame (`capabilities.indexedDB: false`) the limits
+last for this frame load only.
+
 - Counting: orders per minute are counted per key across all accounts. Daily notional is counted per key across all
   accounts for the baseline $25M. For personal limits, a sub-account whose own limits set `maxDailyNotionalUsd` has a
   counter of its own against that limit; the master and every other sub-account share one counter against the
   master's `maxDailyNotionalUsd`.
 - Errors:
-  - `LIMIT_LOOSENING_REJECTED`, with `details.fields` listing the fields that would loosen;
-  - `INVALID_REQUEST`.
+  - `LIMIT_LOOSENING_REJECTED`, with `details.fields` listing the fields above the baseline (or, in a frame with no user
+    interface, the fields that would loosen the stored limits);
+  - `USER_CANCELLED`, `USER_TIMEOUT` (nothing changed), `PROMPT_BUSY`;
+  - `SIGNER_BUSY` (retryable): the stored limits changed while the user was confirming, or kept changing in other tabs;
+  - `STORAGE_FAILED` (retryable): the stored limits could not be read or written; nothing changed;
+  - `NO_KEY` (a sub-account's limits without a key), `INVALID_REQUEST`.
 
 ### `revoke`
 
@@ -630,11 +687,11 @@ Allowed variables:
 | Event | `data` | When |
 |---|---|---|
 | `ready` | `{ protocolVersion: 1 }` | Once, when the frame has started |
-| `statusChanged` | `SignerStatus` | Key created, confirmed, locked, unlocked, revoked, expired, changed in another tab; limits changed |
+| `statusChanged` | `SignerStatus` | Key created, confirmed, locked, unlocked, revoked, expired, changed in another tab; limits changed (in this tab or another) |
 | `keyExpiringSoon` | `{ agentAddress, validUntil, msRemaining }` | Once per key per frame load, when it expires within 7 days (right after `hello`, and on a timer). Show the renew banner. Also in `status.expiringSoon` |
 | `keyExpired` | `{ agentAddress, validUntil }` | Once per key per frame load, at `validUntil − 15 s`. The frame refuses to sign from then on. Also in `status.expired` |
-| `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| "vault-deposit" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true** |
-| `reconnected` (client-side, not sent by the frame) | `HelloResult` | `KokoahSignerClient` re-ran `hello` after the frame reloaded ([§3](#3-the-client)). Re-apply `setLimits` and `setTheme` |
+| `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| "vault-deposit" \| "limits" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true** |
+| `reconnected` (client-side, not sent by the frame) | `HelloResult` | `KokoahSignerClient` re-ran `hello` after the frame reloaded ([§3](#3-the-client)). Re-apply `setLimits` (a no-op when stored) and `setTheme` |
 
 Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event": "promptChanged", "data": { "visible": true, "kind": "passkey-unlock" } }`
 
@@ -664,14 +721,14 @@ Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event":
 | `MARKET_DATA_UNAVAILABLE` | HL `/info` failed | Retry later |
 | `HL_UNAVAILABLE` | HL `/info` unreachable during `confirmAgent` | Retry later |
 | `REQUEST_ID_REUSED` | Same `requestId`, different intent | Bug: log it |
-| `SIGNER_BUSY` | Signing lock busy for 20 s | Retry |
-| `LIMIT_LOOSENING_REJECTED` | `setLimits` tried to loosen (`details.fields`) | Show which limit can't be raised |
+| `SIGNER_BUSY` | Signing lock busy for 20 s; or `setLimits`: the stored limits changed while the user was confirming | Retry |
+| `LIMIT_LOOSENING_REJECTED` | `setLimits` above the baseline, or a loosening in a frame with no user interface (`details.fields`) | Show which limit can't be raised |
 | `PASSKEY_UNAVAILABLE` | WebAuthn/PRF not usable | Offer `device` or `session` |
 | `PASSKEY_FAILED` | The WebAuthn ceremony failed | Retry |
-| `USER_CANCELLED` / `USER_TIMEOUT` | The user cancelled or didn't act within 120 s | Let them retry |
+| `USER_CANCELLED` / `USER_TIMEOUT` | The user cancelled or didn't act within 120 s (a passkey ceremony, an HLP deposit, looser limits) | Let them retry; nothing changed |
 | `PROMPT_BUSY` | A prompt is already open | Wait |
 | `UNLOCK_FAILED` | Stored key can't be decrypted | Revoke and create a new key |
-| `STORAGE_FAILED` | IndexedDB write failed | Retry, or use `session` |
+| `STORAGE_FAILED` | IndexedDB read or write failed (the key, or the stored limits) | Retry, or use `session` |
 | `MAINNET_WRITES_DISABLED` | The build doesn't allow mainnet writes | Configuration error |
 | `INTERNAL_ERROR` | Unexpected failure, or an outgoing message failed the safety check | Report |
 | Client only: `TIMEOUT`, `DESTROYED`, `HANDSHAKE_FAILED` | See §3 | For `signAndSubmit`: retry with the **same** `requestId` |
@@ -750,6 +807,8 @@ Denials come back as `POLICY_DENIED` with every violation, for example:
 - **Signing is serialized** per agent with the Web Locks API, across tabs. Nonces are reserved in an IndexedDB read-write transaction, which the browser runs one at a time across tabs. So two tabs can never use the same nonce, even without Web Locks. Without Web Locks, the arrival order at HL across tabs isn't guaranteed, which HL tolerates.
 - Create, confirm and revoke in one tab update the other tabs' frames through a `BroadcastChannel` notice (no key material). They emit `statusChanged`.
 - The per-minute rate and the daily notional are shared by all tabs.
+- So are the user's limits: stored per network, read again before each signature under the agent lock, and announced to
+  the other tabs (`statusChanged`) through the same BroadcastChannel.
 
 ## 10. Rules for the parent
 
@@ -758,7 +817,9 @@ Denials come back as `POLICY_DENIED` with every violation, for example:
 - Don't send prices, registries, nonces or builders; the frame ignores or rejects them. The ticket's own numbers are for display and risk estimates only.
 - The main wallet signs only readable typed data: `approveAgent`, `revokeAgent`, builder fee. **Never** an L1 action.
 - Never log or forward signatures, and never ask for a seed phrase.
-- Re-apply `setLimits` (the master's and each sub-account's) and `setTheme` after each `hello` and on `reconnected`.
+- Re-apply `setLimits` (the master's and each sub-account's) and `setTheme` after each `hello` and on `reconnected`. A frame
+  with `confirmsLooserLimits` stores the limits, so this is a no-op unless they differ; never loosen them silently in
+  the app either: show what the frame's prompt will ask.
 - Put `vaultAddress` on every intent for a sub-account (orders, cancels, modifies, leverage, margin, `scheduleCancel`):
   the account a request acts for is part of the signed hash.
 
