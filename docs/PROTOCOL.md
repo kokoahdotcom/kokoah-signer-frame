@@ -162,7 +162,8 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
     "passkey": { "available": true, "prf": "supported" },
     "webLocks": true,
     "indexedDB": true,
-    "broadcastChannel": true
+    "broadcastChannel": true,
+    "vaultTransfers": true
   },
   "builder": { "address": "0x…builder", "feeTenthsBps": 25 },
   "status": { "hasKey": true, "keyState": "active", "expiringSoon": true, "expired": false, "…": "SignerStatus, see getStatus" },
@@ -173,6 +174,8 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
 - **Required check:** compare `network` with the app's network and `builder` with `public-config`. **Refuse to trade on any mismatch** (FRONTEND_IMPLEMENTATION §B3.1, §B6.3).
 - `capabilities.passkey.available` is false when WebAuthn is missing or blocked in the frame, with a `reason`, for example `"WebAuthn is blocked by Permissions-Policy in the signer frame"`. `prf` is `"unknown"` when the browser can't say without a ceremony.
 - `storageModes` lists what can work here. Offer only those, in that order of preference.
+- `vaultTransfers` is true when the frame signs `hlpDeposit` and `vaultWithdraw` (absent in older frames): show HLP
+  deposits and vault withdrawals only then.
 - `status` is the frame's `SignerStatus` at the handshake (see `getStatus`), including the key's expiry state.
 - Errors: `UNSUPPORTED_VERSION`.
 

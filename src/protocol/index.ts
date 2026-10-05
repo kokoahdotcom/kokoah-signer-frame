@@ -260,6 +260,11 @@ export interface HelloResult {
     webLocks: boolean;
     indexedDB: boolean;
     broadcastChannel: boolean;
+    /**
+     * The frame signs `hlpDeposit` and `vaultWithdraw` account actions. Absent in frames built before them: the app
+     * shows HLP deposits and vault withdrawals only when this is true.
+     */
+    vaultTransfers?: boolean;
   };
   builder: { address: Hex; feeTenthsBps: number };
   /**

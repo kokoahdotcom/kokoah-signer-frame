@@ -645,6 +645,7 @@ export class FrameCore {
         webLocks: this.coordinator.usesWebLocks,
         indexedDB: this.deps.store.persistent,
         broadcastChannel: Boolean(this.deps.broadcast),
+        vaultTransfers: true,
       },
       builder: { address: this.config.builder.address, feeTenthsBps: this.config.builder.feeTenthsBps },
       status: this.status(),
