@@ -125,14 +125,15 @@ Post-build variables (not in the bundle):
   
   After deploying, run `monitor-deploy` from kokoah-infra against the signer domain.
 - **Vercel.** `kokoah-infra/vercel` builds the frame from its commit with the deployment's origins in `_headers`, serves those headers through the Build Output routes and checks the live headers after each deploy.
-- **Mainnet.** Set `VITE_HL_NETWORK=mainnet` **and** `VITE_ALLOW_MAINNET_WRITES=true`, the real builder and the real app origin, in the production pipeline only.
+- **Mainnet.** Set `VITE_HL_NETWORK=mainnet` **and** `VITE_ALLOW_MAINNET_WRITES=true`, the real builder and the real app origin, in the production pipeline only. On an origin that served testnet, a mainnet build ignores the testnet key and limits stored there (keys, limits, locks and broadcasts are per network): users create a new trading key. HLP deposits go to mainnet's HLP (`0xdfc24b077bc1425ad1dea75bcb6f8158e10df303`) within 10,000 USDC per deposit and 25,000 per 24 hours.
 
 ### Requested kokoah-infra changes
 
 These aren't in this repo's power; they are for the kokoah-infra owners.
 
 1. **Passkey mode needs WebAuthn on the signer origin. Done (2026-09-22).** kokoah-infra now sends `publickey-credentials-create=(self), publickey-credentials-get=(self)` on the signer, and the app delegates both to the signer origin (`(self "https://signer.kokoah.example")`). When replacing the placeholder domains, keep the app's delegation in sync with the real signer origin. `public/_headers` is identical to kokoah-infra's copy, and `pnpm build` fails if it drifts or disables WebAuthn again. `pnpm smoke:browser` serves the real header and verifies both states in Chromium: the full PRF flow with the signer's own headers, and the fallback when the app doesn't delegate WebAuthn.
-2. Chrome for Testing 153 logs "Unrecognized feature: 'bluetooth'" and "'browsing-topics'" for the signer `Permissions-Policy`. This is harmless, but noisy in the console.
+2. **Mainnet builds (2026-10-05).** `kokoah-infra/vercel/build.sh` builds testnet only and doesn't pass `VITE_ALLOW_MAINNET_WRITES`; a mainnet frame build needs `VITE_HL_NETWORK=mainnet` and `VITE_ALLOW_MAINNET_WRITES=true` (without the second, `vite build` fails by design).
+3. Chrome for Testing 153 logs "Unrecognized feature: 'bluetooth'" and "'browsing-topics'" for the signer `Permissions-Policy`. This is harmless, but noisy in the console.
 3. A staging signer needs its own `_headers` (staging `frame-ancestors`).
 
 ## Frontend integration (kokoah-frontend)
