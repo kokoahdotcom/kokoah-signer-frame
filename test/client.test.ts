@@ -102,7 +102,7 @@ describe("KokoahSignerClient", () => {
     await waitFor(() => statuses.length >= 5);
     off();
     const n = statuses.length;
-    await client.setLimits({});
+    await client.setLimits({ maxOrdersPerMinute: 4 });
     expect(statuses.length).toBe(n);
   });
 
@@ -183,10 +183,10 @@ describe("KokoahSignerClient", () => {
     expect(hellos).toHaveLength(2);
     expect(hellos[1]?.params).toEqual(hellos[0]?.params);
     expect(hellos[1]?.params).toEqual({ protocolVersion: 1, client: { name: "kokoah-frontend", version: "1.2.3" } });
-    // The new frame forgot the user limits (the app re-applies them on reconnected), but it answers again.
+    // The new frame keeps the user limits (stored on the signer origin) and answers again.
     const status = await client.getStatus();
     expect(status.agentAddress).toBe(created.agentAddress);
-    expect(status.policy.userLimits).toBeNull();
+    expect(status.policy.userLimits).toEqual({ maxOrdersPerMinute: 5 });
     expect(next.parent.posted.some((p) => p.message.kind === "response" && !p.message.ok)).toBe(false);
     // Listeners registered long before still get the events the new frame emits right after the new hello.
     expect(expiring).toHaveLength(1);

@@ -93,15 +93,19 @@ import {
   evaluateFramePolicy,
   hip3PinnedLegs,
   intentCoins,
+  type LimitChange,
+  limitChanges,
+  type LimitsSet,
   limitsForAccount,
   MAX_ACCOUNT_LIMITS,
   orderCount,
   policyForAccount,
   separateDailyAccounts,
+  storedUserLimits,
   summarizeFramePolicy,
 } from "./policy.js";
 import { applyTheme, invalidThemeVariables, PromptError, PromptUi, type ActionFailure, type PromptKind } from "./prompt.js";
-import type { SignerStore, StoredKeyRecord } from "./storage.js";
+import { limitsRev, limitsSlot, type SignerStore, type StoredKeyRecord, type StoredLimitsRecord } from "./storage.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** setTimeout's maximum delay. */
@@ -112,12 +116,15 @@ const MAX_REMEMBERED_REQUESTS = 1_000;
 /** Hyperliquid's app refuses a referral code after this much traded volume (USD). */
 const REFERRAL_MAX_VOLUME_USD = 10_000;
 
+/** Most attempts of one `setLimits` when other tabs keep writing the limits in between. */
+const MAX_LIMITS_ATTEMPTS = 5;
+
 /** Where the frame posts messages (`window.parent`). */
 export interface ParentLike {
   postMessage(message: unknown, targetOrigin: string): void;
 }
 
-/** A BroadcastChannel (same-origin tabs) used only for "the stored key changed" notices, never key material. */
+/** A BroadcastChannel (same-origin tabs) used only for "the stored key / limits changed" notices, never key material. */
 export interface BroadcastLike {
   postMessage(message: unknown): void;
   onmessage: ((ev: { data: unknown }) => void) | null;
@@ -164,6 +171,20 @@ interface LoadedKey {
   /** Null while locked. */
   account: PrivateKeyAccount | null;
   generation: number;
+}
+
+/** The user's limits (storage.ts `StoredLimitsRecord`), with the master's effective policy. */
+interface LimitsState extends LimitsSet {
+  /** The stored record's revision (0: none stored). */
+  rev: number;
+  accounts: Map<string, AccountLimits>;
+  /** The baseline with the master's limits on top. */
+  policy: Policy;
+}
+
+/** Compares the limits of two states, whatever their revisions. */
+function limitsKey(s: LimitsSet): string {
+  return stableStringify({ master: s.master, accounts: Object.fromEntries([...s.accounts].map(([a, l]) => [a, l.limits])) });
 }
 
 interface RequestEntry {
@@ -217,10 +238,14 @@ export class FrameCore {
   private readonly baseline: Policy;
   private readonly ui: PromptUi | null;
   private readonly instanceId: string;
-  private policy: Policy;
-  private userLimits: UserLimits | null = null;
-  /** Sub-accounts with their own limits (lowercase address → limits), applied on top of the master's. */
-  private readonly accountLimits = new Map<string, AccountLimits>();
+  /**
+   * The user's limits as last read from or written to the frame's storage: what `status()` reports. Signing reads the
+   * stored limits again under the agent lock, so a change made in another tab binds the next signature.
+   */
+  private limits: LimitsState;
+  /** Orders reads and writes of the limits, so an older read that finishes late can't replace a newer state. */
+  private limitsOrder = 0;
+  private limitsShownOrder = 0;
   /** The master's sub-accounts, read from HL by the frame itself (never from the parent). */
   private readonly subAccounts: SubAccountOwnership;
   private key: LoadedKey | null = null;
@@ -229,7 +254,11 @@ export class FrameCore {
   private clockOffsetMs = 0;
   private clockSyncedAt: number | null = null;
   private clockSync: Promise<void> | null = null;
-  private stateTail: Promise<void> = Promise.resolve();
+  /**
+   * Run one at a time: key-management operations (`state`); the compare-and-write steps of this tab's `setLimits`
+   * calls (`limits`, which every read of the limits waits for); their prompts (`limitsPrompt`).
+   */
+  private readonly tails: Record<"state" | "limits" | "limitsPrompt", Promise<void>> = { state: Promise.resolve(), limits: Promise.resolve(), limitsPrompt: Promise.resolve() };
   private readonly requests = new Map<string, RequestEntry>();
   private expiryTimer: ReturnType<typeof setTimeout> | undefined;
   private notifiedExpiringFor: string | null = null;
@@ -253,17 +282,18 @@ export class FrameCore {
     this.subAccounts = new SubAccountOwnership({ now: this.now, load: async (master) => await this.hl.info({ type: "subAccounts", user: master }) });
     this.coordinator = new SigningCoordinator({ store: deps.store, locks: deps.locks, lockPrefix: `kokoah-signer/v1/${this.config.network.name}` });
     this.baseline = createBaselinePolicy(this.config.builder, { spotCoins: this.market.stablecoinPairCoins, referralCode: this.config.referralCode });
-    this.policy = this.baseline;
+    this.limits = { rev: 0, master: null, accounts: new Map(), policy: this.baseline };
     this.instanceId = bytesToHex(randomBytes(deps.crypto, 8));
     const root = deps.uiRoot ?? deps.document?.body ?? null;
     this.ui = deps.document && root ? new PromptUi(deps.document, root, (visible, kind) => this.emit("promptChanged", { visible, kind })) : null;
     if (deps.broadcast) deps.broadcast.onmessage = (ev) => this.onBroadcast(ev.data);
   }
 
-  /** Creates the core and restores a stored key (device keys are unlocked, passkey keys stay locked). */
+  /** Creates the core and restores a stored key (device keys are unlocked, passkey keys stay locked) and the limits. */
   static async create(deps: FrameDeps): Promise<FrameCore> {
     const core = new FrameCore(deps);
     await core.restoreFromStore();
+    await core.refreshLimits();
     core.refreshIdleText();
     core.log("frame.started", { network: core.config.network.name, version: deps.frameVersion });
     return core;
@@ -332,6 +362,7 @@ export class FrameCore {
       case "hello":
         return (await this.hello(params as HelloParams, origin)) as MethodResults[M];
       case "getStatus":
+        await this.refreshLimits();
         return this.status() as MethodResults[M];
       case "createAgent":
         return (await this.createAgent(params as CreateAgentParams)) as MethodResults[M];
@@ -346,7 +377,7 @@ export class FrameCore {
       case "signAndSubmit":
         return (await this.signAndSubmit(params as SignAndSubmitParams)) as MethodResults[M];
       case "setLimits":
-        return this.setLimits(params as SetLimitsParams) as MethodResults[M];
+        return (await this.setLimits(params as SetLimitsParams)) as MethodResults[M];
       case "revoke":
         return (await this.revoke(params as RevokeParams)) as MethodResults[M];
       case "setTheme":
@@ -435,7 +466,7 @@ export class FrameCore {
       network: this.config.network.name,
       mainnetWritesEnabled: this.config.network.name === "mainnet" && this.config.network.allowMainnetWrites,
       clockOffsetMs: this.clockOffsetMs,
-      policy: summarizeFramePolicy(this.policy, this.userLimits, this.accountLimits, this.market.tradingPairCoins),
+      policy: summarizeFramePolicy(this.limits.policy, this.limits.master, this.limits.accounts, this.market.tradingPairCoins),
       metrics: { ...this.metrics },
     };
   }
@@ -456,9 +487,13 @@ export class FrameCore {
 
   /** Serializes key-management operations. */
   private async withState<T>(fn: () => Promise<T>): Promise<T> {
-    const prev = this.stateTail;
+    return await this.serialized("state", fn);
+  }
+
+  private async serialized<T>(queue: keyof FrameCore["tails"], fn: () => Promise<T>): Promise<T> {
+    const prev = this.tails[queue];
     let release!: () => void;
-    this.stateTail = new Promise<void>((r) => (release = r));
+    this.tails[queue] = new Promise<void>((r) => (release = r));
     await prev;
     try {
       return await fn();
@@ -474,9 +509,9 @@ export class FrameCore {
     this.notifiedExpiredFor = null;
   }
 
-  private notifyOtherTabs(): void {
+  private notifyOtherTabs(type: "keyChanged" | "limitsChanged" = "keyChanged"): void {
     try {
-      this.deps.broadcast?.postMessage({ type: "keyChanged", from: this.instanceId });
+      this.deps.broadcast?.postMessage({ type, from: this.instanceId });
     } catch {
       // Best effort.
     }
@@ -495,7 +530,12 @@ export class FrameCore {
   }
 
   private onBroadcast(data: unknown): void {
-    if (!isRecord(data) || data.type !== "keyChanged" || data.from === this.instanceId) return;
+    if (!isRecord(data) || data.from === this.instanceId) return;
+    if (data.type === "limitsChanged") {
+      void this.refreshLimits();
+      return;
+    }
+    if (data.type !== "keyChanged") return;
     void this.withState(async () => {
       if (this.key?.meta.storageMode === "session") return; // A tab-local session key is independent of storage.
       let rec: StoredKeyRecord | undefined;
@@ -629,6 +669,7 @@ export class FrameCore {
     }
     this.boundOrigin = origin;
     void this.syncClock();
+    await this.refreshLimits();
     const passkey = await this.passkeySupport();
     const storageModes: StorageMode[] = ["session"];
     if (this.deps.store.persistent) storageModes.unshift("device");
@@ -646,6 +687,7 @@ export class FrameCore {
         indexedDB: this.deps.store.persistent,
         broadcastChannel: Boolean(this.deps.broadcast),
         vaultTransfers: true,
+        confirmsLooserLimits: true,
       },
       builder: { address: this.config.builder.address, feeTenthsBps: this.config.builder.feeTenthsBps },
       status: this.status(),
@@ -1215,33 +1257,190 @@ export class FrameCore {
   }
 
   // -------------------------------------------------------------------------------------------
-  // setLimits / setTheme
+  // Limits
   // -------------------------------------------------------------------------------------------
 
-  private setLimits(p: SetLimitsParams): SetLimitsResult {
+  /**
+   * The state for a stored record. Each account's limits are checked again against this build's baseline; a field that
+   * no longer fits is dropped, so the baseline's own, stricter value applies.
+   */
+  private limitsState(rec: StoredLimitsRecord | undefined): LimitsState {
+    const rev = limitsRev(rec);
+    const valid = isRecord(rec) && rec.network === this.config.network.name;
+    const accounts = new Map<string, AccountLimits>();
+    if (valid && isRecord(rec.accounts)) {
+      for (const [address, raw] of Object.entries(rec.accounts)) {
+        const limits = /^0x[0-9a-f]{40}$/.test(address) ? storedUserLimits(this.baseline, raw) : null;
+        if (limits !== null && accounts.size < MAX_ACCOUNT_LIMITS) accounts.set(address, { limits });
+      }
+    }
+    return this.withPolicy(rev, valid ? storedUserLimits(this.baseline, rec.master) : null, accounts);
+  }
+
+  private withPolicy(rev: number, master: UserLimits | null, accounts: Map<string, AccountLimits>): LimitsState {
+    const r = applyUserLimits(this.baseline, master ?? {}, { tradingCoins: this.market.tradingPairCoins });
+    // Never: stored limits are checked against the baseline when they are read and before they are written.
+    if (!r.ok) throw new Error("limits outside the baseline");
+    return { rev, master, accounts, policy: r.policy };
+  }
+
+  /**
+   * Reads the user's limits from storage (another tab may have changed them) and reports them in `status()`, once this
+   * tab's `setLimits` calls received so far have compared and written theirs (a prompt waiting for the user doesn't
+   * hold them up), so a request sent after a tightening sees it. A read that fails throws STORAGE_FAILED: the frame
+   * signs nothing on limits it can't read.
+   */
+  private async readLimits(): Promise<LimitsState> {
+    await this.tails.limits;
+    return await this.readStoredLimits();
+  }
+
+  /** `readLimits` without waiting for this tab's `setLimits` calls (used inside them). */
+  private async readStoredLimits(): Promise<LimitsState> {
+    const order = ++this.limitsOrder;
+    let rec: StoredLimitsRecord | undefined;
+    try {
+      rec = await this.deps.store.getLimits(this.config.network.name);
+    } catch {
+      throw new SignerFailure("STORAGE_FAILED", "Your limits could not be read on this device; nothing was changed or signed.", { retryable: true });
+    }
+    const state = this.limitsState(rec);
+    this.showLimits(state, order);
+    return state;
+  }
+
+  /** `readLimits` for `status()` only: when the read fails, the status keeps the limits last read. */
+  private async refreshLimits(): Promise<void> {
+    try {
+      await this.readLimits();
+    } catch {
+      // Signing reads them again and fails closed.
+    }
+  }
+
+  /** Makes `state` what `status()` reports, unless a newer read or write already did; emits statusChanged on a change. */
+  private showLimits(state: LimitsState, order: number): void {
+    if (order <= this.limitsShownOrder) return;
+    this.limitsShownOrder = order;
+    const changed = limitsKey(state) !== limitsKey(this.limits);
+    this.limits = state;
+    if (changed) this.emit("statusChanged", this.status());
+  }
+
+  /**
+   * Sets the master's or a sub-account's limits. They are stored on the signer origin, per network: they hold across
+   * reloads and in every tab, with or without a key. Each value is checked against the baseline first; then the
+   * change is compared with the limits stored now ({@link limitChanges}):
+   * - identical limits change nothing (the app sends them again at every handshake);
+   * - a change that only tightens is applied at once;
+   * - anything that loosens is applied only after the user's click on the frame's own prompt, which lists every change.
+   *   Cancel or timeout: USER_CANCELLED / USER_TIMEOUT, and nothing changes. A second loosening in this tab waits for
+   *   the first prompt to close, then compares again and shows its own.
+   * The write is a compare-and-set on the stored revision. If another tab changed the limits meanwhile, the change is
+   * compared again with the new limits; a loosening the user confirmed against older limits is refused (SIGNER_BUSY,
+   * retryable) rather than applied to limits the prompt didn't show.
+   */
+  private async setLimits(p: SetLimitsParams): Promise<SetLimitsResult> {
     const { account, ...limits } = p;
     // Sub-account limits belong to a key's user: without a key there is no master to tell a sub-account from (limits
     // meant for the master would be stored as a sub-account's, and the master would trade on the baseline).
     if (account !== undefined && !this.key) throw new SignerFailure("NO_KEY", "Create or unlock a trading key before setting an account's limits.");
     const r = applyUserLimits(this.baseline, limits, { tradingCoins: this.market.tradingPairCoins });
     if (!r.ok) throw new SignerFailure("LIMIT_LOOSENING_REJECTED", r.message, { details: { fields: r.fields } });
-    const sub = account?.toLowerCase();
-    if (sub === undefined || sub === this.key?.meta.userAddress.toLowerCase()) {
-      this.policy = r.policy;
-      this.userLimits = r.limits;
-    } else if (r.limits === null) {
-      // `{ account }` alone: the sub-account uses the master's limits again.
-      this.accountLimits.delete(sub);
-    } else {
-      if (!this.accountLimits.has(sub) && this.accountLimits.size >= MAX_ACCOUNT_LIMITS) {
-        throw new SignerFailure("INVALID_REQUEST", `At most ${MAX_ACCOUNT_LIMITS} sub-accounts can have their own limits.`);
+    const lower = account?.toLowerCase();
+    const sub = lower === undefined || lower === this.key?.meta.userAddress.toLowerCase() ? undefined : lower;
+    const whose = sub === undefined ? "your limits" : `the limits of sub-account ${sub.slice(0, 6)}…${sub.slice(-4)}`;
+    let confirmedRev: number | undefined;
+    for (let attempt = 0; attempt < MAX_LIMITS_ATTEMPTS; attempt++) {
+      const step = await this.serialized("limits", () => this.limitsStep(sub, r.limits, confirmedRev));
+      if (step.kind === "done") return { policy: summarizeFramePolicy(this.limits.policy, this.limits.master, this.limits.accounts, this.market.tradingPairCoins) };
+      if (step.kind === "confirm") {
+        // One limits prompt at a time in this tab; the limits may have changed while this one waited for its turn.
+        confirmedRev = await this.serialized("limitsPrompt", async () => {
+          if ((await this.readLimits()).rev !== step.before.rev) return undefined;
+          await this.prompt(
+            "limits",
+            {
+              title: "Loosen your trading limits?",
+              body: `The Kokoah app asks to change ${whose} on this device. Confirm only if you asked for this.\n\n${step.changes.map((c) => c.text).join("\n")}`,
+              actionLabel: "Loosen limits",
+              fixedStyle: true,
+            },
+            async () => undefined,
+          );
+          return step.before.rev;
+        });
       }
-      // Checked against the baseline above; at signing they apply on top of the master's limits of that moment.
-      this.accountLimits.set(sub, { limits: r.limits });
+      // Otherwise another tab wrote first, or changed the limits while this prompt waited: compare again.
     }
-    this.statusChanged();
-    return { policy: summarizeFramePolicy(this.policy, this.userLimits, this.accountLimits, this.market.tradingPairCoins) };
+    throw new SignerFailure("SIGNER_BUSY", "Your limits kept changing in another tab; nothing was changed. Try again.", { retryable: true });
   }
+
+  /**
+   * One attempt of `setLimits`, in this tab's limits queue: compares the new limits of the account with the stored
+   * ones, then writes them (identical: nothing to write) or asks for the user's confirmation (`confirm`). `confirmedRev`:
+   * the revision the user confirmed a loosening against, if any. `retry`: another tab wrote first.
+   */
+  private async limitsStep(
+    sub: string | undefined,
+    limits: UserLimits | null,
+    confirmedRev: number | undefined,
+  ): Promise<{ kind: "done" | "retry" } | { kind: "confirm"; before: LimitsState; changes: LimitChange[] }> {
+    const before = await this.readStoredLimits();
+    const accounts = new Map(before.accounts);
+    if (sub !== undefined) {
+      if (limits === null) {
+        // `{ account }` alone: the sub-account uses the master's limits again.
+        accounts.delete(sub);
+      } else {
+        if (!accounts.has(sub) && accounts.size >= MAX_ACCOUNT_LIMITS) {
+          throw new SignerFailure("INVALID_REQUEST", `At most ${MAX_ACCOUNT_LIMITS} sub-accounts can have their own limits.`);
+        }
+        // Checked against the baseline; at signing they apply on top of the master's limits of that moment.
+        accounts.set(sub, { limits });
+      }
+    }
+    const after = this.withPolicy(before.rev + 1, sub === undefined ? limits : before.master, accounts);
+    if (limitsKey(after) === limitsKey(before)) return { kind: "done" };
+    const changes = limitChanges(this.baseline, before, after, sub);
+    const looser = changes.filter((c) => c.looser);
+    if (looser.length > 0 && confirmedRev !== before.rev) {
+      if (confirmedRev !== undefined) {
+        throw new SignerFailure("SIGNER_BUSY", "Your limits changed in another tab while you were confirming; nothing was changed. Try again.", { retryable: true });
+      }
+      if (!this.ui) {
+        throw new SignerFailure("LIMIT_LOOSENING_REJECTED", "Loosening your limits needs a click in the signer frame, which has no user interface here.", {
+          details: { fields: looser.map((c) => c.field) },
+        });
+      }
+      return { kind: "confirm", before, changes };
+    }
+    const network = this.config.network.name;
+    const record: StoredLimitsRecord = {
+      slot: limitsSlot(network),
+      v: 1,
+      network,
+      rev: after.rev,
+      master: after.master,
+      accounts: Object.fromEntries([...after.accounts].map(([a, l]) => [a, l.limits])),
+      updatedAt: this.now(),
+    };
+    let written: boolean;
+    try {
+      written = await this.deps.store.replaceLimits(record, before.rev);
+    } catch {
+      throw new SignerFailure("STORAGE_FAILED", "Your limits could not be stored on this device; nothing was changed.", { retryable: true });
+    }
+    if (!written) return { kind: "retry" };
+    this.showLimits(after, ++this.limitsOrder);
+    this.log("limits.changed", { reason: looser.length > 0 ? "confirmed" : "tightened", count: changes.length });
+    this.notifyOtherTabs("limitsChanged");
+    return { kind: "done" };
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // setTheme
+  // -------------------------------------------------------------------------------------------
 
   private setTheme(p: SetThemeParams): SetThemeResult {
     const bad = invalidThemeVariables(p);
@@ -1326,8 +1525,8 @@ export class FrameCore {
       }
     }
     const account = vault ?? master;
-    const accountPolicy = policyForAccount(this.policy, this.accountLimits, vault, this.market.tradingPairCoins);
-    const accountLimits = limitsForAccount(this.userLimits, this.accountLimits, vault);
+    // The user's limits as stored now; read again under the agent lock below.
+    const stored = await this.readLimits();
 
     // 2. The frame's own clock, market metadata and prices.
     await this.ensureClock();
@@ -1372,22 +1571,10 @@ export class FrameCore {
       if (problem !== undefined) throw new SignerFailure("UNSUPPORTED_MARKET", problem);
     }
 
-    // 4. The user's current leverage, only needed when the parent tightened maxLeverage below the market maximum.
-    let leverageByCoin: Record<string, number> | undefined;
+    // 4. The user's current leverage, only needed when the user tightened maxLeverage below the market maximum.
     const opensExposure = (intent.kind === "order" && !intent.reduceOnly) || (intent.kind === "modify" && !intent.order.reduceOnly);
-    if (accountLimits?.maxLeverage !== undefined && opensExposure) {
-      leverageByCoin = {};
-      // Spot has no leverage: spot pairs are skipped.
-      for (const coin of coins.filter((c) => snapshot.registry.get(c)?.kind !== "spot")) {
-        let lev: number | undefined;
-        try {
-          lev = await this.market.leverageFor(account, coin);
-        } catch {
-          throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Could not read the account's leverage from Hyperliquid; try again shortly.", { retryable: true });
-        }
-        if (lev !== undefined) leverageByCoin[coin] = lev;
-      }
-    }
+    const needsLeverage = (limits: LimitsState) => opensExposure && limitsForAccount(limits.master, limits.accounts, vault)?.maxLeverage !== undefined;
+    let leverageByCoin = needsLeverage(stored) ? await this.accountLeverage(account, coins, snapshot) : undefined;
 
     const agent = key.meta.agentAddress;
     const generation = key.generation;
@@ -1399,11 +1586,15 @@ export class FrameCore {
       if (!current || current.generation !== generation || !current.account) {
         throw new SignerFailure("KEY_CHANGED", "The trading key changed or was locked before signing.", { retryable: true });
       }
+      // The user's limits again, under the lock: a change made in another tab since binds this signature.
+      const limits = await this.readLimits();
+      if (leverageByCoin === undefined && needsLeverage(limits)) leverageByCoin = await this.accountLeverage(account, coins, snapshot);
+      const accountPolicy = policyForAccount(limits.policy, limits.accounts, vault, this.market.tradingPairCoins);
       const now = this.correctedNow();
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
       const expiresAfter = now + EXPIRES_AFTER_MS;
       // Sub-accounts without a daily limit of their own share the master's daily limit and counter.
-      const usageAccount = { account, master, separate: separateDailyAccounts(this.accountLimits) };
+      const usageAccount = { account, master, separate: separateDailyAccounts(limits.accounts) };
       const usage = await this.coordinator.usage(agent, now, usageAccount);
       const decision = evaluateFramePolicy({
         compiled,
@@ -1543,7 +1734,9 @@ export class FrameCore {
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
       const expiresAfter = now + EXPIRES_AFTER_MS;
       const referrer = intent.kind === "setReferrer" ? { alreadyReferred, signedBefore: await this.coordinator.referrerSigned(agent) } : undefined;
-      const decision = evaluateFrameAccountPolicy({ compiled, expiresAfter, now, policy: this.policy, ...(referrer ? { referrer } : {}) });
+      // The master's limits as stored now (another tab may have changed them).
+      const { policy } = await this.readLimits();
+      const decision = evaluateFrameAccountPolicy({ compiled, expiresAfter, now, policy, ...(referrer ? { referrer } : {}) });
       if (!decision.allowed) {
         this.metrics.policyDenials++;
         this.log("sign.denied", { actionType: decision.actionType, codes: decision.violations.map((v) => v.code).join(",") });
@@ -1630,9 +1823,9 @@ export class FrameCore {
       const equity = isRecord(held) ? Number(held.equity) : undefined;
       return { network, ...(equity !== undefined && Number.isFinite(equity) ? { heldEquityUsd: equity } : {}) };
     };
-    const decide = (now: number, vault: Awaited<ReturnType<typeof facts>>) => {
+    const decide = (now: number, vault: Awaited<ReturnType<typeof facts>>, policy: Policy) => {
       const expiresAfter = now + EXPIRES_AFTER_MS;
-      const decision = evaluateFrameAccountPolicy({ compiled, expiresAfter, now, policy: this.policy, vault });
+      const decision = evaluateFrameAccountPolicy({ compiled, expiresAfter, now, policy, vault });
       if (!decision.allowed) {
         this.metrics.policyDenials++;
         this.log("sign.denied", { actionType: decision.actionType, codes: decision.violations.map((v) => v.code).join(",") });
@@ -1642,7 +1835,7 @@ export class FrameCore {
     };
 
     // Checked before asking, so the user is never asked to confirm something the rules refuse.
-    decide(this.correctedNow(), await facts(this.correctedNow()));
+    decide(this.correctedNow(), await facts(this.correctedNow()), (await this.readLimits()).policy);
     if (action.isDeposit) {
       await this.prompt(
         "vault-deposit",
@@ -1667,8 +1860,8 @@ export class FrameCore {
       }
       const now = this.correctedNow();
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
-      // Read again under the lock: another tab or device may have deposited while the prompt was open.
-      const { decision, expiresAfter } = decide(now, await facts(now));
+      // Read again under the lock: another tab or device may have deposited, or changed the limits, while the prompt was open.
+      const { decision, expiresAfter } = decide(now, await facts(now), (await this.readLimits()).policy);
 
       let nonce: number;
       try {
@@ -1700,6 +1893,21 @@ export class FrameCore {
       if (result.error && (result.error.code === "INVALID_NONCE" || result.error.code === "ACTION_EXPIRED")) void this.syncClock();
       return result;
     });
+  }
+
+  /** The account's current leverage on HL for the perp coins of an action (spot has none), read by the frame itself. */
+  private async accountLeverage(account: Hex, coins: readonly string[], snapshot: MarketSnapshot): Promise<Record<string, number>> {
+    const leverage: Record<string, number> = {};
+    for (const coin of coins.filter((c) => snapshot.registry.get(c)?.kind !== "spot")) {
+      let lev: number | undefined;
+      try {
+        lev = await this.market.leverageFor(account, coin);
+      } catch {
+        throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Could not read the account's leverage from Hyperliquid; try again shortly.", { retryable: true });
+      }
+      if (lev !== undefined) leverage[coin] = lev;
+    }
+    return leverage;
   }
 
   /** An HL `/info` read by the frame itself; a failed read signs nothing (`MARKET_DATA_UNAVAILABLE`, retryable). */

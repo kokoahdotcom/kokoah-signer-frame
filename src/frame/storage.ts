@@ -3,14 +3,16 @@
  * unavailable (then only `session` keys are possible).
  *
  * Object stores:
- * - `keys` (key `slot`): the encrypted agent key record (`device` and `passkey` modes). Never plaintext.
+ * - `keys` (key `slot`): the encrypted agent key record (`device` and `passkey` modes; slot `current`). Never
+ *   plaintext. Also the user's limits for each network (slot `limits/<network>`, see {@link StoredLimitsRecord}): kept
+ *   in this store so the schema version stays 1 and an older frame build still opens the database.
  * - `usage` (key `agent`): last nonce, recent order times and today's notional, per agent address. Updated in a single
  *   `readwrite` transaction per signature, which IndexedDB serializes across tabs of the origin.
  * - `agents` (key `address`): every agent address this origin ever generated, so an address is never reused.
  *
  * @module
  */
-import type { NetworkName } from "../protocol/index.js";
+import type { NetworkName, UserLimits } from "../protocol/index.js";
 
 export const DB_NAME = "kokoah-signer";
 export const DB_VERSION = 1;
@@ -44,6 +46,28 @@ export interface StoredKeyRecord {
   deviceKey?: CryptoKey;
   /** Passkey mode: what is needed to re-derive the wrapping key with a WebAuthn PRF assertion. */
   passkey?: { credentialId: Uint8Array; prfSalt: Uint8Array; hkdfSalt: Uint8Array; rpId: string };
+}
+
+/**
+ * The user's limits on one network (`setLimits`), stored on the signer origin so the parent can't drop them by
+ * reloading the frame. Per network, not per key or wallet: they exist before a key does and outlive it.
+ */
+export interface StoredLimitsRecord {
+  slot: `limits/${NetworkName}`;
+  v: 1;
+  network: NetworkName;
+  /** Bumped by every write; a write based on an older read is refused (see {@link SignerStore.replaceLimits}). */
+  rev: number;
+  /** The master's limits (null: the baseline). */
+  master: UserLimits | null;
+  /** Sub-accounts' own limits, by lowercase address. */
+  accounts: Record<string, UserLimits>;
+  updatedAt: number;
+}
+
+/** Slot of a network's limits record in the `keys` store. */
+export function limitsSlot(network: NetworkName): StoredLimitsRecord["slot"] {
+  return `limits/${network}`;
 }
 
 /** Per-agent usage and nonce state. */
@@ -87,6 +111,12 @@ export interface SignerStore {
    * `lastNonce`.
    */
   updateUsage(agent: string, update: (previous: UsageRecord | undefined) => UsageRecord): Promise<UsageRecord>;
+  getLimits(network: NetworkName): Promise<StoredLimitsRecord | undefined>;
+  /**
+   * Writes `record` only while the stored record's `rev` is still `expectedRev` (0: none stored), in one `readwrite`
+   * transaction (serialized across tabs). Returns false, writing nothing, when another write came first.
+   */
+  replaceLimits(record: StoredLimitsRecord, expectedRev: number): Promise<boolean>;
 }
 
 function req<T>(r: IDBRequest<T>): Promise<T> {
@@ -193,6 +223,31 @@ export class IdbSignerStore implements SignerStore {
     if (next === undefined) throw new Error("usage update produced nothing");
     return next;
   }
+
+  async getLimits(network: NetworkName): Promise<StoredLimitsRecord | undefined> {
+    const tx = this.db.transaction(KEYS, "readonly");
+    return (await req(tx.objectStore(KEYS).get(limitsSlot(network)))) as StoredLimitsRecord | undefined;
+  }
+
+  async replaceLimits(record: StoredLimitsRecord, expectedRev: number): Promise<boolean> {
+    const tx = this.db.transaction(KEYS, "readwrite");
+    const store = tx.objectStore(KEYS);
+    let written = false;
+    const get = store.get(record.slot);
+    get.onsuccess = () => {
+      if (limitsRev(get.result) !== expectedRev) return;
+      store.put(record);
+      written = true;
+    };
+    await done(tx);
+    return written;
+  }
+}
+
+/** A stored limits record's revision (0: none, or unreadable). */
+export function limitsRev(record: unknown): number {
+  const rev = (record as { rev?: unknown } | undefined)?.rev;
+  return typeof rev === "number" && Number.isSafeInteger(rev) && rev > 0 ? rev : 0;
 }
 
 /** In-memory fallback (nothing survives a reload; nothing is shared across tabs). */
@@ -201,6 +256,7 @@ export class MemorySignerStore implements SignerStore {
   private record: StoredKeyRecord | undefined;
   private readonly usage = new Map<string, UsageRecord>();
   private readonly agents = new Set<string>();
+  private readonly limits = new Map<string, StoredLimitsRecord>();
 
   async getKeyRecord(): Promise<StoredKeyRecord | undefined> {
     return this.record;
@@ -226,6 +282,15 @@ export class MemorySignerStore implements SignerStore {
     const next = { ...update(this.usage.get(key)), agent: key };
     this.usage.set(key, next);
     return structuredClone(next);
+  }
+  async getLimits(network: NetworkName): Promise<StoredLimitsRecord | undefined> {
+    const r = this.limits.get(network);
+    return r === undefined ? undefined : structuredClone(r);
+  }
+  async replaceLimits(record: StoredLimitsRecord, expectedRev: number): Promise<boolean> {
+    if (limitsRev(this.limits.get(record.network)) !== expectedRev) return false;
+    this.limits.set(record.network, structuredClone(record));
+    return true;
   }
 }
 

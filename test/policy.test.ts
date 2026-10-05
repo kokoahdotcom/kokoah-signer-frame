@@ -236,8 +236,8 @@ describe("setLimits", () => {
     expect(lev.details?.violations?.map((v) => v.code)).toContain("ACTION_TYPE_NOT_ALLOWED");
     expect((await h.ok("signAndSubmit", { requestId: "ok", intent: limitOrder({ size: "0.05", stopLoss: { triggerPrice: "1990" } }) })).status).toBe("ok");
 
-    // {} resets to the baseline.
-    const reset = await h.ok("setLimits", {});
+    // {} resets to the baseline, after the user's click in the frame.
+    const reset = await h.loosen({});
     expect(reset.policy.userLimits).toBeNull();
     expect(reset.policy.maxOrderNotionalUsd).toBe(1_000_000);
   });

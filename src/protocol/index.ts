@@ -142,7 +142,7 @@ export interface PasskeySupport {
   reason?: string;
 }
 
-/** The effective limits the frame enforces (baseline tightened by `setLimits`). */
+/** The effective limits the frame enforces (the baseline, tightened by the user's limits stored in the frame). */
 export interface PolicySummary {
   allowedActionTypes: AllowedActionType[];
   allowedCoins: "*" | string[];
@@ -188,11 +188,11 @@ export interface PolicySummary {
    * carry (signed at most once per account). Null: `setReferrer` is denied.
    */
   referralCode: string | null;
-  /** The master account's limits last applied with `setLimits` (null: baseline only). */
+  /** The master account's limits, as stored in the frame for this network (null: baseline only). */
   userLimits: UserLimits | null;
   /**
-   * Sub-accounts with their own limits (`setLimits` with `account`), as set. They apply on top of `userLimits`: a field
-   * left out keeps the master's value. Any other sub-account uses `userLimits`.
+   * Sub-accounts with their own limits (`setLimits` with `account`), as stored. They apply on top of `userLimits`: a
+   * field left out keeps the master's value. Any other sub-account uses `userLimits`.
    */
   accountLimits: Record<Hex, UserLimits>;
 }
@@ -265,6 +265,13 @@ export interface HelloResult {
      * shows HLP deposits and vault withdrawals only when this is true.
      */
     vaultTransfers?: boolean;
+    /**
+     * The frame stores the user's limits itself (per network, across reloads and tabs) and applies a `setLimits` that
+     * loosens them only after the user's click on its own prompt (`promptChanged` kind `limits`); tightening and
+     * identical limits apply without one. Absent in older frames, which keep limits in memory and refuse nothing below
+     * the baseline: there, tell the user nothing about confirming in the signer window.
+     */
+    confirmsLooserLimits?: boolean;
   };
   builder: { address: Hex; feeTenthsBps: number };
   /**
@@ -428,7 +435,10 @@ export interface SignAndSubmitResult {
   replayed: boolean;
 }
 
-/** Limits the parent may set. Each value must be at least as strict as the frame's baseline. */
+/**
+ * Limits the parent may set. Each value must be at least as strict as the frame's baseline. The frame stores them (see
+ * {@link SetLimitsParams}); loosening the stored ones needs the user's click in the frame.
+ */
 export interface UserLimits {
   maxOrderNotionalUsd?: number;
   maxDailyNotionalUsd?: number;
@@ -445,7 +455,7 @@ export interface UserLimits {
   /**
    * `true` turns spot trading on (off by default, so omitting it or `{}` turns it off): market orders and IOC, GTC and
    * post-only limits on the pairs in `PolicySummary.spotTradingCoins`, for the master account only. It unlocks nothing
-   * beyond the frame's baseline; like every limit, the parent re-applies it after each load.
+   * beyond the frame's baseline; it is stored with the other limits, and turning it on is a loosening.
    */
   spotTrading?: boolean;
 }
@@ -456,6 +466,14 @@ export interface UserLimits {
  * each field left out keeps the master's. A sub-account has a daily counter of its own only when its own limits set
  * `maxDailyNotionalUsd`; otherwise it shares the master's. `{ account }` alone removes them, so the sub-account uses
  * the master's again.
+ *
+ * The frame stores the limits on its own origin, per network (not per wallet): they survive reloads, bind every tab
+ * and need no key (except a sub-account's, which needs the key's master). Compared with the stored limits, identical
+ * limits change nothing, a change that only tightens applies at once, and a change that loosens anything (a higher
+ * number, a field removed, `{}`, spot trading on, more coins or action types, the stop-loss rule off, a sub-account
+ * falling back to looser master limits or getting a daily counter of its own) waits for the user's click on the
+ * frame's prompt (`promptChanged` kind `limits`, up to 120 s); cancel or timeout change nothing
+ * (`USER_CANCELLED` / `USER_TIMEOUT`).
  */
 export type SetLimitsParams = UserLimits & {
   /** A sub-account of the key's master. Omit for the master account. */
@@ -587,7 +605,7 @@ export interface SignerError {
     issues?: Array<{ message: string; path?: string }>;
     /** COMPILE_FAILED: the `CompileError` code. */
     compileCode?: string;
-    /** LIMIT_LOOSENING_REJECTED: the fields that would loosen the baseline. */
+    /** LIMIT_LOOSENING_REJECTED: the fields that would loosen the baseline (or the stored limits, in a frame with no UI). */
     fields?: string[];
     /** Anything else worth showing (never secrets). */
     [key: string]: unknown;
@@ -608,7 +626,7 @@ export interface EventData {
   /** The key has expired; the frame refuses to sign with it. */
   keyExpired: { agentAddress: Hex; validUntil: number };
   /** The frame needs (or no longer needs) the user to click inside it. Show the iframe while `visible` is true. */
-  promptChanged: { visible: boolean; kind: "passkey-create" | "passkey-unlock" | "vault-deposit" | null };
+  promptChanged: { visible: boolean; kind: "passkey-create" | "passkey-unlock" | "vault-deposit" | "limits" | null };
 }
 
 // ---------------------------------------------------------------------------------------------

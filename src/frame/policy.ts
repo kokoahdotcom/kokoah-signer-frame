@@ -21,7 +21,9 @@
  * top of the master's (a field the sub-account leaves out keeps the master's value; without limits of its own it uses
  * the master's). Orders per minute are counted per agent across accounts. Daily notional is counted per agent for the
  * baseline cap, and for personal limits once for the master and every sub-account without a daily limit of its own
- * (they share the master's), and separately for each sub-account that sets `maxDailyNotionalUsd`.
+ * (they share the master's), and separately for each sub-account that sets `maxDailyNotionalUsd`. The frame stores
+ * them itself (`core.ts`); {@link limitChanges} tells a tightening, applied silently, from a loosening, which needs the
+ * user's click in the frame.
  *
  * Spot, for the master account only:
  * - Convert stablecoins (PHASE3 REV): orders only on the pinned stablecoin/USDC pairs of the frame's network
@@ -45,7 +47,9 @@ import type { ActionIntent } from "@kokoah/shared/intents";
 import type { MarketRegistry } from "@kokoah/shared/markets";
 import { vaultTransferProblems } from "@kokoah/shared/vaults";
 import { createManualTradingPolicy, evaluatePolicy, parsePolicy, type Policy, type PolicyViolation, spotOrderVolumeProblem } from "@kokoah/shared/policy";
+import * as v from "valibot";
 import { BASELINE_ACTION_TYPES, EXPIRES_AFTER_MS, type AllowedActionType, type PolicySummary, type UserLimits } from "../protocol/index.js";
+import { PARAMS_SCHEMAS } from "./messages.js";
 
 /** Leverage value meaning "no global cap; each market's own maximum applies". */
 export const NO_GLOBAL_LEVERAGE_CAP = 1000;
@@ -201,6 +205,97 @@ export function limitsForAccount(masterLimits: UserLimits | null, accountLimits:
  */
 export function separateDailyAccounts(accountLimits: ReadonlyMap<string, AccountLimits>): string[] {
   return [...accountLimits].filter(([, a]) => a.limits.maxDailyNotionalUsd !== undefined).map(([account]) => account.toLowerCase());
+}
+
+/**
+ * Limits read back from the frame's storage, checked again as if the parent had sent them: a field that no longer
+ * parses or no longer fits this build's baseline (a later build may have tightened it) is dropped, so the baseline's
+ * own, stricter value applies. Action types this build doesn't know are left out of `allowedActionTypes`.
+ */
+export function storedUserLimits(baseline: Policy, raw: unknown): UserLimits | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const parsed: UserLimits = {};
+  for (const [field, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (field === "account") continue;
+    const known = field === "allowedActionTypes" && Array.isArray(value) ? value.filter((t) => (BASELINE_ACTION_TYPES as readonly unknown[]).includes(t)) : value;
+    const one = v.safeParse(PARAMS_SCHEMAS.setLimits, { [field]: known });
+    if (one.success) Object.assign(parsed, one.output);
+  }
+  let r = applyUserLimits(baseline, parsed);
+  if (!r.ok) {
+    for (const field of r.fields) delete parsed[field as keyof UserLimits];
+    r = applyUserLimits(baseline, parsed);
+  }
+  return r.ok ? r.limits : null;
+}
+
+/** The user's limits as the frame keeps them: the master's, and each sub-account's own (lowercase address). */
+export interface LimitsSet {
+  master: UserLimits | null;
+  accounts: ReadonlyMap<string, AccountLimits>;
+}
+
+/** One difference {@link limitChanges} found, in plain words for the frame's prompt. */
+export interface LimitChange {
+  field: keyof UserLimits;
+  /** E.g. `Largest order: $100 → $5,000`. */
+  text: string;
+  /** True when the account may do more than before. */
+  looser: boolean;
+}
+
+const usd = (n: number): string => `$${n.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
+
+function names(items: readonly string[]): string {
+  return items.length > 6 ? `${items.slice(0, 6).join(", ")} and ${items.length - 6} more` : items.join(", ");
+}
+
+/**
+ * What changes for one account (`subAccount`, or the master when undefined) between the limits in force `before` and
+ * `after` a `setLimits`, compared on effective values: the account's own field, else the master's (for a sub-account),
+ * else the baseline's. Anything that lets the account do more is `looser`: a higher number, a field removed (the
+ * baseline or the master's looser value applies again), more markets or action types, spot trading on, the stop-loss
+ * requirement off. A sub-account that gets a daily counter of its own while the master has a daily limit is looser
+ * too, whatever the number: its trading no longer uses up the master's limit, so the day's total can grow by it.
+ */
+export function limitChanges(baseline: Policy, before: LimitsSet, after: LimitsSet, subAccount?: string): LimitChange[] {
+  const sub = subAccount?.toLowerCase();
+  const b = limitsForAccount(before.master, before.accounts, sub) ?? {};
+  const a = limitsForAccount(after.master, after.accounts, sub) ?? {};
+  const changes: LimitChange[] = [];
+  const add = (field: keyof UserLimits, label: string, from: string, to: string, looser: boolean) => {
+    if (from !== to) changes.push({ field, text: `${label}: ${from} → ${to}`, looser });
+  };
+  const number = (field: "maxOrderNotionalUsd" | "maxDailyNotionalUsd" | "maxLeverage" | "maxOrdersPerMinute" | "priceBandPct", label: string, show: (n: number) => string) => {
+    const from = b[field] ?? baseline[field];
+    const to = a[field] ?? baseline[field];
+    if (from !== to) add(field, label, show(from), show(to), to > from);
+  };
+  number("maxOrderNotionalUsd", "Largest order", usd);
+  const ownDailyBefore = sub === undefined ? undefined : before.accounts.get(sub)?.limits.maxDailyNotionalUsd;
+  const ownDailyAfter = sub === undefined ? undefined : after.accounts.get(sub)?.limits.maxDailyNotionalUsd;
+  const sharedDaily = after.master?.maxDailyNotionalUsd;
+  if (ownDailyBefore === undefined && ownDailyAfter !== undefined && sharedDaily !== undefined) {
+    add("maxDailyNotionalUsd", "Trading per day", `${usd(sharedDaily)} shared with the main account`, `${usd(ownDailyAfter)} of its own, on top of the main account's`, true);
+  } else number("maxDailyNotionalUsd", "Trading per day", usd);
+  number("maxLeverage", "Leverage", (n) => (n >= NO_GLOBAL_LEVERAGE_CAP ? "each market's maximum" : `up to ${n}x`));
+  number("maxOrdersPerMinute", "Orders per minute", String);
+  number("priceBandPct", "Price distance from the market", (n) => `${n}%`);
+  const set = (field: "allowedCoins" | "allowedActionTypes", label: string, all: readonly string[] | "*") => {
+    const from = b[field] ?? all;
+    const to = a[field] ?? all;
+    const show = (x: readonly string[] | "*") => (x === "*" || (all !== "*" && all.every((t) => x.includes(t))) ? "all" : names(x));
+    const looser = to === "*" ? from !== "*" : from !== "*" && to.some((x) => !from.includes(x));
+    const tighter = from === "*" ? to !== "*" : to !== "*" && from.some((x) => !to.includes(x));
+    if (looser || tighter) add(field, label, show(from), show(to), looser);
+  };
+  set("allowedCoins", "Markets", "*");
+  set("allowedActionTypes", "Allowed actions", baseline.allowedActionTypes);
+  const stopBefore = b.requireStopLossForNewEntries === true || baseline.requireStopLossForNewEntries;
+  const stopAfter = a.requireStopLossForNewEntries === true || baseline.requireStopLossForNewEntries;
+  add("requireStopLossForNewEntries", "Stop-loss on new positions", stopBefore ? "required" : "not required", stopAfter ? "required" : "not required", stopBefore && !stopAfter);
+  add("spotTrading", "Spot trading", b.spotTrading === true ? "on" : "off", a.spotTrading === true ? "on" : "off", a.spotTrading === true && b.spotTrading !== true);
+  return changes;
 }
 
 /** Summary of the effective policy for `getStatus`. `spotTradingCoins`: the verified pairs spot trading would add. */
