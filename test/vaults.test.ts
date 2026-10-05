@@ -24,6 +24,11 @@ async function promptText(): Promise<string> {
 }
 
 describe("HLP deposit", () => {
+  it("is announced in the handshake, so the app shows it only with a frame that signs it", async () => {
+    h = await FrameHarness.create();
+    expect((await h.ok("hello", { protocolVersion: 1 })).capabilities.vaultTransfers).toBe(true);
+  });
+
   it("signs a deposit into the frame's own HLP address only after the user's click in the frame", async () => {
     h = await FrameHarness.create();
     const { address } = await h.activeAgent();
