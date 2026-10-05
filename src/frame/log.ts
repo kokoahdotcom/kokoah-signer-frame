@@ -19,6 +19,7 @@ export type LogEvent =
   | "key.expired"
   | "key.reloaded"
   | "key.unlock_failed"
+  | "limits.changed"
   | "sign.denied"
   | "sign.submitted"
   | "sign.result"

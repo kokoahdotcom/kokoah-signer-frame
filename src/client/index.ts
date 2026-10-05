@@ -10,8 +10,8 @@
  *
  * const signer = new KokoahSignerClient({ frameUrl: import.meta.env.VITE_SIGNER_FRAME_URL });
  * signer.on("statusChanged", (s) => …);           // subscribe before hello: some events follow it immediately
- * signer.on("promptChanged", ({ visible }) => …);  // show the iframe while visible (passkey ceremonies)
- * signer.on("reconnected", (hello) => { void signer.setLimits(limits); });  // the frame reloaded: re-apply
+ * signer.on("promptChanged", ({ visible }) => …);  // show the iframe while visible (passkeys, deposits, looser limits)
+ * signer.on("reconnected", (hello) => { void signer.setLimits(limits); });  // the frame reloaded: re-apply (a no-op when stored)
  * const hello = await signer.hello();          // check hello.network and hello.builder against public-config
  * const r = await signer.signAndSubmit({ requestId: crypto.randomUUID(), intent });
  * ```
@@ -107,7 +107,7 @@ export interface KokoahSignerClientOptions {
   container?: HTMLElement;
   /** Default request timeout (ms). Default 30 000. */
   requestTimeoutMs?: number;
-  /** Timeout for requests that may wait for the user in the frame (`unlock`, `setStorageMode`, passkey `createAgent` / `createLinkedAgent`). Default 300 000. */
+  /** Timeout for requests that may wait for the user in the frame (`unlock`, `setStorageMode`, `setLimits`, passkey `createAgent` / `createLinkedAgent`). Default 300 000. */
   interactiveTimeoutMs?: number;
   /** How long `hello()` keeps trying to reach the frame (ms). Default 15 000. */
   helloTimeoutMs?: number;
@@ -278,9 +278,13 @@ export class KokoahSignerClient {
     return this.request("signAndSubmit", params, Math.max(this.options.requestTimeoutMs, 45_000));
   }
 
-  /** Tightens the frame's limits (never loosens: `LIMIT_LOOSENING_REJECTED`). `{}` resets to the baseline. */
+  /**
+   * Sets one account's limits, stored by the frame. Tightening and identical limits answer at once; a loosening (`{}`
+   * included, with `hello.capabilities.confirmsLooserLimits`) waits for the user's click on the frame's prompt: keep
+   * the iframe visible while `promptChanged.visible`. Above the frame's baseline: `LIMIT_LOOSENING_REJECTED`.
+   */
   setLimits(params: SetLimitsParams): Promise<SetLimitsResult> {
-    return this.request("setLimits", params);
+    return this.request("setLimits", params, this.options.interactiveTimeoutMs);
   }
 
   /** Wipes this device's key and returns `revokeAgent` typed data for the main wallet to sign and the app to post. */

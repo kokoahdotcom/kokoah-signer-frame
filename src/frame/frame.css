@@ -76,6 +76,8 @@ body {
 .ks-body {
   margin: 0 0 1em;
   color: var(--ks-muted);
+  /* One change per line in the limits prompt. */
+  white-space: pre-line;
 }
 
 .ks-actions {
@@ -136,8 +138,8 @@ body {
 }
 
 /*
- * A prompt that weakens the key's protection (passkey → device) ignores the parent's theme: literal colors and sizes,
- * so the parent's --ks-* values can't hide or disguise it.
+ * A prompt that weakens the key's protection (passkey → device, looser limits, an HLP deposit) ignores the parent's
+ * theme: literal colors and sizes, so the parent's --ks-* values can't hide or disguise it.
  */
 .ks-prompt.ks-prompt--fixed {
   background: #ffffff;

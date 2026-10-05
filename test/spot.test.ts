@@ -21,7 +21,7 @@ const sent = (i: number) => h.hl.exchangeCalls[i]!.body.action as unknown as { t
 async function mainnetTrading() {
   h = await FrameHarness.create({ config: testConfig(MAINNET) });
   await h.activeAgent();
-  await h.ok("setLimits", { spotTrading: true });
+  await h.loosen({ spotTrading: true });
 }
 
 describe("spot trading: the switch", () => {
@@ -31,12 +31,14 @@ describe("spot trading: the switch", () => {
     const off = (await h.ok("getStatus")).policy;
     expect(off).toMatchObject({ spotTrading: false, spotCoins: ["@166", "@150"], userLimits: null });
     expect(off.spotTradingCoins).toEqual(VERIFIED_SPOT_PAIRS.mainnet.map((p) => p.coin));
-    const on = (await h.ok("setLimits", { spotTrading: true, maxLeverage: 5 })).policy;
+    // Turning it on loosens: the user confirms in the frame.
+    const on = (await h.loosen({ spotTrading: true, maxLeverage: 5 })).policy;
     expect(on.spotTrading).toBe(true);
     expect(on.spotCoins).toEqual(["@166", "@150", ...VERIFIED_SPOT_PAIRS.mainnet.map((p) => p.coin)]);
     expect(on.userLimits).toEqual({ maxLeverage: 5, spotTrading: true });
-    expect((await h.ok("setLimits", { spotTrading: false })).policy.spotTrading).toBe(false);
-    expect((await h.ok("setLimits", { spotTrading: true })).policy.spotTrading).toBe(true);
+    expect((await h.loosen({ spotTrading: false })).policy.spotTrading).toBe(false);
+    expect((await h.loosen({ spotTrading: true })).policy.spotTrading).toBe(true);
+    // Off again only tightens: no prompt.
     const reset = (await h.ok("setLimits", {})).policy;
     expect(reset).toMatchObject({ spotTrading: false, spotCoins: ["@166", "@150"], userLimits: null });
     expect((await h.fail("setLimits", { spotTrading: "yes" })).code).toBe("INVALID_REQUEST");
@@ -104,7 +106,7 @@ describe("spot trading: orders", () => {
   it("counts notional, rate and personal limits", async () => {
     h = await FrameHarness.create({ config: testConfig(MAINNET) });
     await h.activeAgent();
-    await h.ok("setLimits", { spotTrading: true, maxOrderNotionalUsd: 100, maxOrdersPerMinute: 2, maxLeverage: 2, requireStopLossForNewEntries: true });
+    await h.loosen({ spotTrading: true, maxOrderNotionalUsd: 100, maxOrdersPerMinute: 2, maxLeverage: 2, requireStopLossForNewEntries: true });
     expect(codes(await h.fail("signAndSubmit", { requestId: "n1", intent: market({ size: "3" }) }))).toEqual(["ORDER_NOTIONAL_EXCEEDED"]);
     // Leverage and stop-loss rules are about perps: no activeAssetData read, no stop needed.
     await h.ok("signAndSubmit", { requestId: "n2", intent: market() });
@@ -158,6 +160,7 @@ describe("spot trading: which pairs and accounts", () => {
     await mainnetTrading();
     const sub = "0x5555555555555555555555555555555555555555";
     h.hl.subAccounts[USER] = [subAccountEntry(sub)];
+    // The master has spot trading on already: nothing loosens, so no prompt.
     await h.ok("setLimits", { account: sub, spotTrading: true });
     const e = await h.fail("signAndSubmit", { requestId: "m1", intent: market({ vaultAddress: sub }) });
     expect(codes(e)).toContain("VAULT_NOT_ALLOWED");
@@ -168,7 +171,7 @@ describe("spot trading: which pairs and accounts", () => {
   it("uses the testnet pins on testnet (no volume cap there)", async () => {
     h = await FrameHarness.create();
     await h.activeAgent();
-    expect((await h.ok("setLimits", { spotTrading: true })).policy.spotTradingCoins).toEqual(VERIFIED_SPOT_PAIRS.testnet.map((p) => p.coin));
+    expect((await h.loosen({ spotTrading: true })).policy.spotTradingCoins).toEqual(VERIFIED_SPOT_PAIRS.testnet.map((p) => p.coin));
     // The mock's spot meta is mainnet's: the testnet pins don't match it, and the mainnet pairs aren't testnet pins.
     expect((await h.fail("signAndSubmit", { requestId: "n1", intent: market({ coin: "PURR/USDC", size: "4" }) })).code).toBe("UNSUPPORTED_MARKET");
     expect((await h.fail("signAndSubmit", { requestId: "n2", intent: market() })).code).toBe("UNSUPPORTED_MARKET");

@@ -489,6 +489,21 @@ export class FrameHarness {
     return await this.ok("createAgent", params);
   }
 
+  /** `setLimits` that loosens the stored limits: confirms the frame's prompt. */
+  async loosen(params: MethodParams["setLimits"]): Promise<MethodResults["setLimits"]> {
+    const pending = this.request("setLimits", params);
+    await this.clickPrompt();
+    const r = await pending;
+    if (!r.ok) throw new Error(`setLimits failed: ${r.error.code} ${r.error.message}`);
+    return r.result;
+  }
+
+  /** Text of the in-frame prompt while it is shown ("" otherwise). */
+  promptText(): string {
+    const panel = this.root?.querySelector<HTMLElement>(".ks-prompt");
+    return panel && !panel.hidden ? (panel.textContent ?? "") : "";
+  }
+
   /** Waits for the in-frame prompt and clicks its primary button. */
   async clickPrompt(button: "primary" | "cancel" = "primary"): Promise<void> {
     await waitFor(() => this.root?.querySelector<HTMLElement>(".ks-prompt")?.hidden === false);
