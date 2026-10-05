@@ -138,6 +138,8 @@ describe("limits stored by the frame", () => {
       [{ ...start, spotTrading: true }, ["Spot trading: off → on"]],
       [{ ...start, allowedCoins: ["ETH", "BTC", "SOL"] }, ["Markets: ETH, BTC → ETH, BTC, SOL"]],
       [{ ...start, allowedCoins: ["SOL"] }, ["Markets: ETH, BTC → SOL"]],
+      // Coin names come from the parent: no control characters reach the frame's own text, and long lists are cut.
+      [{ ...start, allowedCoins: ["ETH", "BTC", "A\u202eB", "C", "D", "E", "F", "G"] }, ["Markets: ETH, BTC → ETH, BTC, A?B, C, D, E and 2 more"]],
       [{ ...start, allowedActionTypes: ["order", "cancel", "modify"] }, ["Allowed actions: order, cancel → order, cancel, modify"]],
       [{ ...start, requireStopLossForNewEntries: false }, ["Stop-loss on new positions: required → not required"]],
       // A tightening next to a loosening: one prompt lists both.

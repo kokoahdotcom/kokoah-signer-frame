@@ -246,8 +246,10 @@ export interface LimitChange {
 
 const usd = (n: number): string => `$${n.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
 
+/** Up to six names. Coin names come from the parent: anything but printable ASCII (bidi controls…) shows as `?`. */
 function names(items: readonly string[]): string {
-  return items.length > 6 ? `${items.slice(0, 6).join(", ")} and ${items.length - 6} more` : items.join(", ");
+  const shown = items.slice(0, 6).map((x) => x.replace(/[^\x21-\x7e]/g, "?"));
+  return items.length > 6 ? `${shown.join(", ")} and ${items.length - 6} more` : shown.join(", ");
 }
 
 /**
