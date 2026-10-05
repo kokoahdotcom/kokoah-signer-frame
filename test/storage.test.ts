@@ -33,6 +33,22 @@ function containsBytes(haystack: unknown, needle: Uint8Array): boolean {
 }
 
 describe("device storage", () => {
+  it("a mainnet build on the same origin never uses the key a testnet build stored", async () => {
+    const a = await frame();
+    await a.activeAgent("device");
+    a.destroy();
+
+    const mainnet = await frame({ idb: a.idb, clock: a.clock, hl: a.hl, config: testConfig({ VITE_HL_NETWORK: "mainnet", VITE_ALLOW_MAINNET_WRITES: "true" }) });
+    const hello = await mainnet.ok("hello", { protocolVersion: 1 });
+    expect(hello).toMatchObject({ network: "mainnet", mainnetWritesEnabled: true });
+    expect(hello.status).toMatchObject({ hasKey: false, keyState: "none", agentAddress: null, network: "mainnet" });
+    expect((await mainnet.fail("signAndSubmit", { requestId: "testnet-key", intent: limitOrder() })).code).toBe("NO_KEY");
+    expect(mainnet.hl.exchangeCalls).toHaveLength(0);
+    // The testnet key is still the testnet build's.
+    const b = await frame({ idb: a.idb, clock: a.clock, hl: a.hl });
+    expect((await b.ok("hello", { protocolVersion: 1 })).status).toMatchObject({ hasKey: true, keyState: "active", network: "testnet" });
+  });
+
   it("round-trips through IndexedDB (fake-indexeddb) and signs after a reload", async () => {
     const a = await frame();
     const { address, privateKey } = await a.activeAgent("device");
