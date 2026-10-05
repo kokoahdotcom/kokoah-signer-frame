@@ -95,6 +95,25 @@ describe("HLP deposit", () => {
     expect(h.hl.exchangeCalls).toHaveLength(2);
   });
 
+  it("on mainnet counts deposits into mainnet's HLP only, with the same caps (nothing is signed here)", async () => {
+    h = await FrameHarness.create({ config: testConfig({ VITE_HL_NETWORK: "mainnet", VITE_ALLOW_MAINNET_WRITES: "true" }) });
+    await h.activeAgent();
+    const MAINNET_HLP = HLP_VAULT_ADDRESSES.mainnet;
+    expect(MAINNET_HLP).toBe("0xdfc24b077bc1425ad1dea75bcb6f8158e10df303");
+    expect(codes(await h.fail("signAndSubmit", { requestId: "big", intent: deposit("10000.01") }))).toEqual(["VAULT_DEPOSIT_LIMIT"]);
+    // 20,000 into mainnet's HLP today counts; the testnet HLP address is just another vault on mainnet.
+    h.hl.ledger = [ledgerDeposit("10000", 60_000, MAINNET_HLP), ledgerDeposit("10000", 3_600_000, MAINNET_HLP), ledgerDeposit("9000", 1000, HLP)];
+    const day = await h.fail("signAndSubmit", { requestId: "day", intent: deposit("5000.01") });
+    expect(codes(day)).toEqual(["VAULT_DEPOSIT_LIMIT"]);
+    expect(day.details?.violations?.[0]?.message).toContain("5,000 USDC is left");
+    // 5,000 fits: the frame asks with its own prompt; cancelled, nothing is signed or sent.
+    const pending = h.fail("signAndSubmit", { requestId: "fits", intent: deposit("5000") });
+    expect(await promptText()).toContain("4 days");
+    await h.clickPrompt("cancel");
+    expect((await pending).code).toBe("USER_CANCELLED");
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+  });
+
   it("fails closed when Hyperliquid's ledger can't be read", async () => {
     h = await FrameHarness.create();
     await h.activeAgent();
