@@ -31,6 +31,7 @@ import { isWriteAllowed } from "@kokoah/shared/network";
 import type { Policy } from "@kokoah/shared/policy";
 import { buildApproveAgent, buildRevokeAgent, parseAgentName, prepareL1Request } from "@kokoah/shared/signing";
 import { SubAccountLookupError, SubAccountOwnership } from "@kokoah/shared/subaccounts";
+import { HLP_LOCKUP_DAYS, HLP_VAULT_ADDRESSES, vaultDepositsSince, vaultUnitsToUsd } from "@kokoah/shared/vaults";
 import { bytesToHex, hexToBytes } from "viem";
 import { generatePrivateKey as viemGeneratePrivateKey, privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import {
@@ -235,6 +236,11 @@ export class FrameCore {
   private notifiedExpiredFor: string | null = null;
   private passkeySupportCache: Promise<PasskeySupport> | null = null;
   private readonly metrics = { ignoredMessages: 0, rejectedRequests: 0, policyDenials: 0, submitted: 0 };
+  /**
+   * HLP deposits this frame sent in the last few minutes, by master: Hyperliquid's ledger can lag a deposit by a few
+   * seconds, so these count towards the 24-hour cap on top of the ledger (counted twice for a moment: stricter).
+   */
+  private readonly hlpSent: Array<{ master: string; at: number; usd: number }> = [];
   private destroyed = false;
 
   private constructor(deps: FrameDeps) {
@@ -1470,6 +1476,7 @@ export class FrameCore {
     const parsed = safeParseAccountIntent(p.intent);
     if (!parsed.success) throw new SignerFailure("INVALID_INTENT", "The intent is not valid.", { details: { issues: parsed.issues.slice(0, 20) } });
     const intent: AccountIntent = parsed.intent;
+    if (intent.kind === "hlpDeposit" || intent.kind === "vaultWithdraw") return await this.runVaultTransfer(p, key, intent, markConsumed);
     const master = key.meta.userAddress.toLowerCase() as `0x${string}`;
     const deny = (message: string): never => {
       this.metrics.policyDenials++;
@@ -1563,6 +1570,127 @@ export class FrameCore {
       // Signs exactly `compiled.action` (the object the policy evaluated), for the master account.
       const body = await prepareL1Request({ wallet: current.account, network: this.config.network, compiled: { action: compiled.action }, nonce, expiresAfter });
       markConsumed();
+      this.metrics.submitted++;
+      this.log("sign.submitted", { actionType: decision.actionType, agent });
+      const transport = await this.hl.exchange(body);
+      const result = this.buildResult(p.requestId, decision.actionType, nonce, expiresAfter, { cloids: [] }, transport, 0);
+      this.log("sign.result", { status: result.status, actionType: result.actionType, ...(result.error ? { code: result.error.code } : {}) });
+      if (result.error && (result.error.code === "INVALID_NONCE" || result.error.code === "ACTION_EXPIRED")) void this.syncClock();
+      return result;
+    });
+  }
+
+  /**
+   * A vault transfer, the one fund movement a trading key may make (shared `vaults/hlp.ts`; product owner,
+   * 2026-10-05). A deposit goes into HLP only (the frame's own address for its network, never one from the parent),
+   * within 10,000 USDC per deposit and 25,000 per 24 hours counted from Hyperliquid's own ledger, and only after the
+   * user confirms the frame's own description of it (amount and 4-day lock-up) with a click in the frame. A withdrawal
+   * comes from a vault the frame reads on Hyperliquid that the account holds, up to its equity there, back into the
+   * account. Facts Hyperliquid can't give sign nothing.
+   */
+  private async runVaultTransfer(
+    p: SignAndSubmitParams,
+    key: LoadedKey & { account: PrivateKeyAccount },
+    intent: Extract<AccountIntent, { kind: "hlpDeposit" | "vaultWithdraw" }>,
+    markConsumed: () => void,
+  ): Promise<SignAndSubmitResult> {
+    const master = key.meta.userAddress.toLowerCase() as `0x${string}`;
+    const network = this.config.network.name;
+    const hlp = HLP_VAULT_ADDRESSES[network];
+    await this.ensureClock();
+
+    let compiled: CompiledAccountAction;
+    try {
+      compiled = compileAccountAction(intent, { hlpVaultAddress: hlp });
+    } catch (e) {
+      if (e instanceof CompileError) throw new SignerFailure(e.code === "INVALID_INTENT" ? "INVALID_INTENT" : "COMPILE_FAILED", e.message, { details: { compileCode: e.code } });
+      throw e;
+    }
+    const action = compiled.action as { type: "vaultTransfer"; vaultAddress: `0x${string}`; isDeposit: boolean; usd: number };
+    const usdText = vaultUnitsToUsd(action.usd);
+
+    // What the rules need, read by the frame itself for the master (never from the parent).
+    const facts = async (now: number): Promise<{ network: typeof network; hlpDepositedLast24hUsd?: number; heldEquityUsd?: number }> => {
+      if (action.isDeposit) {
+        const since = now - 24 * 60 * 60 * 1000;
+        const ledger = await this.readInfo({ type: "userNonFundingLedgerUpdates", user: master, startTime: since }, "Could not read today's HLP deposits from Hyperliquid; nothing was signed. Try again shortly.");
+        let fromLedger: number;
+        try {
+          fromLedger = vaultDepositsSince(ledger, hlp, since);
+        } catch {
+          throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Hyperliquid's ledger was unreadable; nothing was signed. Try again shortly.", { retryable: true });
+        }
+        const recent = this.hlpSent.filter((d) => d.master === master && d.at > now - 5 * 60 * 1000).reduce((sum, d) => sum + d.usd, 0);
+        return { network, hlpDepositedLast24hUsd: fromLedger + recent };
+      }
+      const equities = await this.readInfo({ type: "userVaultEquities", user: master }, "Could not read your vaults from Hyperliquid; nothing was signed. Try again shortly.");
+      if (!Array.isArray(equities)) throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Hyperliquid's vault list was unreadable; nothing was signed. Try again shortly.", { retryable: true });
+      const held = equities.find((v) => isRecord(v) && typeof v.vaultAddress === "string" && v.vaultAddress.toLowerCase() === action.vaultAddress);
+      const equity = isRecord(held) ? Number(held.equity) : undefined;
+      return { network, ...(equity !== undefined && Number.isFinite(equity) ? { heldEquityUsd: equity } : {}) };
+    };
+    const decide = (now: number, vault: Awaited<ReturnType<typeof facts>>) => {
+      const expiresAfter = now + EXPIRES_AFTER_MS;
+      const decision = evaluateFrameAccountPolicy({ compiled, expiresAfter, now, policy: this.policy, vault });
+      if (!decision.allowed) {
+        this.metrics.policyDenials++;
+        this.log("sign.denied", { actionType: decision.actionType, codes: decision.violations.map((v) => v.code).join(",") });
+        throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: decision.violations } });
+      }
+      return { decision, expiresAfter };
+    };
+
+    // Checked before asking, so the user is never asked to confirm something the rules refuse.
+    decide(this.correctedNow(), await facts(this.correctedNow()));
+    if (action.isDeposit) {
+      await this.prompt(
+        "vault-deposit",
+        {
+          title: "Deposit into HLP",
+          body:
+            `Move ${usdText} USDC from your Hyperliquid account into HLP, Hyperliquid's own vault. ` +
+            `You can withdraw it ${HLP_LOCKUP_DAYS} days after this deposit. HLP can lose money.`,
+          actionLabel: `Deposit ${usdText} USDC`,
+          fixedStyle: true,
+        },
+        async () => undefined,
+      );
+    }
+
+    const agent = key.meta.agentAddress;
+    const generation = key.generation;
+    return await this.coordinator.withAgentLock(agent, async () => {
+      const current = this.key;
+      if (!current || current.generation !== generation || !current.account) {
+        throw new SignerFailure("KEY_CHANGED", "The trading key changed or was locked before signing.", { retryable: true });
+      }
+      const now = this.correctedNow();
+      if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
+      // Read again under the lock: another tab or device may have deposited while the prompt was open.
+      const { decision, expiresAfter } = decide(now, await facts(now));
+
+      let nonce: number;
+      try {
+        nonce = await this.coordinator.reserve(agent, {
+          now,
+          orders: 0,
+          notionalUsd: 0,
+          account: { account: master, master },
+          limits: { maxOrdersPerMinute: Infinity, maxActionsPerMinute: BASELINE_LIMITS.maxActionsPerMinute, maxDailyNotionalUsd: Infinity, maxAgentDailyNotionalUsd: Infinity },
+        });
+      } catch (e) {
+        if (e instanceof UsageLimitError) {
+          this.metrics.policyDenials++;
+          throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: e.code, message: e.message }] } });
+        }
+        if (e instanceof RangeError) throw new SignerFailure("INTERNAL_ERROR", "Could not produce a valid nonce; check the device clock.");
+        throw new SignerFailure("STORAGE_FAILED", "Could not reserve a nonce on this device.", { retryable: true });
+      }
+
+      // Signs exactly `compiled.action` (the object the rules checked), for the master account.
+      const body = await prepareL1Request({ wallet: current.account, network: this.config.network, compiled: { action: compiled.action }, nonce, expiresAfter });
+      markConsumed();
+      if (action.isDeposit) this.hlpSent.push({ master, at: now, usd: action.usd / 1e6 });
       this.metrics.submitted++;
       this.log("sign.submitted", { actionType: decision.actionType, agent });
       const transport = await this.hl.exchange(body);

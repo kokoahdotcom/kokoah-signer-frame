@@ -16,7 +16,11 @@ Those need the main wallet. It **can**:
   others (research B §1.7);
 - sign `setReferrer` (any code) and `startFeeTrial`, and trade spot. The frame allows only Kokoah's own code once, the
   fee trial, spot on the pinned stablecoin pairs, and, once the user turns spot trading on, spot on the verified token
-  pairs (A14–A17).
+  pairs (A14–A17);
+- move money into and out of vaults (`vaultTransfer`). The frame allows one fund movement (product owner, 2026-10-05):
+  deposits into **HLP only**, at most 10,000 USDC at once and 25,000 per 24 hours (counted from Hyperliquid's ledger),
+  each after the user's click on the frame's own prompt; and withdrawals from a vault the account holds back into the
+  account (A22).
 
 A stolen agent key can therefore still drain an account:
 - by trading against the attacker's resting orders in thin markets;
@@ -67,6 +71,7 @@ Trust boundaries:
 | A19 | A1 signs a **`scheduleCancel` far ahead**, or **loops cancels / `noop`** | Cancel every order (stop-losses included) days later; use up the address's HL request allowance | `scheduleCancel` is at most 1 h ahead (shared `compile.ts`, `SCHEDULE_TOO_FAR`). Every signed action counts toward 120 per minute per key, checked in the same IndexedDB transaction that records it | Unit-tested (shared `actions.test.ts`, `test/nonce.test.ts`) |
 | A20 | A1 uses **several tabs without Web Locks**, or **sub-accounts without a daily limit of their own** | Multiply the per-minute and daily limits | The limits are checked again inside the IndexedDB transaction that reserves the nonce and records the usage. A sub-account's own limits apply on top of the master's (fields it leaves out keep the master's values), and only a sub-account whose own limits set `maxDailyNotionalUsd` gets a daily counter of its own; every other sub-account, including one with only a leverage or per-order limit, shares the master's daily limit and counter | Unit-tested (`test/nonce.test.ts`, `test/subaccounts.test.ts`) |
 | A21 | A1 **themes the frame** and asks to remove passkey protection (`setStorageMode` → device) | Disguise the prompt so one click permanently downgrades the key to auto-unlock | That prompt ignores `setTheme`: the frame's own fixed colors and sizes, "Remove passkey protection?", button "Remove protection" | `test/storage.test.ts` |
+| A22 | A1 asks the frame to **move funds into a vault** (`hlpDeposit`, `vaultWithdraw`) | Send the account's money to a vault the attacker leads and trade it away | Deposits carry no vault field (strict schema): the frame signs only its own HLP address for its network, never a leader's vault. Caps: 10,000 USDC per deposit and 25,000 per 24 hours, counted from the ledger the frame reads itself plus what it just sent, checked before and again under the agent lock. Each deposit needs the user's click on the frame's own fixed-style prompt naming amount and lock-up. Withdrawals only return money to the account, from a vault HL says the account holds. Worst case for a stolen key or A1: up to 25,000 USDC a day parked in HLP (still the account's, withdrawable after 4 days) | Unit-tested (`test/vaults.test.ts`, shared `vaults.test.ts`, golden vectors) |
 
 ## 4. What each storage mode protects (plainly)
 
@@ -99,7 +104,12 @@ Trust boundaries:
    start the user's fee trial at a moment the user didn't choose (once per 90 days, per HL). The app explains the
    terms and asks before it sends the action; the frame cannot tell a real click from A1. `setReferrer` can only ever
    carry Kokoah's own code (A14), so A1 gains nothing by triggering it.
-10. **Sub-accounts trust HL's answer.** Ownership comes from HL `subAccounts` over HTTPS; a compromised HL API is out of scope (it could also lie about prices). Whether HL charges the builder fee on a sub-account's orders with only the master's `approveBuilderFee`, or needs an approval for the sub-account itself, is **unverified** (checked on funded testnet by the coordinator). The frame puts the builder on every sub-account order either way; if HL refuses them, sub-account trading fails closed ("builder fee not approved") rather than trading without the fee.
+10. **HLP deposits.** A1 can't click the frame's prompt, but a user who clicks without reading can be led to deposit
+   (clickjacking is limited by the fixed styling, not ruled out). The damage is bounded: HLP only, 25,000 USDC per 24
+   hours, the money stays the account's and is withdrawable after HLP's 4-day lock-up; HLP itself can lose money. The
+   cap counts deposits from every device through Hyperliquid's ledger, plus this frame's own last 5 minutes; two frames
+   on two devices depositing in the same second, before the ledger shows either, could pass the cap once.
+11. **Sub-accounts trust HL's answer.** Ownership comes from HL `subAccounts` over HTTPS; a compromised HL API is out of scope (it could also lie about prices). Whether HL charges the builder fee on a sub-account's orders with only the master's `approveBuilderFee`, or needs an approval for the sub-account itself, is **unverified** (checked on funded testnet by the coordinator). The frame puts the builder on every sub-account order either way; if HL refuses them, sub-account trading fails closed ("builder fee not approved") rather than trading without the fee.
 
 ## 6. Controls checklist
 
@@ -123,6 +133,7 @@ Trust boundaries:
 | Testnet default; mainnet needs `VITE_ALLOW_MAINNET_WRITES=true`; shared write guard | `config.ts`, shared `assertWriteAllowed` | `test/config.test.ts` |
 | Link phone: the phone's own key, a matching code over that key, the link secret never stored, logged or echoed, no `approveAgent` on the phone | `core.ts` `createLinkedAgent`, shared `deviceLinkCode` | `test/link.test.ts`, shared `test/link.test.ts` |
 | `setReferrer` only with the frame's own code, only while HL reports no referrer, once per key; `startFeeTrial` master-only; spot only on the pinned stablecoin pairs verified against the frame's own `spotMeta` | `core.ts` `runAccountAction`, `policy.ts`, `market-data.ts`, shared `evaluatePolicy` and `STABLECOIN_PAIRS` | `test/revenue.test.ts`, shared `accountActions.test.ts` and `spotPolicy.test.ts` |
+| Vault transfers: deposits into the frame's own HLP address only, ≤ 10,000 USDC each and ≤ 25,000 per 24 h from HL's ledger, each after the user's click on the fixed-style prompt; withdrawals only from a vault HL says the account holds, up to its equity | `core.ts` `runVaultTransfer`, `policy.ts` `evaluateFrameAccountPolicy`, shared `vaults/hlp.ts` | `test/vaults.test.ts`, shared `vaults.test.ts` and golden vectors |
 | Spot trading off by default; on, only the pinned verified pairs confirmed against the frame's own `spotMeta`; no triggers, reduce-only or modify; master only; mainnet order ≤ 10% of 24 h volume | `policy.ts` (`applyUserLimits`, `evaluateFramePolicy`), `market-data.ts`, shared `VERIFIED_SPOT_PAIRS`, `verifiedSpotPairs`, `spotOrderVolumeProblem` | `test/spot.test.ts`, shared `spotPolicy.test.ts` and `spotPairs.test.ts` |
 
 ## 7. Link phone
