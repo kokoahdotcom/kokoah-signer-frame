@@ -9,7 +9,7 @@
  *    - `dist/_headers` (copied from public/) sets `frame-ancestors` to exactly the allowed parent origins, its
  *      `connect-src` covers the HL API origin and its Permissions-Policy allows WebAuthn for `self`; when kokoah-infra
  *      is next to this repo, any difference from its signer `_headers` other than deployment-specific origins
- *      (`frame-ancestors`, the CSP report endpoint) fails the build;
+ *      (`frame-ancestors`, the CSP report endpoint, the API origin in `connect-src`) fails the build;
  *    - no `eval(`/`new Function(` in the JavaScript, no source maps, nothing from the dev harness;
  *    - a mainnet build never uses the placeholder builder address.
  * 3. Writes `release-manifest.json` (kokoah.release-manifest/v1, kokoah-infra/docs/RELEASE_MANIFEST.md) next to
@@ -149,11 +149,15 @@ const WEBAUTHN_FEATURES = ["publickey-credentials-create", "publickey-credential
 
 /**
  * Values that legitimately differ between the frame's `_headers` and kokoah-infra's copy (another deployment's
- * origins): `frame-ancestors` (checked against VITE_ALLOWED_PARENT_ORIGINS by {@link checkHeaders}) and the CSP report
- * endpoint (`report-uri`, `Reporting-Endpoints`). Everything else must be identical.
+ * origins): `frame-ancestors` (checked against VITE_ALLOWED_PARENT_ORIGINS by {@link checkHeaders}), the CSP report
+ * endpoint (`report-uri`, `Reporting-Endpoints`) and, in `connect-src`, the deployment's API origin (the region check,
+ * VITE_ELIGIBILITY_URL) where kokoah-infra has its placeholder {@link INFRA_API_ORIGIN}. Everything else must be
+ * identical.
  */
 const DEPLOYMENT_SPECIFIC_CSP = new Set(["frame-ancestors", "report-uri"]);
 const DEPLOYMENT_SPECIFIC_HEADERS = new Set(["reporting-endpoints"]);
+/** kokoah-infra's placeholder for the API origin. */
+export const INFRA_API_ORIGIN = "https://api.kokoah.example";
 
 function cspDirectives(value: string): Map<string, string> {
   const map = new Map<string, string>();
@@ -169,7 +173,7 @@ function cspDirectives(value: string): Map<string, string> {
  * any path, header or CSP directive added, removed or changed, except the deployment-specific origins above.
  * Comments and whitespace are ignored.
  */
-export function headersDrift(frameHeaders: string, infraHeaders: string): string[] {
+export function headersDrift(frameHeaders: string, infraHeaders: string, apiOrigin: string | null = null): string[] {
   const problems: string[] = [];
   const ours = parseHeadersFile(frameHeaders);
   const theirs = parseHeadersFile(infraHeaders);
@@ -194,6 +198,9 @@ export function headersDrift(frameHeaders: string, infraHeaders: string): string
       }
       const da = cspDirectives(va);
       const db = cspDirectives(vb);
+      // This deployment's API origin stands where kokoah-infra has its placeholder, and only there.
+      const connect = da.get("connect-src");
+      if (apiOrigin && connect !== undefined) da.set("connect-src", connect.split(" ").map((o) => (o === apiOrigin ? INFRA_API_ORIGIN : o)).join(" "));
       for (const d of new Set([...da.keys(), ...db.keys()])) {
         if (da.has(d) && db.has(d) && (DEPLOYMENT_SPECIFIC_CSP.has(d) || da.get(d) === db.get(d))) continue;
         problems.push(`_headers ${path} CSP ${d} differs from kokoah-infra: "${da.get(d) ?? "(absent)"}" vs "${db.get(d) ?? "(absent)"}"`);
@@ -320,7 +327,7 @@ function main(): number {
     if (!existsSync(infraCopy)) warnings.push("kokoah-infra is not next to this repo; public/_headers was not compared with its signer _headers");
     else {
       const infra = readFileSync(infraCopy, "utf8");
-      problems.push(...headersDrift(headers, infra));
+      problems.push(...headersDrift(headers, infra, config.eligibilityUrl && new URL(config.eligibilityUrl).origin));
       if (infra !== headers) warnings.push("public/_headers differs from kokoah-infra/headers/cloudflare/signer/_headers in deployment-specific origins or comments only");
     }
   }

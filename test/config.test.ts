@@ -128,6 +128,15 @@ describe("CSP consistency with kokoah-infra/headers", () => {
     expect(headersDrift(headers.replace("  X-XSS-Protection: 0", "  X-XSS-Protection: 0\n  X-Extra: 1"), headers).join()).toMatch(/x-extra is not set by kokoah-infra/);
     expect(headersDrift(`${headers}\n/other\n  X-Frame-Options: DENY\n`, headers).join()).toMatch(/rule \/other is not in/);
   });
+
+  it("headersDrift lets this deployment's API origin stand for kokoah-infra's placeholder in connect-src, and nothing else", () => {
+    const live = headers.replaceAll("https://api.kokoah.example", "https://api.kokoah.com");
+    expect(headersDrift(live, headers, "https://api.kokoah.com")).toEqual([]);
+    expect(headersDrift(live, headers).join()).toMatch(/CSP connect-src differs/);
+    expect(headersDrift(live, headers, "https://api.other.example").join()).toMatch(/CSP connect-src differs/);
+    const extra = headers.replace("connect-src https://api.hyperliquid.xyz", "connect-src https://evil.example https://api.hyperliquid.xyz");
+    expect(headersDrift(extra, headers, "https://evil.example").join()).toMatch(/CSP connect-src differs/);
+  });
 });
 
 describe("post-build SRI and release manifest", () => {
