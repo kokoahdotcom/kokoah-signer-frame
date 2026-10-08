@@ -718,6 +718,7 @@ Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event":
 | `UNSUPPORTED_MARKET` | Outcome market, a spot pair the frame can't verify, or (mainnet) anything but a cancel or reduce-only order on a HIP-3 dex that isn't pinned or has a new deployer | Don't offer the ticket; on such a dex, offer only cancels and reduce-only closes (leverage and margin changes go through Hyperliquid itself) |
 | `COMPILE_FAILED` | Market unknown/delisted, precision, margin mode… (`details.compileCode`) | Show the message (it carries the rounded suggestion) |
 | `POLICY_DENIED` | Policy refused (`details.violations`) | Show each violation's `message` |
+| `REGION_BLOCKED` | Kokoah's region check, asked by the frame itself (`VITE_ELIGIBILITY_URL`), doesn't allow this visitor to add risk. Asked only for orders and changes that aren't reduce-only, leverage and margin changes, an HLP deposit, `setReferrer` and `startFeeTrial`; cancels, reduce-only orders and vault withdrawals never ask. A "not allowed" answer holds (kept on the signer origin) until a later answer allows; without one on record, a check that can't be reached lets signing go on | Say trading isn't available in the user's region; closing and cancelling still work |
 | `MARKET_DATA_UNAVAILABLE` | HL `/info` failed | Retry later |
 | `HL_UNAVAILABLE` | HL `/info` unreachable during `confirmAgent` | Retry later |
 | `REQUEST_ID_REUSED` | Same `requestId`, different intent | Bug: log it |

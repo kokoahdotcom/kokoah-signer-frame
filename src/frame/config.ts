@@ -32,6 +32,11 @@ export interface FrameConfig {
   readonly referralCode: string | null;
   /** Development only: base URL that replaces the HL API (the dev harness mock/read-only proxy). */
   readonly hlApiUrlOverride: string | null;
+  /**
+   * Kokoah's region check (`GET /v1/eligibility` on its API), asked before anything that adds risk is signed
+   * (src/frame/eligibility.ts), or null for no check. It can only refuse.
+   */
+  readonly eligibilityUrl: string | null;
   /** True for production builds (stricter origin rules, no overrides). */
   readonly production: boolean;
 }
@@ -73,6 +78,8 @@ function str(env: RawEnv, key: string): string | undefined {
  * - `VITE_HL_REFERRAL_CODE`: optional, Kokoah's Hyperliquid referral code (1–20 of `A–Z a–z 0–9 _ -`); keep it equal
  *   to the backend's `HL_REFERRAL_CODE`. Unset: the frame never signs `setReferrer`.
  * - `VITE_HL_API_URL_OVERRIDE`: development builds only (dev harness proxy). Rejected in production builds.
+ * - `VITE_ELIGIBILITY_URL`: optional, Kokoah's `GET /v1/eligibility` (https in production builds; http only to
+ *   localhost in development). Its origin joins `connect-src`. Unset: no region check in the frame.
  */
 export function parseFrameConfig(env: RawEnv, options: { production: boolean }): FrameConfig {
   const problems: string[] = [];
@@ -103,6 +110,22 @@ export function parseFrameConfig(env: RawEnv, options: { production: boolean }):
       } catch {
         problems.push("VITE_HL_API_URL_OVERRIDE is not a valid URL");
       }
+    }
+  }
+
+  // Region check (optional).
+  let eligibilityUrl: string | null = null;
+  const eligibilityRaw = str(env, "VITE_ELIGIBILITY_URL");
+  if (eligibilityRaw !== undefined) {
+    try {
+      const u = new URL(eligibilityRaw);
+      if (u.protocol !== "https:" && !(u.protocol === "http:" && !production && LOOPBACK_HOSTS.has(u.hostname))) {
+        problems.push("VITE_ELIGIBILITY_URL must use https (http only to localhost in development builds)");
+      } else if (u.search !== "" || u.hash !== "" || u.username !== "" || u.password !== "") {
+        problems.push("VITE_ELIGIBILITY_URL must not have a query, fragment or credentials");
+      } else eligibilityUrl = `${u.origin}${u.pathname}`;
+    } catch {
+      problems.push("VITE_ELIGIBILITY_URL is not a valid URL");
     }
   }
 
@@ -156,6 +179,7 @@ export function parseFrameConfig(env: RawEnv, options: { production: boolean }):
     defaultAgentName: nameRaw,
     referralCode: referralRaw ?? null,
     hlApiUrlOverride,
+    eligibilityUrl,
     production,
   });
 }
@@ -176,9 +200,19 @@ function originProblem(value: string, production: boolean): string | null {
   return `"${value}" must use https`;
 }
 
-/** Origin the frame talks to for `/info` and `/exchange` (the only `connect-src` entry it needs). */
+/** Origin the frame talks to for `/info` and `/exchange`. */
 export function hlApiOrigin(config: FrameConfig): string {
   return new URL(config.network.apiUrl).origin;
+}
+
+/** Every origin the frame fetches from (`connect-src`): Hyperliquid's API and, when configured, Kokoah's region check. */
+export function connectOrigins(config: FrameConfig): string[] {
+  const out = [hlApiOrigin(config)];
+  if (config.eligibilityUrl !== null) {
+    const o = new URL(config.eligibilityUrl).origin;
+    if (!out.includes(o)) out.push(o);
+  }
+  return out;
 }
 
 /**
@@ -193,7 +227,7 @@ export function buildMetaCsp(config: FrameConfig): string {
     "script-src 'self'",
     "style-src 'self'",
     "img-src 'self'",
-    `connect-src ${hlApiOrigin(config)}`,
+    `connect-src ${connectOrigins(config).join(" ")}`,
     "worker-src 'none'",
     "frame-src 'none'",
     "object-src 'none'",

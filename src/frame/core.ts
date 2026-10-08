@@ -78,6 +78,7 @@ import type { FrameConfig } from "./config.js";
 import { deriveKeyFromPrf, generateDeviceKey, keyAad, randomBytes, unwrapSecret, wipe, wrapSecret } from "./crypto.js";
 import { outgoingProblem, redactHex64, SignerFailure } from "./errors.js";
 import { errorName, HlHttp, type FetchLike } from "./hl.js";
+import { RegionGate } from "./eligibility.js";
 import { silentLogger, type Logger } from "./log.js";
 import { MarketData, MarketDataError, type MarketSnapshot } from "./market-data.js";
 import { classifyMessage } from "./messages.js";
@@ -248,6 +249,8 @@ export class FrameCore {
   private limitsShownOrder = 0;
   /** The master's sub-accounts, read from HL by the frame itself (never from the parent). */
   private readonly subAccounts: SubAccountOwnership;
+  /** Kokoah's region check, asked before anything that adds risk is signed (eligibility.ts). */
+  private readonly region: RegionGate;
   private key: LoadedKey | null = null;
   private generation = 0;
   private boundOrigin: string | null = null;
@@ -280,6 +283,7 @@ export class FrameCore {
     this.hl = new HlHttp({ fetch: deps.fetch, infoUrl: this.config.network.infoUrl, exchangeUrl: this.config.network.exchangeUrl });
     this.market = new MarketData({ hl: this.hl, now: this.now, network: this.config.network.name });
     this.subAccounts = new SubAccountOwnership({ now: this.now, load: async (master) => await this.hl.info({ type: "subAccounts", user: master }) });
+    this.region = new RegionGate({ url: this.config.eligibilityUrl, network: this.config.network.name, fetch: deps.fetch, store: deps.store, now: this.now });
     this.coordinator = new SigningCoordinator({ store: deps.store, locks: deps.locks, lockPrefix: `kokoah-signer/v1/${this.config.network.name}` });
     this.baseline = createBaselinePolicy(this.config.builder, { spotCoins: this.market.stablecoinPairCoins, referralCode: this.config.referralCode });
     this.limits = { rev: 0, master: null, accounts: new Map(), policy: this.baseline };
@@ -605,6 +609,14 @@ export class FrameCore {
       }
     })();
     return this.clockSync;
+  }
+
+  /** Refuses with REGION_BLOCKED when Kokoah's region check doesn't allow this visitor to add risk. */
+  private async requireRegion(): Promise<void> {
+    const decision = await this.region.check();
+    if (decision.allowed) return;
+    this.log("sign.denied", { code: "REGION_BLOCKED" });
+    throw new SignerFailure("REGION_BLOCKED", "Trading isn't available in your region. You can still close positions and cancel orders.");
   }
 
   private async ensureClock(): Promise<void> {
@@ -1508,6 +1520,7 @@ export class FrameCore {
     const parsed = safeParseActionIntent(p.intent);
     if (!parsed.success) throw new SignerFailure("INVALID_INTENT", "The intent is not valid.", { details: { issues: parsed.issues.slice(0, 20) } });
     const intent: ActionIntent = parsed.intent;
+    if (addsRisk(intent)) await this.requireRegion();
 
     // 1b. Acting for a sub-account: the frame checks on HL itself that it belongs to this key's master (cached
     // briefly). Anything else (a vault the master leads, another user's account) is denied by the policy below.
@@ -1668,6 +1681,9 @@ export class FrameCore {
     const parsed = safeParseAccountIntent(p.intent);
     if (!parsed.success) throw new SignerFailure("INVALID_INTENT", "The intent is not valid.", { details: { issues: parsed.issues.slice(0, 20) } });
     const intent: AccountIntent = parsed.intent;
+    // Taking money out of a vault only lowers risk; everything else here (a deposit, the referrer, a fee trial) waits for
+    // the region check.
+    if (intent.kind !== "vaultWithdraw") await this.requireRegion();
     if (intent.kind === "hlpDeposit" || intent.kind === "vaultWithdraw") return await this.runVaultTransfer(p, key, intent, markConsumed);
     const master = key.meta.userAddress.toLowerCase() as `0x${string}`;
     const deny = (message: string): never => {
@@ -1952,5 +1968,25 @@ export class FrameCore {
     const outcome = redactHex64(parseExchangeResponse(body, expectedCount > 0 ? expectedCount : undefined));
     if (outcome.ok) return { ...base, status: "ok", exchangeResponse: body, outcome };
     return { ...base, status: "rejected", exchangeResponse: body, outcome, error: outcome.error };
+  }
+}
+
+/**
+ * Whether signing an action adds risk, so it waits for the region check: a new order or a change of one that isn't
+ * reduce-only, and every leverage or isolated-margin change. Cancels, reduce-only orders, a dead man's switch and a noop
+ * only lower risk (as the app's `reducesRisk`).
+ */
+export function addsRisk(intent: ActionIntent): boolean {
+  switch (intent.kind) {
+    case "order":
+      return !intent.reduceOnly;
+    case "modify":
+      return !intent.order.reduceOnly;
+    case "cancel":
+    case "scheduleCancel":
+    case "noop":
+      return false;
+    default:
+      return true;
   }
 }

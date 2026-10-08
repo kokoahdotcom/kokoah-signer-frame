@@ -166,6 +166,9 @@ export class MockHl {
   infoCalls: Array<Record<string, unknown>> = [];
   exchangeCalls: ExchangeCall[] = [];
   infoFailure: ((body: Record<string, unknown>) => boolean) | null = null;
+  /** What Kokoah's region check answers ("down": no answer at all). */
+  eligibility: { allowed: boolean; blockedReason?: string | null } | "down" = { allowed: true, blockedReason: null };
+  eligibilityCalls = 0;
   responder: Responder | null = null;
 
   constructor(clock: Clock) {
@@ -178,6 +181,12 @@ export class MockHl {
   }
 
   fetch: FetchLike = async (url, init) => {
+    // Kokoah's region check (the frame's own, src/frame/eligibility.ts): a GET without a body.
+    if (url.includes("/v1/eligibility")) {
+      this.eligibilityCalls++;
+      if (this.eligibility === "down") throw new TypeError("Failed to fetch");
+      return json(this.eligibility);
+    }
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
     if (url.endsWith("/info")) {
       this.infoCalls.push(body);

@@ -578,6 +578,8 @@ export type SignerErrorCode =
   | "UNSUPPORTED_MARKET"
   | "COMPILE_FAILED"
   | "POLICY_DENIED"
+  /** Kokoah's region check (asked by the frame itself) doesn't allow this visitor to add risk; closing and cancelling still work. */
+  | "REGION_BLOCKED"
   | "MARKET_DATA_UNAVAILABLE"
   | "REQUEST_ID_REUSED"
   | "SIGNER_BUSY"
