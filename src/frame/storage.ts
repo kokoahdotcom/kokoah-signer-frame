@@ -70,6 +70,22 @@ export function limitsSlot(network: NetworkName): StoredLimitsRecord["slot"] {
   return `limits/${network}`;
 }
 
+/**
+ * The last answer of Kokoah's region check the frame got itself (src/frame/eligibility.ts), per network: a "not
+ * allowed" holds until a later answer allows, so blocking the check's request doesn't lift it.
+ */
+export interface StoredRegionRecord {
+  slot: `region/${NetworkName}`;
+  v: 1;
+  allowed: boolean;
+  at: number;
+}
+
+/** Slot of a network's region record in the `keys` store. */
+export function regionSlot(network: NetworkName): StoredRegionRecord["slot"] {
+  return `region/${network}`;
+}
+
 /** Per-agent usage and nonce state. */
 export interface UsageRecord {
   agent: string;
@@ -117,6 +133,8 @@ export interface SignerStore {
    * transaction (serialized across tabs). Returns false, writing nothing, when another write came first.
    */
   replaceLimits(record: StoredLimitsRecord, expectedRev: number): Promise<boolean>;
+  getRegion(network: NetworkName): Promise<StoredRegionRecord | undefined>;
+  putRegion(record: StoredRegionRecord): Promise<void>;
 }
 
 function req<T>(r: IDBRequest<T>): Promise<T> {
@@ -242,6 +260,17 @@ export class IdbSignerStore implements SignerStore {
     await done(tx);
     return written;
   }
+
+  async getRegion(network: NetworkName): Promise<StoredRegionRecord | undefined> {
+    const tx = this.db.transaction(KEYS, "readonly");
+    return (await req(tx.objectStore(KEYS).get(regionSlot(network)))) as StoredRegionRecord | undefined;
+  }
+
+  async putRegion(record: StoredRegionRecord): Promise<void> {
+    const tx = this.db.transaction(KEYS, "readwrite");
+    tx.objectStore(KEYS).put(record);
+    await done(tx);
+  }
 }
 
 /** A stored limits record's revision (0: none, or unreadable). */
@@ -257,6 +286,7 @@ export class MemorySignerStore implements SignerStore {
   private readonly usage = new Map<string, UsageRecord>();
   private readonly agents = new Set<string>();
   private readonly limits = new Map<string, StoredLimitsRecord>();
+  private readonly regions = new Map<string, StoredRegionRecord>();
 
   async getKeyRecord(): Promise<StoredKeyRecord | undefined> {
     return this.record;
@@ -291,6 +321,13 @@ export class MemorySignerStore implements SignerStore {
     if (limitsRev(this.limits.get(record.network)) !== expectedRev) return false;
     this.limits.set(record.network, structuredClone(record));
     return true;
+  }
+  async getRegion(network: NetworkName): Promise<StoredRegionRecord | undefined> {
+    const r = this.regions.get(regionSlot(network));
+    return r === undefined ? undefined : structuredClone(r);
+  }
+  async putRegion(record: StoredRegionRecord): Promise<void> {
+    this.regions.set(record.slot, structuredClone(record));
   }
 }
 

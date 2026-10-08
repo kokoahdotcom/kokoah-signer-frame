@@ -10,7 +10,7 @@
 # rules is comma-joined, so each header name appears in only one rule for a given path.
 
 /*
-  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src https://api.hyperliquid.xyz https://api.hyperliquid-testnet.xyz; worker-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors https://app.kokoah.example; require-trusted-types-for 'script'; trusted-types 'none'; report-to csp; report-uri https://api.kokoah.example/v1/csp-reports
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src https://api.hyperliquid.xyz https://api.hyperliquid-testnet.xyz https://api.kokoah.example; worker-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors https://app.kokoah.example; require-trusted-types-for 'script'; trusted-types 'none'; report-to csp; report-uri https://api.kokoah.example/v1/csp-reports
   Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer

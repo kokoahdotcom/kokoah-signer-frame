@@ -25,7 +25,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { loadEnv } from "vite";
-import { buildMetaCsp, hlApiOrigin, parseFrameConfig, type FrameConfig } from "../src/frame/config.ts";
+import { buildMetaCsp, connectOrigins, parseFrameConfig, type FrameConfig } from "../src/frame/config.ts";
 
 export const MANIFEST_SCHEMA = "kokoah.release-manifest/v1";
 const EXCLUDED = new Set(["_headers", "_redirects", "_routes.json"]);
@@ -219,7 +219,9 @@ export function checkHeaders(headers: string, config: FrameConfig): string[] {
   for (const a of ancestors) {
     if (!config.allowedParentOrigins.includes(a)) problems.push(`_headers frame-ancestors allows ${a}, which is not in VITE_ALLOWED_PARENT_ORIGINS`);
   }
-  if (!(csp.get("connect-src") ?? []).includes(hlApiOrigin(config))) problems.push(`_headers connect-src does not include ${hlApiOrigin(config)}`);
+  for (const o of connectOrigins(config)) {
+    if (!(csp.get("connect-src") ?? []).includes(o)) problems.push(`_headers connect-src does not include ${o}`);
+  }
   if ((csp.get("script-src") ?? []).join(" ") !== "'self'") problems.push("_headers script-src must be exactly 'self'");
   return problems;
 }
