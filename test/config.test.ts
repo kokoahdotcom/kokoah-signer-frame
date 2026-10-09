@@ -56,6 +56,16 @@ describe("build-time configuration", () => {
     expect(dev.network.infoUrl).toBe("http://localhost:47801/hl/info");
     expect(parseFrameConfig({ ...base, VITE_BUILDER_ADDRESS: BUILDER.toUpperCase().replace("0X", "0x") }, { production: true }).builder.address).toBe(BUILDER);
   });
+
+  it("reads an optional builder-fee promotion", () => {
+    expect(parseFrameConfig(base, { production: true }).builder.promo).toBeNull();
+    const promo = (env: Record<string, string>) => parseFrameConfig({ ...base, ...env }, { production: true }).builder.promo;
+    expect(promo({ VITE_BUILDER_FEE_PROMO_UNTIL: "2026-12-01T00:00:00Z" })).toEqual({ feeTenthsBps: 0, until: Date.UTC(2026, 11, 1) });
+    expect(promo({ VITE_BUILDER_FEE_PROMO_UNTIL: "2026-12-01T00:00:00Z", VITE_BUILDER_FEE_PROMO_TENTHS_BPS: "10" })).toEqual({ feeTenthsBps: 10, until: Date.UTC(2026, 11, 1) });
+    expect(problems({ VITE_BUILDER_FEE_PROMO_UNTIL: "December 1" })).toHaveLength(1);
+    expect(problems({ VITE_BUILDER_FEE_PROMO_UNTIL: "2026-12-01T00:00:00Z", VITE_BUILDER_FEE_PROMO_TENTHS_BPS: "30" }).join()).toMatch(/must not exceed/);
+    expect(problems({ VITE_BUILDER_FEE_PROMO_TENTHS_BPS: "0" }).join()).toMatch(/needs VITE_BUILDER_FEE_PROMO_UNTIL/);
+  });
 });
 
 describe("CSP consistency with kokoah-infra/headers", () => {

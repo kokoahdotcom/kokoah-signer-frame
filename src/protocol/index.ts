@@ -154,7 +154,7 @@ export interface PolicySummary {
   /** Max distance of a limit price from the mark price, percent. */
   priceBandPct: number;
   requireStopLossForNewEntries: boolean;
-  /** Every order carries exactly this builder code. */
+  /** Every order carries this builder code, with a fee of at most this (a promotion charges less). */
   builder: { address: Hex; feeTenthsBps: number };
   /** Always false: the frame never acts for a Hyperliquid vault (see `ownSubAccountsAllowed` for sub-accounts). */
   vaultAddressAllowed: false;
@@ -273,7 +273,11 @@ export interface HelloResult {
      */
     confirmsLooserLimits?: boolean;
   };
-  builder: { address: Hex; feeTenthsBps: number };
+  /**
+   * The builder code on every order. `feeTenthsBps` is the standard fee (the most an order pays; the policy's cap).
+   * `promo`: a lower fee orders pay until `until` (ms since the epoch); null or absent (older frames): none.
+   */
+  builder: { address: Hex; feeTenthsBps: number; promo?: { feeTenthsBps: number; until: number } | null };
   /**
    * The frame's status at the handshake (key state, `expiringSoon`/`expired`, policy), so the app knows the key's
    * state without depending on events it may not have subscribed to yet.

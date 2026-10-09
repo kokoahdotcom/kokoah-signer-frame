@@ -11,6 +11,7 @@
  * @module
  */
 import { getNetworkConfig, type NetworkConfig } from "@kokoah/shared/network";
+import { builderFeeScheduleProblem, type BuilderFeePromo } from "@kokoah/shared/risk";
 
 /** Raw environment (e.g. `import.meta.env` or Vite's `loadEnv`). */
 export type RawEnv = Readonly<Record<string, string | boolean | undefined>>;
@@ -21,8 +22,11 @@ export interface FrameConfig {
   readonly network: NetworkConfig;
   /** Exact parent origins allowed to talk to the frame (and to embed it: keep `frame-ancestors` in sync). */
   readonly allowedParentOrigins: readonly string[];
-  /** Builder code attached to every order. */
-  readonly builder: { readonly address: `0x${string}`; readonly feeTenthsBps: number };
+  /**
+   * Builder code attached to every order: the standard fee (the policy's cap), and an optional promotion whose lower
+   * fee orders pay until it ends (`builderFeeAt`).
+   */
+  readonly builder: { readonly address: `0x${string}`; readonly feeTenthsBps: number; readonly promo: BuilderFeePromo | null };
   /** Default agent name for `createAgent`. */
   readonly defaultAgentName: string;
   /**
@@ -54,6 +58,8 @@ export class FrameConfigError extends Error {
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const AGENT_NAME_RE = /^[A-Za-z0-9._-]{1,16}$/;
 const REFERRAL_CODE_RE = /^[A-Za-z0-9_-]{1,20}$/;
+/** An ISO 8601 time with its offset (`2026-12-01T00:00:00Z`). */
+const INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 function str(env: RawEnv, key: string): string | undefined {
@@ -74,6 +80,9 @@ function str(env: RawEnv, key: string): string | undefined {
  *   `http://localhost`/`127.0.0.1` are accepted in development builds.
  * - `VITE_BUILDER_ADDRESS`: the Kokoah builder address (required).
  * - `VITE_BUILDER_FEE_TENTHS_BPS`: builder fee in tenths of a basis point, integer 0–100 (required).
+ * - `VITE_BUILDER_FEE_PROMO_UNTIL`, `VITE_BUILDER_FEE_PROMO_TENTHS_BPS`: an optional promotion: orders pay the promo
+ *   fee (default 0, at most the standard fee) until that ISO 8601 time with its offset. The backend's and the signer
+ *   service's `KOKOAH_BUILDER_FEE_PROMO_*` must match (the app compares them at the handshake).
  * - `VITE_AGENT_NAME`: default agent name (default `kokoah-web`), 1–16 of `A–Z a–z 0–9 . _ -`.
  * - `VITE_HL_REFERRAL_CODE`: optional, Kokoah's Hyperliquid referral code (1–20 of `A–Z a–z 0–9 _ -`); keep it equal
  *   to the backend's `HL_REFERRAL_CODE`. Unset: the frame never signs `setReferrer`.
@@ -157,6 +166,19 @@ export function parseFrameConfig(env: RawEnv, options: { production: boolean }):
   if (feeRaw === undefined) problems.push("VITE_BUILDER_FEE_TENTHS_BPS is required (tenths of a basis point, e.g. 25 = 0.025%)");
   else if (!/^\d{1,3}$/.test(feeRaw) || Number(feeRaw) > 100) problems.push("VITE_BUILDER_FEE_TENTHS_BPS must be an integer between 0 and 100 (the perps cap, 0.1%)");
   else feeTenthsBps = Number(feeRaw);
+  let promo: BuilderFeePromo | null = null;
+  const promoUntilRaw = str(env, "VITE_BUILDER_FEE_PROMO_UNTIL");
+  const promoFeeRaw = str(env, "VITE_BUILDER_FEE_PROMO_TENTHS_BPS") ?? "0";
+  if (promoUntilRaw !== undefined) {
+    const until = INSTANT_RE.test(promoUntilRaw) ? Date.parse(promoUntilRaw) : Number.NaN;
+    if (!Number.isFinite(until)) problems.push("VITE_BUILDER_FEE_PROMO_UNTIL must be an ISO 8601 time with its offset, e.g. 2026-12-01T00:00:00Z");
+    else if (!/^\d{1,3}$/.test(promoFeeRaw)) problems.push("VITE_BUILDER_FEE_PROMO_TENTHS_BPS must be an integer between 0 and 100");
+    else {
+      promo = { feeTenthsBps: Number(promoFeeRaw), until };
+      const problem = builderFeeScheduleProblem({ feeTenthsBps, promo });
+      if (problem) problems.push(`VITE_BUILDER_FEE_PROMO_TENTHS_BPS: ${problem}`);
+    }
+  } else if (str(env, "VITE_BUILDER_FEE_PROMO_TENTHS_BPS") !== undefined) problems.push("VITE_BUILDER_FEE_PROMO_TENTHS_BPS needs VITE_BUILDER_FEE_PROMO_UNTIL");
 
   // Agent name.
   const nameRaw = str(env, "VITE_AGENT_NAME") ?? "kokoah-web";
@@ -175,7 +197,7 @@ export function parseFrameConfig(env: RawEnv, options: { production: boolean }):
   return Object.freeze({
     network,
     allowedParentOrigins: Object.freeze([...allowedParentOrigins]),
-    builder: Object.freeze({ address: builderAddress, feeTenthsBps }),
+    builder: Object.freeze({ address: builderAddress, feeTenthsBps, promo: promo && Object.freeze(promo) }),
     defaultAgentName: nameRaw,
     referralCode: referralRaw ?? null,
     hlApiUrlOverride,

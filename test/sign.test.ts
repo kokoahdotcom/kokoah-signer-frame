@@ -11,6 +11,21 @@ afterEach(() => h?.destroy());
 const NETWORK = testConfig().network;
 
 describe("signAndSubmit happy path", () => {
+  it("charges the promotional builder fee until the promotion ends, under the standard-fee policy", async () => {
+    const until = T0 + 60_000;
+    h = await FrameHarness.create({ config: testConfig({ VITE_BUILDER_FEE_PROMO_UNTIL: new Date(until).toISOString() }) });
+    const hello = await h.ok("hello", { protocolVersion: 1 });
+    expect(hello.builder).toEqual({ address: BUILDER, feeTenthsBps: 25, promo: { feeTenthsBps: 0, until } });
+    await h.activeAgent("device");
+    expect((await h.ok("signAndSubmit", { requestId: "promo-1", intent: limitOrder() })).status).toBe("ok");
+    h.clock.advance(60_000);
+    expect((await h.ok("signAndSubmit", { requestId: "promo-2", intent: limitOrder() })).status).toBe("ok");
+    expect(h.hl.exchangeCalls.map((c) => c.body.action.builder)).toEqual([
+      { b: BUILDER, f: 0 },
+      { b: BUILDER, f: 25 },
+    ]);
+  });
+
   it("signs with the agent key, submits the body buildExchangeRequest would build, with the builder", async () => {
     h = await FrameHarness.create();
     const { address } = await h.activeAgent("device");

@@ -29,6 +29,7 @@ import { safeParseActionIntent, type ActionIntent } from "@kokoah/shared/intents
 import { deviceLinkCode } from "@kokoah/shared/link";
 import { isWriteAllowed } from "@kokoah/shared/network";
 import type { Policy } from "@kokoah/shared/policy";
+import { builderFeeAt } from "@kokoah/shared/risk";
 import { buildApproveAgent, buildRevokeAgent, parseAgentName, prepareL1Request } from "@kokoah/shared/signing";
 import { SubAccountLookupError, SubAccountOwnership } from "@kokoah/shared/subaccounts";
 import { HLP_LOCKUP_DAYS, HLP_VAULT_ADDRESSES, vaultDepositsSince, vaultUnitsToUsd } from "@kokoah/shared/vaults";
@@ -701,7 +702,7 @@ export class FrameCore {
         vaultTransfers: true,
         confirmsLooserLimits: true,
       },
-      builder: { address: this.config.builder.address, feeTenthsBps: this.config.builder.feeTenthsBps },
+      builder: { address: this.config.builder.address, feeTenthsBps: this.config.builder.feeTenthsBps, promo: this.config.builder.promo },
       status: this.status(),
       limits: {
         maxMessageBytes: MAX_MESSAGE_BYTES,
@@ -1561,7 +1562,7 @@ export class FrameCore {
     try {
       compiled = compileAction(intent, {
         registry: snapshot.registry,
-        builder: { address: this.config.builder.address, feeTenthsBps: this.config.builder.feeTenthsBps },
+        builder: { address: this.config.builder.address, feeTenthsBps: builderFeeAt(this.config.builder, this.correctedNow()) },
         getMidPrice: (coin) => snapshot.midPrices[coin],
         now: this.correctedNow(),
       });
