@@ -70,7 +70,7 @@ describe("KokoahSignerClient", () => {
     const { client, sentByClient } = await connected();
     const hello = await client.hello();
     expect(hello.network).toBe("testnet");
-    expect(hello.builder).toEqual({ address: "0x00000000000000000000000000000000000b0b1d", feeTenthsBps: 25 });
+    expect(hello.builder).toEqual({ address: "0x00000000000000000000000000000000000b0b1d", feeTenthsBps: 25, promo: null });
     expect(hello.frameOrigin).toBe(FRAME_ORIGIN);
     expect(client.connection).toEqual(hello);
     expect(await client.hello()).toBe(hello); // cached
