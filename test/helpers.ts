@@ -386,6 +386,8 @@ export interface HarnessOptions {
   logger?: FrameDeps["logger"];
   withUi?: boolean;
   promptTimeoutMs?: number;
+  /** Prompt arming delay (default 0 here, so tests don't wait; test/prompt.test.ts covers the real delay). */
+  promptArmMs?: number;
 }
 
 export class FrameHarness {
@@ -447,6 +449,7 @@ export class FrameHarness {
       },
       ...(o.logger ? { logger: o.logger } : {}),
       ...(o.promptTimeoutMs !== undefined ? { promptTimeoutMs: o.promptTimeoutMs } : {}),
+      promptArmMs: o.promptArmMs ?? 0,
     });
     return new FrameHarness({ core, parent, hl, clock, idb, root, generatedKeys });
   }

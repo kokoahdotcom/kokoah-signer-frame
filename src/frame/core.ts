@@ -155,6 +155,8 @@ export interface FrameDeps {
   generatePrivateKey?: () => Hex;
   /** How long a prompt waits for the user. Default 120 s. */
   promptTimeoutMs?: number;
+  /** How long a prompt is shown (and seen, where the browser can tell) before it can be confirmed. Default PROMPT_ARM_MS. */
+  promptArmMs?: number;
   logger?: Logger;
 }
 
@@ -290,7 +292,7 @@ export class FrameCore {
     this.limits = { rev: 0, master: null, accounts: new Map(), policy: this.baseline };
     this.instanceId = bytesToHex(randomBytes(deps.crypto, 8));
     const root = deps.uiRoot ?? deps.document?.body ?? null;
-    this.ui = deps.document && root ? new PromptUi(deps.document, root, (visible, kind) => this.emit("promptChanged", { visible, kind })) : null;
+    this.ui = deps.document && root ? new PromptUi(deps.document, root, (visible, kind) => this.emit("promptChanged", { visible, kind }), deps.promptArmMs) : null;
     if (deps.broadcast) deps.broadcast.onmessage = (ev) => this.onBroadcast(ev.data);
   }
 

@@ -51,8 +51,21 @@ function el<K extends keyof HTMLElementTagNameMap>(doc: Document, tag: K, classN
   return e;
 }
 
+/**
+ * How long the prompt must have been shown, and seen whole and unobscured where the browser can tell, before its
+ * primary button works. The parent page learns the moment a prompt opens (`promptChanged`, so it can make room for
+ * it); without this, a hostile page could time a click or a key press onto a prompt the user never saw, or cover it.
+ */
+export const PROMPT_ARM_MS = 800;
+
+type VisibilityEntry = IntersectionObserverEntry & { isVisible?: boolean };
+
 export class PromptUi {
   private readonly onChange: (visible: boolean, kind: PromptKind | null) => void;
+  private readonly armMs: number;
+  private armed = false;
+  private armTimer: ReturnType<typeof setTimeout> | undefined;
+  private observer: IntersectionObserver | null = null;
   private readonly idle: HTMLElement;
   private readonly idleText: HTMLElement;
   private readonly panel: HTMLElement;
@@ -63,8 +76,9 @@ export class PromptUi {
   private readonly status: HTMLElement;
   private active: PromptKind | null = null;
 
-  constructor(doc: Document, root: HTMLElement, onChange: (visible: boolean, kind: PromptKind | null) => void) {
+  constructor(doc: Document, root: HTMLElement, onChange: (visible: boolean, kind: PromptKind | null) => void, armMs = PROMPT_ARM_MS) {
     this.onChange = onChange;
+    this.armMs = armMs;
     this.idle = el(doc, "section", "ks-idle");
     this.idle.setAttribute("aria-label", "Kokoah signer status");
     this.idleText = el(doc, "p", "ks-idle-text", "Kokoah signer");
@@ -120,7 +134,7 @@ export class PromptUi {
       };
       const timer = setTimeout(() => finish(() => reject(new PromptError("USER_TIMEOUT", "The user did not respond in time."))), req.timeoutMs);
       this.primary.onclick = () => {
-        if (settled || running) return;
+        if (settled || running || !this.armed) return;
         running = true;
         this.setBusy(true, "Waiting for your passkey…");
         let p: Promise<T>;
@@ -161,10 +175,56 @@ export class PromptUi {
     this.idle.hidden = true;
     this.panel.hidden = false;
     this.onChange(true, req.kind);
-    this.primary.focus();
+    // Focus starts on Cancel: a key press meant for the page (Enter, Space) can't confirm.
+    this.secondary.focus();
+    this.arm();
+  }
+
+  /**
+   * Enables the primary button once the prompt has been shown for `armMs`. Where the browser reports occlusion
+   * (IntersectionObserver v2, `isVisible`), that time counts only while the whole prompt is visible and unobscured;
+   * covering, fading or hiding it disables the button again and restarts the wait.
+   */
+  private arm(): void {
+    this.disarm();
+    const start = () => {
+      clearTimeout(this.armTimer);
+      this.armTimer = setTimeout(() => {
+        this.armed = true;
+        if (this.panel.getAttribute("aria-busy") !== "true") this.primary.disabled = false;
+      }, this.armMs);
+    };
+    const win = this.panel.ownerDocument.defaultView as (Window & typeof globalThis) | null;
+    const tracksVisibility = !!win?.IntersectionObserver && !!win.IntersectionObserverEntry && "isVisible" in win.IntersectionObserverEntry.prototype;
+    if (!win || !tracksVisibility) {
+      start();
+      return;
+    }
+    this.observer = new win.IntersectionObserver(
+      (entries) => {
+        const entry = entries.at(-1) as VisibilityEntry | undefined;
+        if (entry?.isVisible) start();
+        else this.disarm(false);
+      },
+      // `trackVisibility` and `delay` are IntersectionObserver v2 options (not in every DOM typing).
+      { threshold: [1], trackVisibility: true, delay: 100 } as IntersectionObserverInit,
+    );
+    this.observer.observe(this.panel);
+  }
+
+  /** Disables the primary button until the prompt is armed again; also stops watching it unless `stopWatching` is false. */
+  private disarm(stopWatching = true): void {
+    clearTimeout(this.armTimer);
+    this.armed = false;
+    this.primary.disabled = true;
+    if (stopWatching) {
+      this.observer?.disconnect();
+      this.observer = null;
+    }
   }
 
   private hide(): void {
+    this.disarm();
     this.panel.hidden = true;
     this.idle.hidden = false;
     this.active = null;
@@ -173,7 +233,7 @@ export class PromptUi {
   }
 
   private setBusy(busy: boolean, status: string): void {
-    this.primary.disabled = busy;
+    this.primary.disabled = busy || !this.armed;
     this.secondary.disabled = busy;
     this.panel.setAttribute("aria-busy", busy ? "true" : "false");
     this.status.textContent = status;
