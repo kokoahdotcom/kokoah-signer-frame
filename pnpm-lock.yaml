@@ -15,8 +15,8 @@ importers:
         specifier: 1.5.0
         version: 1.5.0(typescript@6.0.3)
       viem:
-        specifier: 2.56.9
-        version: 2.56.9(typescript@6.0.3)
+        specifier: 2.57.3
+        version: 2.57.3(typescript@6.0.3)
     devDependencies:
       '@types/node':
         specifier: 24.13.6
@@ -543,8 +543,8 @@ packages:
       typescript:
         optional: true
 
-  viem@2.56.9:
-    resolution: {integrity: sha512-UC1G0Qz+RbPKqwl6yRrp3dH6ltrOmUcFJMTcOyE1Mg0nO5lxrEBTONh/8OFWPnALGuN/O7LkNcz/IsSj83Svqw==}
+  viem@2.57.3:
+    resolution: {integrity: sha512-441q6Z42ZU7+mTJrYAjQsBpVWK76nyGQcKOCGT6hp+tBpw1XsnTIgKaqZFLTaW5xmBN1ummEFgzFWmR05FISTg==}
     peerDependencies:
       typescript: '>=5.0.4'
     peerDependenciesMeta:
@@ -1079,7 +1079,7 @@ snapshots:
     optionalDependencies:
       typescript: 6.0.3
 
-  viem@2.56.9(typescript@6.0.3):
+  viem@2.57.3(typescript@6.0.3):
     dependencies:
       '@noble/curves': 1.9.1
       '@noble/hashes': 1.8.0
