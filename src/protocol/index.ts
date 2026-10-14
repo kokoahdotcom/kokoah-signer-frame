@@ -272,6 +272,14 @@ export interface HelloResult {
      * the baseline: there, tell the user nothing about confirming in the signer window.
      */
     confirmsLooserLimits?: boolean;
+    /**
+     * The frame signs orders above `limits.confirmOrdersAboveUsd` in all (every order of one `signAndSubmit`, reduce-only
+     * ones included, size × max(limit, trigger, mark)) only after the user presses and holds the button of its own
+     * prompt (`promptChanged` kind `order`), which names every order. `signAndSubmit` waits for it (the client doesn't
+     * time out while a prompt is open); cancel or timeout: `USER_CANCELLED` / `USER_TIMEOUT` with `details.prompt:
+     * "order"`, nothing sent. Absent in older frames, which sign them without a prompt.
+     */
+    confirmsLargeOrders?: boolean;
   };
   /**
    * The builder code on every order. `feeTenthsBps` is the standard fee (the most an order pays; the policy's cap).
@@ -289,6 +297,8 @@ export interface HelloResult {
     maxValidForDays: number;
     expiresAfterMs: number;
     maxAgentNameLength: number;
+    /** With `capabilities.confirmsLargeOrders`: orders above this (USD, in all) need the user's confirmation in the frame. */
+    confirmOrdersAboveUsd?: number;
   };
 }
 
@@ -634,7 +644,7 @@ export interface EventData {
   /** The key has expired; the frame refuses to sign with it. */
   keyExpired: { agentAddress: Hex; validUntil: number };
   /** The frame needs (or no longer needs) the user to click inside it. Show the iframe while `visible` is true. */
-  promptChanged: { visible: boolean; kind: "passkey-create" | "passkey-unlock" | "vault-deposit" | "limits" | null };
+  promptChanged: { visible: boolean; kind: "passkey-create" | "passkey-unlock" | "vault-deposit" | "limits" | "order" | null };
 }
 
 // ---------------------------------------------------------------------------------------------

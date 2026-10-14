@@ -148,6 +148,45 @@ describe("KokoahSignerClient", () => {
     ]);
   });
 
+  describe("while the frame asks the user about a signAndSubmit", () => {
+    /** A connected client with an active key; `big` is a $30,000 BTC buy, which the frame asks the user about. */
+    async function trading(clientOptions: Partial<ConstructorParameters<typeof KokoahSignerClient>[0]> = {}) {
+      const c = await connected({ clientOptions });
+      const created = await c.client.createAgent({ userAddress: USER, validForDays: 30, storageMode: "device" });
+      c.h.hl.approve(USER, created.agentAddress, created.agentName, created.validUntil);
+      await c.client.confirmAgent({ timeoutMs: 1_000 });
+      expect(c.client.connection?.capabilities.confirmsLargeOrders).toBe(true);
+      const big = (requestId: string) => ({ requestId, intent: limitOrder({ coin: "BTC", size: "0.3", price: "100000" }) as never });
+      return { ...c, big };
+    }
+
+    it("doesn't time it out while the prompt is open, and gives it its full time again once it closes", async () => {
+      const { h, client, big } = await trading({ interactiveTimeoutMs: 5_000 });
+      // 200 ms would end it long before the user answers.
+      const sign = client.request("signAndSubmit", big("slow-user"), 200);
+      await waitFor(() => !client.iframe.hidden);
+      expect(client.iframe.getAttribute("data-kokoah-signer-prompt")).toBe("order");
+      await new Promise((r) => setTimeout(r, 600));
+      await h.clickPrompt();
+      expect(await sign).toMatchObject({ status: "ok", requestId: "slow-user" });
+      // A cancel arrives as the frame's own answer.
+      const cancelled = client.request("signAndSubmit", big("declined"), 200).catch((e: unknown) => e);
+      await waitFor(() => !client.iframe.hidden);
+      await new Promise((r) => setTimeout(r, 400));
+      await h.clickPrompt("cancel");
+      expect(await cancelled).toMatchObject({ code: "USER_CANCELLED", details: { prompt: "order" } });
+    });
+
+    it("still ends it after interactiveTimeoutMs when the prompt stays open", async () => {
+      const { client, big } = await trading({ interactiveTimeoutMs: 300 });
+      const sign = client.request("signAndSubmit", big("left-open"), 100).catch((e: unknown) => e);
+      await waitFor(() => !client.iframe.hidden);
+      const started = Date.now();
+      expect(await sign).toMatchObject({ code: "TIMEOUT", method: "signAndSubmit" });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(250);
+    });
+  });
+
   it("listeners registered before hello() receive the events the frame emits right after hello", async () => {
     // A device key that expires in 5 days, stored by an earlier frame load.
     const first = await FrameHarness.create();

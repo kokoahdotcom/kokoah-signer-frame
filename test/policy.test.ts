@@ -107,7 +107,10 @@ describe("policy through signAndSubmit", () => {
     const e = await h.fail("signAndSubmit", { requestId: "n1", intent: btc("2.6") });
     expect(e.details?.violations?.map((v) => v.code)).toEqual(["ORDER_NOTIONAL_EXCEEDED"]);
     expect(h.hl.exchangeCalls).toHaveLength(0);
-    expect((await h.ok("signAndSubmit", { requestId: "n2", intent: btc("2.6", { side: "sell", reduceOnly: true }) })).status).toBe("ok");
+    // Exempt from the cap, but above $25,000: it waits for the user's confirmation in the frame.
+    const close = h.ok("signAndSubmit", { requestId: "n2", intent: btc("2.6", { side: "sell", reduceOnly: true }) });
+    await h.clickPrompt();
+    expect((await close).status).toBe("ok");
   });
 
   it("lets resting limits sit up to 50% from HL's mark, but bands orders that execute now at 5%", async () => {

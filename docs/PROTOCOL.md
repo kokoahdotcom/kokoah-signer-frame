@@ -91,7 +91,7 @@ store.setSignerStatus(hello.status);                 // includes expiringSoon / 
 
 | Member | Notes |
 |---|---|
-| `new KokoahSignerClient(options)` | `frameUrl` (required; https, or http for localhost). Optional: `container` (default `document.body`), `requestTimeoutMs` (30 s), `interactiveTimeoutMs` (300 s, used by `unlock`, `setStorageMode`, `setLimits` and passkey `createAgent`), `helloTimeoutMs` (15 s), `autoShowOnPrompt` (true), `iframeTitle`, `clientInfo`. |
+| `new KokoahSignerClient(options)` | `frameUrl` (required; https, or http for localhost). Optional: `container` (default `document.body`), `requestTimeoutMs` (30 s), `interactiveTimeoutMs` (300 s, used by `unlock`, `setStorageMode`, `setLimits` and passkey `createAgent`, and the least any request waits while the frame shows a prompt), `helloTimeoutMs` (15 s), `autoShowOnPrompt` (true), `iframeTitle`, `clientInfo`. |
 | `iframe` | The `<iframe data-kokoah-signer>`. Hidden (`hidden` attribute) except while the frame shows a prompt. Style it in the app. |
 | `frameOrigin` | The only origin the client sends to and accepts messages from. |
 | `hello(params?)` | Handshake; cached. Called automatically before the first other request. Repeated automatically, with the same params, when the frame reloads (see `reconnected`). |
@@ -133,7 +133,7 @@ signer.on("reconnected", (hello) => {
 
 The client sets no `sandbox`. If the app adds one, it must include `allow-scripts allow-same-origin`; without `allow-same-origin` the frame loses its origin and its storage. Passkeys in sandboxed iframes are unverified.
 
-**Showing the prompt.** When the frame needs a click (passkey ceremonies, an HLP deposit, a loosening of the user's limits), it emits `promptChanged {visible: true}`. The client then removes `hidden` from the iframe and sets `data-kokoah-signer-prompt="<kind>"`. Style that state as a modal, for example:
+**Showing the prompt.** When the frame needs the user (passkey ceremonies, an HLP deposit, a loosening of the user's limits, a large order), it emits `promptChanged {visible: true}`. The client then removes `hidden` from the iframe and sets `data-kokoah-signer-prompt="<kind>"`. Style that state as a modal, for example:
 
 ```css
 iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min(420px, 92vw); height: min(480px, 92vh); border: 0; border-radius: 12px; z-index: 1000; }
@@ -146,7 +146,7 @@ The iframe must be visible, on top and clickable. Don't cover it or make it tran
 starts over). Then a click counts only after the user's own pointer moved over the button inside the frame (a touch
 press on it, for pointers that can't hover); events a script dispatches, a key press and a pointer that was already
 resting where the button appeared don't count, and leaving the button needs new movement. Resizing the iframe, the
-frame losing focus or the page being hidden starts it all over. The `limits` and `vault-deposit` prompts are
+frame losing focus or the page being hidden starts it all over. The `limits`, `vault-deposit` and `order` prompts are
 confirmed by **pressing and holding** the button for 0.8 s (a bar fills; releasing early does nothing). Focus starts on
 Cancel. So don't resize or move the iframe while `visible`, and give the user a pointer path to it.
 
@@ -173,11 +173,12 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
     "indexedDB": true,
     "broadcastChannel": true,
     "vaultTransfers": true,
-    "confirmsLooserLimits": true
+    "confirmsLooserLimits": true,
+    "confirmsLargeOrders": true
   },
   "builder": { "address": "0x…builder", "feeTenthsBps": 25 },
   "status": { "hasKey": true, "keyState": "active", "expiringSoon": true, "expired": false, "…": "SignerStatus, see getStatus" },
-  "limits": { "maxMessageBytes": 65536, "minValidForDays": 1, "maxValidForDays": 30, "expiresAfterMs": 15000, "maxAgentNameLength": 16 }
+  "limits": { "maxMessageBytes": 65536, "minValidForDays": 1, "maxValidForDays": 30, "expiresAfterMs": 15000, "maxAgentNameLength": 16, "confirmOrdersAboveUsd": 25000 }
 }
 ```
 
@@ -190,6 +191,9 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
   after the user's click on its own prompt (see `setLimits`). Only then tell the user to confirm in the signer window.
   Absent in older frames: they keep limits in memory, apply anything within the baseline at once, and the app must
   re-apply limits after every load.
+- `confirmsLargeOrders` is true when the frame asks the user before signing orders above `limits.confirmOrdersAboveUsd`
+  ($25,000) in all (see `signAndSubmit`). Only then tell the user to confirm such an order in the signer window. Absent
+  in older frames, which sign them without asking.
 - `status` is the frame's `SignerStatus` at the handshake (see `getStatus`), including the key's expiry state.
 - Errors: `UNSUPPORTED_VERSION`.
 
@@ -545,6 +549,7 @@ list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE`
   - `POLICY_DENIED` (`details.violations`: every `{ code, message }` from shared `evaluatePolicy`, plus the frame's own rules);
   - `MARKET_DATA_UNAVAILABLE` (retryable);
   - `SIGNER_BUSY` (retryable; the signing lock wasn't free within 20 s);
+  - `USER_CANCELLED`, `USER_TIMEOUT`, `PROMPT_BUSY` (an HLP deposit or a large order the user didn't confirm; nothing sent);
   - `REQUEST_ID_REUSED`;
   - `MAINNET_WRITES_DISABLED`;
   - `STORAGE_FAILED` (retryable; the nonce, or the user's stored limits, could not be read or written: nothing was signed).
@@ -568,6 +573,22 @@ list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE`
 ```
 
 Sizes and prices must already be valid for the market (shared `formatSize`, `checkPrice`). The frame rejects them rather than sign a different number than the user saw.
+
+**Large orders** (`hello.capabilities.confirmsLargeOrders`). When the orders of one action come to more than
+`hello.limits.confirmOrdersAboveUsd` ($25,000) in all, each counted as size × max(limit price, trigger price, mark) and
+reduce-only orders included (a $10,000 entry with a take-profit and a stop-loss counts about $30,000), the frame signs
+them only after the user confirms its own prompt (`promptChanged` kind `order`, fixed styling, press and hold). The
+prompt lists each order as it will be signed, for example `Buy 0.3 BTC at $100,000 (limit) · about $30,000` or
+`Sell 0.3 BTC at market, down to $99,010 · reduce-only · about $30,000`, with the total and the sub-account if any.
+- It asks only about orders its rules allow (checked first) and doesn't hold up other requests meanwhile (a smaller
+  order or a cancel signs at once; a second large order while one is asked about is `PROMPT_BUSY`).
+- After the user confirms, it reads prices, dexes and leverage again and checks everything again under the agent lock:
+  a market that moved past the band while the prompt was open is `POLICY_DENIED` (`PRICE_OUTSIDE_BAND`).
+- Cancel or no answer within 120 s: `USER_CANCELLED` / `USER_TIMEOUT` with `details.prompt: "order"`. Nothing was sent,
+  so the `requestId` may be used again. Show something like "You cancelled the order in the signer. Nothing was sent."
+- The client doesn't time `signAndSubmit` out while a prompt is open (it waits up to `interactiveTimeoutMs`, and gets its
+  full timeout again once the prompt closes). While the call waits, tell the user to confirm in the Kokoah signer
+  window, and keep the iframe on top: a modal `<dialog>` of the app must step aside, or the user can't reach the button.
 
 ### `setLimits`
 
@@ -699,7 +720,7 @@ Allowed variables:
 | `statusChanged` | `SignerStatus` | Key created, confirmed, locked, unlocked, revoked, expired, changed in another tab; limits changed (in this tab or another) |
 | `keyExpiringSoon` | `{ agentAddress, validUntil, msRemaining }` | Once per key per frame load, when it expires within 7 days (right after `hello`, and on a timer). Show the renew banner. Also in `status.expiringSoon` |
 | `keyExpired` | `{ agentAddress, validUntil }` | Once per key per frame load, at `validUntil − 15 s`. The frame refuses to sign from then on. Also in `status.expired` |
-| `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| "vault-deposit" \| "limits" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true** |
+| `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| "vault-deposit" \| "limits" \| "order" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true** |
 | `reconnected` (client-side, not sent by the frame) | `HelloResult` | `KokoahSignerClient` re-ran `hello` after the frame reloaded ([§3](#3-the-client)). Re-apply `setLimits` (a no-op when stored) and `setTheme` |
 
 Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event": "promptChanged", "data": { "visible": true, "kind": "passkey-unlock" } }`
@@ -735,7 +756,7 @@ Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event":
 | `LIMIT_LOOSENING_REJECTED` | `setLimits` above the baseline, or a loosening in a frame with no user interface (`details.fields`) | Show which limit can't be raised |
 | `PASSKEY_UNAVAILABLE` | WebAuthn/PRF not usable | Offer `device` or `session` |
 | `PASSKEY_FAILED` | The WebAuthn ceremony failed | Retry |
-| `USER_CANCELLED` / `USER_TIMEOUT` | The user cancelled or didn't act within 120 s (a passkey ceremony, an HLP deposit, looser limits). `details.prompt` names the prompt's kind | Let them retry; nothing changed |
+| `USER_CANCELLED` / `USER_TIMEOUT` | The user cancelled or didn't act within 120 s (a passkey ceremony, an HLP deposit, looser limits, a large order). `details.prompt` names the prompt's kind | Let them retry; nothing changed |
 | `PROMPT_BUSY` | A prompt is already open (`details.prompt`: the kind asked for) | Wait |
 | `UNLOCK_FAILED` | Stored key can't be decrypted | Revoke and create a new key |
 | `STORAGE_FAILED` | IndexedDB read or write failed (the key, or the stored limits) | Retry, or use `session` |
@@ -763,6 +784,7 @@ The baseline is built into the frame and can't be loosened:
 | Leverage | **50x**, and never above each market's own maximum (`updateLeverage` above it is denied). Where a market allows more than the cap (the baseline's or the user's), the frame reads the account's leverage on HL itself and refuses new entries while it is set higher |
 | Rate | **60 orders per minute** per agent (TP/SL legs count; cancels don't). Persisted, so a reload doesn't reset it |
 | Notional | $250,000 per order, $25,000,000 per UTC day per key across every account (reduce-only orders exempt) |
+| Large orders | More than $25,000 of orders in one action (reduce-only included) only after the user confirms the frame's own prompt (`signAndSubmit`, "Large orders") |
 | `expiresAfter` | Required; the frame uses now + 15 s (window ≤ 30 s) |
 | Origins | `manual`, `ai_ticket` |
 

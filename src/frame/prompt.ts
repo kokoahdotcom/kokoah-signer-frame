@@ -1,7 +1,8 @@
 /**
  * The frame's tiny in-frame UI: an idle status line and a prompt (short text, a primary button, a cancel button) used
- * when the user must act inside the frame (WebAuthn needs a click in the frame's own document; an HLP deposit and a
- * loosening of the user's limits need the user's own confirmation of the frame's own description of them).
+ * when the user must act inside the frame (WebAuthn needs a click in the frame's own document; an HLP deposit, a
+ * loosening of the user's limits and large orders need the user's own confirmation of the frame's own description of
+ * them).
  *
  * The DOM is built with `createElement` and `textContent` only: the frame's CSP has `trusted-types 'none'`, so any
  * HTML sink (`innerHTML`, …) would throw. Styling comes from `frame.css` and CSS custom properties that the parent
@@ -13,9 +14,10 @@ import { THEME_VARIABLES, type SetThemeParams, type ThemeVariable } from "../pro
 
 /**
  * `vault-deposit`: the user confirms an HLP deposit inside the frame before the trading key signs it. `limits`: the
- * user confirms a `setLimits` that loosens their stored limits.
+ * user confirms a `setLimits` that loosens their stored limits. `order`: the user confirms orders above
+ * `CONFIRM_ORDERS_ABOVE_USD` (policy.ts) before they are signed.
  */
-export type PromptKind = "passkey-create" | "passkey-unlock" | "vault-deposit" | "limits";
+export type PromptKind = "passkey-create" | "passkey-unlock" | "vault-deposit" | "limits" | "order";
 
 export interface PromptRequest {
   kind: PromptKind;
