@@ -1,6 +1,6 @@
 import { IDBFactory } from "fake-indexeddb";
 import { afterEach, describe, expect, it } from "vitest";
-import { nextUsage, SignerBusyError, SigningCoordinator, UsageLimitError, usageOf } from "../src/frame/nonces.js";
+import { HLP_DEPOSIT_RECENT_MS, nextUsage, SignerBusyError, SigningCoordinator, UsageLimitError, usageOf } from "../src/frame/nonces.js";
 import { IdbSignerStore, MemorySignerStore } from "../src/frame/storage.js";
 import { Clock, FakeLocks, FrameHarness, limitOrder, MockHl, T0 } from "./helpers.js";
 
@@ -110,6 +110,28 @@ describe("nonces across two tabs sharing IndexedDB", () => {
     await c1!.reserve("0xdef", { now: T0, orders: 0, notionalUsd: 0, limits: few });
     await expect(c2!.reserve("0xdef", { now: T0, orders: 0, notionalUsd: 0, limits: few })).rejects.toThrow("signed actions per minute");
     expect(usageOf(await tabs[0]!.readUsage("0xdef"), T0 + 61_000).actionsInLastMinute).toBe(0);
+  });
+
+  it("records HLP deposits with the nonce for every tab, and refuses one whose cap check missed a deposit recorded since", async () => {
+    const idb = new IDBFactory();
+    const tabs = await Promise.all([IdbSignerStore.open(idb), IdbSignerStore.open(idb)]);
+    const [c1, c2] = tabs.map((store) => new SigningCoordinator({ store, locks: undefined, lockPrefix: "t" }));
+    // Both tabs checked the cap counting no recent deposit: only the first reservation stands.
+    const deposit = { master: "0xMaster", usd: 10_000, countedUsd: 0 };
+    const results = await Promise.allSettled([c1!, c2!].map((c) => c.reserve("0xabc", { now: T0, orders: 0, notionalUsd: 0, hlpDeposit: deposit })));
+    expect(results.map((r) => r.status).sort()).toEqual(["fulfilled", "rejected"]);
+    expect((results.find((r) => r.status === "rejected") as PromiseRejectedResult).reason).toMatchObject({ code: "VAULT_DEPOSIT_LIMIT" });
+    expect(await c2!.recentHlpDepositsUsd("0xabc", "0xmaster", T0)).toBe(10_000);
+    // Counted, the next one is recorded too; other actions keep them; another master's are its own.
+    await c2!.reserve("0xabc", { now: T0 + 1_000, orders: 0, notionalUsd: 0, hlpDeposit: { ...deposit, usd: 5_000, countedUsd: 10_000 } });
+    await c1!.reserve("0xabc", { now: T0 + 2_000, orders: 1, notionalUsd: 10 });
+    expect(await c1!.recentHlpDepositsUsd("0xabc", "0xMASTER", T0 + 2_000)).toBe(15_000);
+    expect(await c1!.recentHlpDepositsUsd("0xabc", "0xother", T0 + 2_000)).toBe(0);
+    // Then the ledger alone counts them.
+    expect(await c1!.recentHlpDepositsUsd("0xabc", "0xmaster", T0 + 1_000 + HLP_DEPOSIT_RECENT_MS)).toBe(0);
+    const later = await c1!.reserve("0xabc", { now: T0 + 2_000 + HLP_DEPOSIT_RECENT_MS, orders: 0, notionalUsd: 0 });
+    expect(later).toBeGreaterThan(T0);
+    expect((await tabs[0]!.readUsage("0xabc"))?.hlpDeposits).toBeUndefined();
   });
 });
 

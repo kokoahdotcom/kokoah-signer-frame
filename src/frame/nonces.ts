@@ -10,8 +10,8 @@
  * - **Formula**: `@kokoah/shared` `MonotonicNonceManager`: `max(now + clockOffset, last + 1)`, where `last` is the
  *   persisted value and the clock offset comes from HL `exchangeStatus` server time.
  *
- * The same record tracks per-minute order counts and today's notional, so reloading the frame does not reset the
- * rate limit.
+ * The same record tracks per-minute order counts, today's notional and the last few minutes of HLP deposits, so
+ * reloading the frame or using another tab does not reset the rate limit or the HLP cap.
  *
  * @module
  */
@@ -41,10 +41,16 @@ export class ReferrerAlreadySignedError extends Error {
 
 const MINUTE = 60_000;
 
+/**
+ * How long an HLP deposit this agent signed counts toward the 24-hour cap on top of Hyperliquid's ledger, which can lag
+ * a deposit by a few seconds (counted twice for a moment: stricter).
+ */
+export const HLP_DEPOSIT_RECENT_MS = 5 * MINUTE;
+
 /** A limit the reservation found exceeded (checked again inside the storage transaction; see {@link SigningCoordinator.reserve}). */
 export class UsageLimitError extends Error {
   /** The shared policy code (the action rate reports as ORDER_RATE_EXCEEDED, with its own message). */
-  readonly code: "ORDER_RATE_EXCEEDED" | "DAILY_NOTIONAL_EXCEEDED";
+  readonly code: "ORDER_RATE_EXCEEDED" | "DAILY_NOTIONAL_EXCEEDED" | "VAULT_DEPOSIT_LIMIT";
   constructor(code: UsageLimitError["code"], message: string) {
     super(message);
     this.name = "UsageLimitError";
@@ -146,15 +152,31 @@ export class SigningCoordinator {
     return typeof (await this.store.readUsage(agent))?.referrerSignedAt === "number";
   }
 
+  /** HLP deposits (USD) this agent signed for `master` in the last {@link HLP_DEPOSIT_RECENT_MS}, in any tab. */
+  async recentHlpDepositsUsd(agent: string, master: string, now: number): Promise<number> {
+    return recentHlpDepositsUsd(await this.store.readUsage(agent), master, now);
+  }
+
   /**
    * Reserves the next nonce for `agent` and records the orders and notional this action adds, atomically.
    * `referrer`: this action is `setReferrer`; it is recorded in the same transaction, and the reservation fails with
    * {@link ReferrerAlreadySignedError} when the agent already signed one.
+   * `hlpDeposit`: this action is an HLP deposit of `usd` for `master`; it is recorded in the same transaction, which
+   * fails with VAULT_DEPOSIT_LIMIT when the recent deposits are more than the `countedUsd` the caller's cap check counted
+   * (another tab deposited in between; with Web Locks it can't).
    * Throws if the nonce would fall outside HL's accepted window.
    */
   async reserve(
     agent: string,
-    params: { now: number; orders: number; notionalUsd: number; account?: UsageAccount; referrer?: boolean; limits?: ReserveLimits },
+    params: {
+      now: number;
+      orders: number;
+      notionalUsd: number;
+      account?: UsageAccount;
+      referrer?: boolean;
+      limits?: ReserveLimits;
+      hlpDeposit?: { master: string; usd: number; countedUsd: number };
+    },
   ): Promise<number> {
     const now = Math.floor(params.now);
     let already = false;
@@ -167,9 +189,9 @@ export class SigningCoordinator {
       }
       // The limits again, in the same transaction that records this action: tabs without a shared lock (no Web Locks)
       // can't both pass on the same usage.
-      exceeded = params.limits ? limitProblem(usageOf(prev, now, params.account), params) : undefined;
+      exceeded = (params.limits ? limitProblem(usageOf(prev, now, params.account), params) : undefined) ?? hlpDepositProblem(prev, now, params.hlpDeposit);
       if (exceeded) return prev ?? { agent: agent.toLowerCase(), lastNonce: 0, orderTimes: [], day: utcDay(now), dayNotionalUsd: 0 };
-      const next = nextUsage(agent, prev, now, params.orders, params.notionalUsd, params.account);
+      const next = nextUsage(agent, prev, now, params.orders, params.notionalUsd, params.account, params.hlpDeposit);
       if (params.referrer) next.referrerSignedAt = now;
       return next;
     });
@@ -240,6 +262,18 @@ function accountNotional(record: UsageRecord, account: UsageAccount | undefined)
     .reduce((sum, a) => sum + amount(a), 0);
 }
 
+/** HLP deposits (USD) a record holds for `master` in the last {@link HLP_DEPOSIT_RECENT_MS} before `now`. */
+export function recentHlpDepositsUsd(record: UsageRecord | undefined, master: string, now: number): number {
+  const key = master.toLowerCase();
+  return (record?.hlpDeposits ?? []).filter((d) => d.master === key && d.at > now - HLP_DEPOSIT_RECENT_MS && Number.isFinite(d.usd)).reduce((sum, d) => sum + d.usd, 0);
+}
+
+/** An HLP deposit whose cap check didn't count a deposit recorded since. */
+function hlpDepositProblem(prev: UsageRecord | undefined, now: number, deposit: { master: string; countedUsd: number } | undefined): UsageLimitError | undefined {
+  if (!deposit || recentHlpDepositsUsd(prev, deposit.master, now) <= deposit.countedUsd + 1e-9) return undefined;
+  return new UsageLimitError("VAULT_DEPOSIT_LIMIT", "Another HLP deposit was signed in this browser meanwhile; nothing was signed. Try again.");
+}
+
 /** The limit this reservation would exceed, if any. */
 function limitProblem(usage: Usage, p: { orders: number; notionalUsd: number; limits?: ReserveLimits }): UsageLimitError | undefined {
   const l = p.limits;
@@ -252,8 +286,16 @@ function limitProblem(usage: Usage, p: { orders: number; notionalUsd: number; li
   return undefined;
 }
 
-/** Pure update of the usage record (runs inside the IndexedDB transaction). */
-export function nextUsage(agent: string, prev: UsageRecord | undefined, now: number, orders: number, notionalUsd: number, account?: UsageAccount): UsageRecord {
+/** Pure update of the usage record (runs inside the IndexedDB transaction). `hlpDeposit`: this action deposits into HLP. */
+export function nextUsage(
+  agent: string,
+  prev: UsageRecord | undefined,
+  now: number,
+  orders: number,
+  notionalUsd: number,
+  account?: UsageAccount,
+  hlpDeposit?: { master: string; usd: number },
+): UsageRecord {
   const mgr = new MonotonicNonceManager({ now: () => now });
   const last = prev?.lastNonce;
   // A persisted nonce beyond HL's future window can only come from a broken clock; it would make every later nonce
@@ -270,6 +312,9 @@ export function nextUsage(agent: string, prev: UsageRecord | undefined, now: num
   actions.push(now);
   const record: UsageRecord = { agent: agent.toLowerCase(), lastNonce: nonce, orderTimes: recent.slice(-10_000), actionTimes: actions.slice(-10_000), day: today, dayNotionalUsd };
   if (typeof prev?.referrerSignedAt === "number") record.referrerSignedAt = prev.referrerSignedAt;
+  const deposits = (prev?.hlpDeposits ?? []).filter((d) => d.at > now - HLP_DEPOSIT_RECENT_MS);
+  if (hlpDeposit) deposits.push({ master: hlpDeposit.master.toLowerCase(), at: now, usd: hlpDeposit.usd });
+  if (deposits.length > 0) record.hlpDeposits = deposits;
   if (account !== undefined || prev?.accountNotionalUsd !== undefined) {
     const byAccount: Record<string, number> = {};
     if (sameDay) {
