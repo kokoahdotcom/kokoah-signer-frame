@@ -8,12 +8,12 @@
  *    compiler bug can't turn an allowed intent into, say, a transfer).
  *
  * Price band (shared `band.ts`): orders that execute now (market, IOC, marketable limits) must be within
- * `priceBandPct` (10% baseline, user-tightenable) of HL's mark; resting GTC/ALO limits that don't cross may sit up to
+ * `priceBandPct` (5% baseline, user-tightenable) of HL's mark; resting GTC/ALO limits that don't cross may sit up to
  * `RESTING_PRICE_BAND_PCT` (50%) away; untriggered triggers likewise. Mark and mid always come from the frame's own
  * HL reads.
  *
- * The frame adds four things the shared policy has no field for: the per-market leverage cap (baseline = each
- * market's own maximum), a hard `vaultAddress` rule independent of the policy object (only a sub-account that the
+ * The frame adds four things the shared policy has no field for: the per-market leverage cap (the baseline's 50x or
+ * the user's limit, never above each market's own maximum), a hard `vaultAddress` rule independent of the policy object (only a sub-account that the
  * frame itself found in HL's `subAccounts` list of the key's master; HL vaults and anything else are denied), the
  * notional counted against the daily limit, and the agent-wide baseline daily cap across all accounts.
  *
@@ -51,19 +51,18 @@ import * as v from "valibot";
 import { BASELINE_ACTION_TYPES, EXPIRES_AFTER_MS, type AllowedActionType, type PolicySummary, type UserLimits } from "../protocol/index.js";
 import { PARAMS_SCHEMAS } from "./messages.js";
 
-/** Leverage value meaning "no global cap; each market's own maximum applies". */
-export const NO_GLOBAL_LEVERAGE_CAP = 1000;
-
 /** Baseline limits compiled into the frame. The parent can only tighten them. */
 export const BASELINE_LIMITS = Object.freeze({
   allowedActionTypes: [...BASELINE_ACTION_TYPES] as AllowedActionType[],
   allowedCoins: "*" as const,
-  maxOrderNotionalUsd: 1_000_000,
+  maxOrderNotionalUsd: 250_000,
   maxDailyNotionalUsd: 25_000_000,
+  /** Each market's own maximum applies below it. */
+  maxLeverage: 50,
   maxOrdersPerMinute: 60,
   /** Signed actions of any kind (cancels, leverage, noop… too) per minute, so none can be looped without limit. */
   maxActionsPerMinute: 120,
-  priceBandPct: 10,
+  priceBandPct: 5,
   requireStopLossForNewEntries: false,
   /** `expiresAfter` is mandatory and at most this far ahead (the frame itself uses 15 s). */
   maxExpiresAfterWindowMs: 30_000,
@@ -93,7 +92,7 @@ export function createBaselinePolicy(builder: BuilderSetting, extras: BaselineEx
       allowedCoins: "*",
       maxOrderNotionalUsd: BASELINE_LIMITS.maxOrderNotionalUsd,
       maxDailyNotionalUsd: BASELINE_LIMITS.maxDailyNotionalUsd,
-      maxLeverage: NO_GLOBAL_LEVERAGE_CAP,
+      maxLeverage: BASELINE_LIMITS.maxLeverage,
       requireStopLossForNewEntries: BASELINE_LIMITS.requireStopLossForNewEntries,
       maxOrdersPerMinute: BASELINE_LIMITS.maxOrdersPerMinute,
       priceBandPct: BASELINE_LIMITS.priceBandPct,
@@ -280,7 +279,7 @@ export function limitChanges(baseline: Policy, before: LimitsSet, after: LimitsS
   if (ownDailyBefore === undefined && ownDailyAfter !== undefined && sharedDaily !== undefined) {
     add("maxDailyNotionalUsd", "Trading per day", `${usd(sharedDaily)} shared with the main account`, `${usd(ownDailyAfter)} of its own, on top of the main account's`, true);
   } else number("maxDailyNotionalUsd", "Trading per day", usd);
-  number("maxLeverage", "Leverage", (n) => (n >= NO_GLOBAL_LEVERAGE_CAP ? "each market's maximum" : `up to ${n}x`));
+  number("maxLeverage", "Leverage", (n) => `up to ${n}x`);
   number("maxOrdersPerMinute", "Orders per minute", String);
   number("priceBandPct", "Price distance from the market", (n) => `${n}%`);
   const set = (field: "allowedCoins" | "allowedActionTypes", label: string, all: readonly string[] | "*") => {
@@ -314,7 +313,7 @@ export function summarizeFramePolicy(
     allowedCoins: policy.allowedCoins === "*" ? "*" : [...policy.allowedCoins],
     maxOrderNotionalUsd: policy.maxOrderNotionalUsd,
     maxDailyNotionalUsd: policy.maxDailyNotionalUsd,
-    maxLeverage: policy.maxLeverage >= NO_GLOBAL_LEVERAGE_CAP ? "market" : policy.maxLeverage,
+    maxLeverage: policy.maxLeverage,
     maxOrdersPerMinute: policy.maxOrdersPerMinute,
     priceBandPct: policy.priceBandPct,
     requireStopLossForNewEntries: policy.requireStopLossForNewEntries,

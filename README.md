@@ -32,8 +32,9 @@ This repo also ships **`KokoahSignerClient`**, the typed, dependency-free client
   - trading actions only;
   - builder required;
   - no `vaultAddress`;
-  - price band against HL's mark: 10% for orders that execute now (market, IOC, marketable limits), 50% for resting limits and untriggered triggers;
-  - market-maximum leverage;
+  - price band against HL's mark: 5% for orders that execute now (market, IOC, marketable limits), 50% for resting limits and untriggered triggers;
+  - leverage up to 50x, never above the market's maximum;
+  - $250,000 per order and $25,000,000 a day per key (reduce-only orders exempt);
   - 60 orders a minute (persisted);
   - `expiresAfter` = now + 15 s.
 - **Keys.**
@@ -281,7 +282,7 @@ Two more suites run on demand:
 ## Known gaps / TODO
 
 - **In-frame confirmation for large or out-of-policy orders** (SECURITY_BASELINE §3 asks for it). v1 denies instead.
-- **Tune the baseline limits.** $1M per order, $25M per day and a 10% band are wide backstops.
+- **Tune the baseline limits.** $250,000 per order and a 5% band (since 2026-10-14) are still wide backstops, and $25M per day is unchanged.
 - **Clickjacking hardening of the in-frame prompt** (IntersectionObserver v2 visibility checks).
 - **Loosening limits relies on the user reading the frame's prompt**; the clickjacking caveat above applies (THREAT_MODEL A23).
 - **Outcome markets aren't supported, nor unverified spot tokens** (`UNSUPPORTED_MARKET`): spot is limited to

@@ -59,7 +59,7 @@ describe("limits stored by the frame", () => {
     const reset = await asking(h, {});
     expect(h.events("promptChanged").at(-1)).toEqual({ visible: true, kind: "limits" });
     expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Loosen your trading limits?");
-    expect(h.promptText()).toContain("Largest order: $100 → $1,000,000");
+    expect(h.promptText()).toContain("Largest order: $100 → $250,000");
     // Shown in the frame's own fixed style, whatever theme the parent set.
     expect(h.root?.querySelector(".ks-prompt")?.classList.contains("ks-prompt--fixed")).toBe(true);
     // While the prompt waits, the cap holds.
@@ -68,7 +68,7 @@ describe("limits stored by the frame", () => {
 
     await h.clickPrompt();
     const r = await reset.answer;
-    expect(r.ok && r.result.policy).toMatchObject({ maxOrderNotionalUsd: 1_000_000, userLimits: null });
+    expect(r.ok && r.result.policy).toMatchObject({ maxOrderNotionalUsd: 250_000, userLimits: null });
     expect((await h.ok("signAndSubmit", order("o2"))).status).toBe("ok");
   });
 
@@ -121,7 +121,7 @@ describe("limits stored by the frame", () => {
       maxDailyNotionalUsd: 5_000,
       maxLeverage: 5,
       maxOrdersPerMinute: 10,
-      priceBandPct: 5,
+      priceBandPct: 3,
       allowedCoins: ["ETH", "BTC"],
       requireStopLossForNewEntries: true,
       allowedActionTypes: ["order", "cancel"],
@@ -133,8 +133,8 @@ describe("limits stored by the frame", () => {
       [{ ...start, maxOrderNotionalUsd: 600 }, ["Largest order: $500 → $600"]],
       [{ ...start, maxDailyNotionalUsd: 6_000 }, ["Trading per day: $5,000 → $6,000"]],
       [{ ...start, maxOrdersPerMinute: 11 }, ["Orders per minute: 10 → 11"]],
-      [{ ...start, priceBandPct: 6 }, ["Price distance from the market: 5% → 6%"]],
-      [withoutLeverage, ["Leverage: up to 5x → each market's maximum"]],
+      [{ ...start, priceBandPct: 4 }, ["Price distance from the market: 3% → 4%"]],
+      [withoutLeverage, ["Leverage: up to 5x → up to 50x"]],
       [{ ...start, spotTrading: true }, ["Spot trading: off → on"]],
       [{ ...start, allowedCoins: ["ETH", "BTC", "SOL"] }, ["Markets: ETH, BTC → ETH, BTC, SOL"]],
       [{ ...start, allowedCoins: ["SOL"] }, ["Markets: ETH, BTC → SOL"]],
@@ -144,7 +144,7 @@ describe("limits stored by the frame", () => {
       [{ ...start, requireStopLossForNewEntries: false }, ["Stop-loss on new positions: required → not required"]],
       // A tightening next to a loosening: one prompt lists both.
       [{ ...start, maxOrderNotionalUsd: 100, maxLeverage: 10 }, ["Largest order: $500 → $100", "Leverage: up to 5x → up to 10x"]],
-      [{}, ["Largest order: $500 → $1,000,000", "Trading per day: $5,000 → $25,000,000", "Markets: ETH, BTC → all", "Allowed actions: order, cancel → all"]],
+      [{}, ["Largest order: $500 → $250,000", "Trading per day: $5,000 → $25,000,000", "Price distance from the market: 3% → 5%", "Markets: ETH, BTC → all", "Allowed actions: order, cancel → all"]],
     ];
     for (const [limits, lines] of cases) {
       const pending = await asking(h, limits);
@@ -161,8 +161,8 @@ describe("limits stored by the frame", () => {
     const h = await frame();
     await h.ok("hello", { protocolVersion: 1 });
     await h.ok("setLimits", { maxOrderNotionalUsd: 100 });
-    const e = await h.fail("setLimits", { maxOrderNotionalUsd: 2_000_000 });
-    expect(e).toMatchObject({ code: "LIMIT_LOOSENING_REJECTED", details: { fields: ["maxOrderNotionalUsd"] } });
+    const e = await h.fail("setLimits", { maxOrderNotionalUsd: 300_000, maxLeverage: 51, priceBandPct: 6 });
+    expect(e).toMatchObject({ code: "LIMIT_LOOSENING_REJECTED", details: { fields: ["maxOrderNotionalUsd", "priceBandPct", "maxLeverage"] } });
     expect(shownPrompts(h)).toHaveLength(0);
     expect((await h.ok("getStatus")).policy.maxOrderNotionalUsd).toBe(100);
   });
@@ -225,7 +225,7 @@ describe("limits across reloads and tabs", () => {
     expect(codes(await b.fail("signAndSubmit", order("o1")))).toContain("ORDER_NOTIONAL_EXCEEDED");
     // Still the stored $100 the reset is compared with: it needs the click.
     const reset = await asking(b, {});
-    expect(b.promptText()).toContain("Largest order: $100 → $1,000,000");
+    expect(b.promptText()).toContain("Largest order: $100 → $250,000");
     await b.clickPrompt("cancel");
     expect((await reset.answer).ok).toBe(false);
   });
@@ -368,7 +368,7 @@ describe("limitChanges and stored limits", () => {
 
   it("compares effective values: the account's own, else the master's, else the baseline's", () => {
     expect(limitChanges(baseline, set({ maxLeverage: 3 }), set({ maxLeverage: 3 }))).toEqual([]);
-    expect(limitChanges(baseline, set(null), set({ maxLeverage: 3 }))).toEqual([{ field: "maxLeverage", text: "Leverage: each market's maximum → up to 3x", looser: false }]);
+    expect(limitChanges(baseline, set(null), set({ maxLeverage: 3 }))).toEqual([{ field: "maxLeverage", text: "Leverage: up to 50x → up to 3x", looser: false }]);
     // The sub-account takes the master's value when it sets none: setting the same one is no change.
     expect(limitChanges(baseline, set({ maxLeverage: 3 }), set({ maxLeverage: 3 }, { [SUB]: { maxLeverage: 3 } }), SUB)).toEqual([]);
     expect(limitChanges(baseline, set({ maxLeverage: 3 }, { [SUB]: { maxLeverage: 2 } }), set({ maxLeverage: 3 }), SUB)).toEqual([

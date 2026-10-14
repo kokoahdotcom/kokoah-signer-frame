@@ -33,7 +33,10 @@ describe("baseline policy", () => {
     expect(baseline.allowedVaultAddresses).toEqual([]);
     expect(baseline.maxExpiresAfterWindowMs).toBe(BASELINE_LIMITS.maxExpiresAfterWindowMs);
     expect(baseline.maxOrdersPerMinute).toBe(60);
-    expect(baseline.priceBandPct).toBe(10);
+    expect(baseline.priceBandPct).toBe(5);
+    expect(baseline.maxOrderNotionalUsd).toBe(250_000);
+    expect(baseline.maxDailyNotionalUsd).toBe(25_000_000);
+    expect(baseline.maxLeverage).toBe(50);
   });
 
   it("denies vault, transfer and withdrawal wire actions even though an agent key could sign them", () => {
@@ -91,13 +94,23 @@ describe("policy through signAndSubmit", () => {
   it("denies a limit price outside the band around HL's mark", async () => {
     h = await FrameHarness.create();
     await h.activeAgent("device");
-    const e = await h.fail("signAndSubmit", { requestId: "b", intent: limitOrder({ price: "2300" }) });
+    const e = await h.fail("signAndSubmit", { requestId: "b", intent: limitOrder({ price: "2120" }) });
     expect(e.details?.violations?.map((v) => v.code)).toContain("PRICE_OUTSIDE_BAND");
-    expect((await h.ok("signAndSubmit", { requestId: "b2", intent: limitOrder({ price: "2190" }) })).status).toBe("ok");
+    expect((await h.ok("signAndSubmit", { requestId: "b2", intent: limitOrder({ price: "2090" }) })).status).toBe("ok");
     expect((await h.ok("getStatus")).metrics.policyDenials).toBe(1);
   });
 
-  it("lets resting limits sit up to 50% from HL's mark, but bands orders that execute now at 10%", async () => {
+  it("caps one order at the baseline's $250,000, reduce-only orders exempt", async () => {
+    h = await FrameHarness.create();
+    await h.activeAgent("device");
+    const btc = (size: string, o: Record<string, unknown> = {}) => limitOrder({ coin: "BTC", size, price: "100000", ...o });
+    const e = await h.fail("signAndSubmit", { requestId: "n1", intent: btc("2.6") });
+    expect(e.details?.violations?.map((v) => v.code)).toEqual(["ORDER_NOTIONAL_EXCEEDED"]);
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    expect((await h.ok("signAndSubmit", { requestId: "n2", intent: btc("2.6", { side: "sell", reduceOnly: true }) })).status).toBe("ok");
+  });
+
+  it("lets resting limits sit up to 50% from HL's mark, but bands orders that execute now at 5%", async () => {
     h = await FrameHarness.create();
     await h.activeAgent("device");
     // Resting GTC and ALO buys 20% below mark (1600 vs 2000) are signed.
@@ -109,7 +122,7 @@ describe("policy through signAndSubmit", () => {
     const above = await h.fail("signAndSubmit", { requestId: "a", intent: limitOrder({ price: "2400" }) });
     expect(above.code).toBe("POLICY_DENIED");
     expect(above.details?.violations).toEqual([
-      { code: "PRICE_OUTSIDE_BAND", message: "ETH buy at 2400 is 20% from the mark price 2000 and would fill immediately; orders that execute now must be within 10% of the mark (a resting limit can be up to 50% away)." },
+      { code: "PRICE_OUTSIDE_BAND", message: "ETH buy at 2400 is 20% from the mark price 2000 and would fill immediately; orders that execute now must be within 5% of the mark (a resting limit can be up to 50% away)." },
     ]);
     // IOC 20% below executes now (or not at all): denied.
     expect((await h.fail("signAndSubmit", { requestId: "i", intent: limitOrder({ price: "1600", tif: "Ioc" }) })).code).toBe("POLICY_DENIED");
@@ -148,6 +161,27 @@ describe("policy through signAndSubmit", () => {
     expect(e.code).toBe("POLICY_DENIED");
     expect(e.details?.violations?.map((v) => v.code)).toEqual(["LEVERAGE_EXCEEDED"]);
     expect((await h.ok("signAndSubmit", { requestId: "lev2", intent: { kind: "updateLeverage", coin: "ETH", leverage: 25, marginMode: "cross", origin: "manual" } })).status).toBe("ok");
+  });
+
+  it("caps leverage at the baseline's 50x where a market allows more, reading the account's leverage only there", async () => {
+    h = await FrameHarness.create();
+    const meta = { ...META0, universe: [...META0.universe, { name: "WILD", szDecimals: 0, maxLeverage: 100 }] };
+    const info = h.hl.info.bind(h.hl);
+    h.hl.info = (body) => (body.type === "metaAndAssetCtxs" && body.dex === undefined ? [meta, h.hl.ctxs(meta)] : info(body));
+    h.hl.mark.WILD = "2";
+    h.hl.mid.WILD = "2";
+    await h.activeAgent("device");
+    const lev = (leverage: number) => ({ kind: "updateLeverage", coin: "WILD", leverage, marginMode: "cross", origin: "manual" });
+    expect((await h.fail("signAndSubmit", { requestId: "w1", intent: lev(51) })).details?.violations?.map((v) => v.code)).toEqual(["LEVERAGE_EXCEEDED"]);
+    expect((await h.ok("signAndSubmit", { requestId: "w2", intent: lev(50) })).status).toBe("ok");
+    // Set above 50x outside Kokoah: new entries are refused, closing still works.
+    h.hl.leverage.WILD = 75;
+    const wild = (o: Record<string, unknown> = {}) => limitOrder({ coin: "WILD", size: "10", price: "2", ...o });
+    expect((await h.fail("signAndSubmit", { requestId: "w3", intent: wild() })).details?.violations?.map((v) => v.code)).toContain("LEVERAGE_EXCEEDED");
+    expect((await h.ok("signAndSubmit", { requestId: "w4", intent: wild({ side: "sell", reduceOnly: true }) })).status).toBe("ok");
+    // ETH's own maximum (25x) is below the cap: no leverage read for it.
+    expect((await h.ok("signAndSubmit", { requestId: "e1", intent: limitOrder() })).status).toBe("ok");
+    expect(h.hl.infoCalls.filter((b) => b.type === "activeAssetData").map((b) => b.coin)).toEqual(["WILD"]);
   });
 
   it("caps leverage at a tightened user limit, for leverage changes and new entries", async () => {
@@ -239,7 +273,7 @@ describe("setLimits", () => {
     // {} resets to the baseline, after the user's click in the frame.
     const reset = await h.loosen({});
     expect(reset.policy.userLimits).toBeNull();
-    expect(reset.policy.maxOrderNotionalUsd).toBe(1_000_000);
+    expect(reset.policy.maxOrderNotionalUsd).toBe(250_000);
   });
 
   it("tracks daily notional", async () => {
