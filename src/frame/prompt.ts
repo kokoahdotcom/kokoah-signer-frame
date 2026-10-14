@@ -67,10 +67,11 @@ function el<K extends keyof HTMLElementTagNameMap>(doc: Document, tag: K, classN
  */
 export const PROMPT_ARM_MS = 800;
 
-/** How long the primary button of a `hold` prompt must be pressed. */
+/** How long the primary button of a `hold` prompt must be pressed, and Enter or Space held on any prompt's. */
 export const PROMPT_HOLD_MS = 800;
 
 const HOLD_HINT = "Press and hold the button to confirm.";
+const KEY_HINT = "Press and hold Enter or Space to confirm.";
 
 type VisibilityEntry = IntersectionObserverEntry & { isVisible?: boolean };
 
@@ -83,14 +84,16 @@ export interface PromptUiOptions {
 }
 
 /**
- * The primary button works only for the user's own pointer on the frame's own document:
+ * The primary button works only for the user's own pointer or keyboard on the frame's own document:
  * - it is armed once the prompt has been shown for `armMs` (and, where the browser reports occlusion, seen; see
  *   {@link PromptUi.arm}); resizing the frame, the frame losing focus or the page being hidden starts that over;
  * - then a click (or, for a `hold` prompt, a press) counts only after real, trusted pointer movement over the armed
  *   button (screen coordinates that change); for a pointer that can't hover (touch, most pens) the press itself;
- *   leaving the button needs new movement. A key press never confirms, and neither does a pointer that was already
- *   resting where the button appeared;
- * - a `hold` prompt confirms only after the button stayed pressed for `holdMs` with the pointer on it.
+ *   leaving the button needs new movement. A pointer that was already resting where the button appeared doesn't count;
+ * - a `hold` prompt confirms only after the button stayed pressed for `holdMs` with the pointer on it;
+ * - from the keyboard, any prompt confirms only when the armed button got focus from the user's own Tab or Shift+Tab
+ *   inside the frame (not a script's `focus()`, not focus that came from the parent page) and Enter or Space is then
+ *   held for `holdMs` (a fresh press; auto-repeat keeps it going). A key press alone never clicks the button.
  */
 export class PromptUi {
   private readonly onChange: (visible: boolean, kind: PromptKind | null) => void;
@@ -103,7 +106,13 @@ export class PromptUi {
   /** The user's pointer moved over the armed primary button (or pressed it, for a pointer that can't hover). */
   private pointerSeen = false;
   private lastPointer: { x: number; y: number } | null = null;
+  /** The armed primary button got focus from the user's own Tab or Shift+Tab inside the frame. */
+  private keyboardFocus = false;
+  /** A trusted Tab keydown whose focus move hasn't landed yet. */
+  private tabbing = false;
   private holdTimer: ReturnType<typeof setTimeout> | undefined;
+  /** What is holding the button down while `holdTimer` runs. */
+  private holdBy: "pointer" | "key" | null = null;
   /** The open prompt's: whether it confirms by holding, and what confirming does. */
   private hold = false;
   private confirm: (() => void) | null = null;
@@ -142,23 +151,41 @@ export class PromptUi {
     this.primary.type = "button";
     // The bar of a hold fills in exactly the hold time (CSSOM, which style-src 'self' allows).
     this.primary.style.setProperty("--ks-hold-ms", `${this.holdMs}ms`);
+    // Screen readers announce how to confirm from the keyboard when the button gets focus.
+    const keyHint = el(doc, "span", "ks-sr-only", KEY_HINT);
+    keyHint.id = "ks-key-hint";
+    this.primary.setAttribute("aria-describedby", "ks-key-hint");
     this.secondary = el(doc, "button", "ks-button ks-secondary");
     this.secondary.type = "button";
     actions.append(this.primary, this.secondary);
     this.status = el(doc, "p", "ks-status");
     this.status.setAttribute("role", "status");
     this.status.setAttribute("aria-live", "polite");
-    this.panel.append(this.title, this.body, actions, this.status);
+    this.panel.append(this.title, this.body, actions, keyHint, this.status);
     root.append(this.idle, this.panel);
 
     const button = this.primary;
     button.addEventListener("pointerover", (ev) => this.onPointer(ev, false));
     button.addEventListener("pointermove", (ev) => this.onPointer(ev, true));
     button.addEventListener("pointerdown", (ev) => this.onPress(ev));
-    button.addEventListener("pointerup", () => this.releaseHold());
+    button.addEventListener("pointerup", () => this.releaseHold("pointer"));
     button.addEventListener("pointerleave", () => this.forgetPointer());
     button.addEventListener("pointercancel", () => this.forgetPointer());
     button.addEventListener("click", (ev) => this.onClick(ev));
+    button.addEventListener("keydown", (ev) => this.onKey(ev, true));
+    button.addEventListener("keyup", (ev) => this.onKey(ev, false));
+    button.addEventListener("focus", () => this.onFocus());
+    button.addEventListener("blur", () => this.forgetKeyboard());
+    // The user's own Tab or Shift+Tab in the frame: the focus move it causes lands before any timer runs.
+    doc.addEventListener(
+      "keydown",
+      (ev) => {
+        if (ev.key !== "Tab" || !this.isTrusted(ev)) return;
+        this.tabbing = true;
+        setTimeout(() => (this.tabbing = false), 0);
+      },
+      true,
+    );
     // A long press must not open the context menu (or a touch callout) instead of confirming.
     button.addEventListener("contextmenu", (ev) => {
       if (this.hold) ev.preventDefault();
@@ -177,8 +204,8 @@ export class PromptUi {
 
   /**
    * Shows the prompt and resolves with `action()`'s result. `action` is called synchronously from the click handler
-   * of the primary button, so it runs with the click's user activation (required by WebAuthn); for a `hold` prompt,
-   * when the hold completes.
+   * of the primary button, so it runs with the click's user activation (required by WebAuthn); for a `hold` prompt or
+   * from the keyboard, when the hold completes (the press's activation still holds then).
    */
   run<T>(req: PromptRequest, action: () => Promise<T>, onFailure: (e: unknown) => ActionFailure): Promise<T> {
     if (this.active !== null) return Promise.reject(new PromptError("PROMPT_BUSY", "Another prompt is already waiting for the user.", req.kind));
@@ -237,7 +264,7 @@ export class PromptUi {
     this.body.textContent = req.body;
     this.primary.textContent = req.actionLabel;
     this.secondary.textContent = req.cancelLabel;
-    this.setBusy(false, this.hold ? HOLD_HINT : "");
+    this.setBusy(false, this.restingStatus());
     this.idle.hidden = true;
     this.panel.hidden = false;
     this.onChange(true, req.kind);
@@ -250,7 +277,7 @@ export class PromptUi {
    * Enables the primary button once the prompt has been shown for `armMs`. Where the browser reports occlusion
    * (IntersectionObserver v2, `isVisible`), that time counts only while the whole prompt is visible and unobscured;
    * covering, fading or hiding it disables the button again and restarts the wait. Either way, the pointer must then
-   * move over the button again.
+   * move over the button again, or the keyboard bring focus to it again.
    */
   private arm(): void {
     this.disarm();
@@ -285,14 +312,15 @@ export class PromptUi {
   }
 
   /**
-   * Disables the primary button until the prompt is armed again and forgets the pointer; also stops watching the
-   * prompt unless `stopWatching` is false.
+   * Disables the primary button until the prompt is armed again and forgets the pointer and the keyboard focus; also
+   * stops watching the prompt unless `stopWatching` is false.
    */
   private disarm(stopWatching = true): void {
     clearTimeout(this.armTimer);
     this.armed = false;
     this.primary.disabled = true;
     this.forgetPointer();
+    this.forgetKeyboard();
     if (stopWatching) {
       this.observer?.disconnect();
       this.observer = null;
@@ -312,7 +340,7 @@ export class PromptUi {
     if (this.active === null || !this.isTrusted(ev) || !ev.isPrimary || ev.button !== 0) return;
     // A pointer that can't hover is over the button only while it presses it.
     if (ev.pointerType !== "mouse" && this.armed) this.pointerSeen = true;
-    if (this.hold) this.startHold();
+    if (this.hold) this.startHold("pointer");
   }
 
   private onClick(ev: MouseEvent): void {
@@ -320,31 +348,65 @@ export class PromptUi {
     this.confirm?.();
   }
 
-  private startHold(): void {
-    if (!this.armed || !this.pointerSeen || this.holdTimer !== undefined || this.panel.getAttribute("aria-busy") === "true") return;
+  /** Focus came to the primary button: from the keyboard only right after the user's own Tab in the frame. */
+  private onFocus(): void {
+    this.keyboardFocus = this.active !== null && this.armed && this.tabbing;
+    this.tabbing = false;
+    if (this.keyboardFocus && this.holdTimer === undefined && this.panel.getAttribute("aria-busy") !== "true") this.status.textContent = KEY_HINT;
+  }
+
+  /** Enter and Space on the primary button: never a click; a fresh press held for `holdMs` once it has keyboard focus. */
+  private onKey(ev: KeyboardEvent, down: boolean): void {
+    if (this.active === null || (ev.key !== "Enter" && ev.key !== " ")) return;
+    // Enter would click on keydown and Space on keyup.
+    ev.preventDefault();
+    if (!this.isTrusted(ev)) return;
+    if (!down) this.releaseHold("key");
+    else if (!ev.repeat) this.startHold("key");
+  }
+
+  private startHold(by: "pointer" | "key"): void {
+    const present = by === "pointer" ? this.pointerSeen : this.keyboardFocus;
+    if (!this.armed || !present || this.holdTimer !== undefined || this.panel.getAttribute("aria-busy") === "true") return;
+    this.holdBy = by;
     this.primary.classList.add("ks-holding");
     this.status.textContent = "Keep holding…";
     this.holdTimer = setTimeout(() => {
       this.holdTimer = undefined;
+      this.holdBy = null;
       this.primary.classList.remove("ks-holding");
       this.confirm?.();
     }, this.holdMs);
   }
 
-  /** Stops a hold that hasn't completed (released early, pointer gone, prompt disarmed). */
-  private releaseHold(): void {
-    if (this.holdTimer === undefined) return;
+  /** Stops a hold that hasn't completed (released early, pointer or focus gone, prompt disarmed); `by`: only that one's. */
+  private releaseHold(by?: "pointer" | "key"): void {
+    if (this.holdTimer === undefined || (by !== undefined && by !== this.holdBy)) return;
     clearTimeout(this.holdTimer);
     this.holdTimer = undefined;
+    this.holdBy = null;
     this.primary.classList.remove("ks-holding");
-    if (this.active !== null) this.status.textContent = HOLD_HINT;
+    if (this.active !== null) this.status.textContent = this.restingStatus();
+  }
+
+  /** What the status line says while nothing is happening. */
+  private restingStatus(): string {
+    return this.keyboardFocus ? KEY_HINT : this.hold ? HOLD_HINT : "";
   }
 
   /** The pointer left the button (or the prompt was disarmed): it must move over the button again. */
   private forgetPointer(): void {
     this.pointerSeen = false;
     this.lastPointer = null;
-    this.releaseHold();
+    this.releaseHold("pointer");
+  }
+
+  /** The button lost focus (or the prompt was disarmed): the keyboard must bring it back with Tab. */
+  private forgetKeyboard(): void {
+    const had = this.keyboardFocus;
+    this.keyboardFocus = false;
+    this.releaseHold("key");
+    if (had && this.active !== null && this.status.textContent === KEY_HINT) this.status.textContent = this.restingStatus();
   }
 
   private hide(): void {

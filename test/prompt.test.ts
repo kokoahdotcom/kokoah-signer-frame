@@ -1,8 +1,9 @@
 /**
  * The in-frame prompt's guard against a hostile parent page (prompt.ts): the primary button works only after the prompt
  * has been shown for the arming delay and, where the browser reports occlusion (IntersectionObserver v2), only while
- * the whole prompt is visible; a click counts only after the user's own pointer moved over the armed button; resizing,
- * focus loss and hiding start over; hold prompts need the button held; focus starts on Cancel.
+ * the whole prompt is visible; a click counts only after the user's own pointer moved over the armed button; the
+ * keyboard confirms only after the user's own Tab onto it and Enter or Space held; resizing, focus loss and hiding
+ * start over; hold prompts need the button held; focus starts on Cancel.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PromptUi, PromptError, type PromptRequest } from "../src/frame/prompt.js";
@@ -224,6 +225,113 @@ describe("prompt arming", () => {
       const ev = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
       primary.dispatchEvent(ev);
       expect(ev.defaultPrevented).toBe(true);
+    });
+  });
+
+  describe("from the keyboard", () => {
+    const key = (target: EventTarget, type: "keydown" | "keyup", k: string, repeat = false) => {
+      const ev = new KeyboardEvent(type, { key: k, bubbles: true, cancelable: true, repeat });
+      target.dispatchEvent(ev);
+      return ev;
+    };
+    /** The user's Tab (or Shift+Tab) in the frame onto `b`: the browser moves focus right after the keydown. */
+    const tabTo = (b: HTMLElement) => {
+      key(document.activeElement ?? document.body, "keydown", "Tab");
+      b.focus();
+    };
+
+    it("confirms any prompt after Tab onto the armed button and Enter held for the hold time", async () => {
+      const { ui, primary, status } = setup();
+      const action = vi.fn(async () => "ok");
+      // A passkey prompt: a short click for the pointer, a hold for the keyboard.
+      const result = ui.run(REQ, action, () => ({ retry: false }));
+      expect(primary.getAttribute("aria-describedby")).toBe("ks-key-hint");
+      expect(document.getElementById("ks-key-hint")?.textContent).toBe("Press and hold Enter or Space to confirm.");
+      vi.advanceTimersByTime(800);
+      tabTo(primary);
+      expect(status.textContent).toBe("Press and hold Enter or Space to confirm.");
+      // Enter never clicks the button.
+      expect(key(primary, "keydown", "Enter").defaultPrevented).toBe(true);
+      expect(primary.classList.contains("ks-holding")).toBe(true);
+      vi.advanceTimersByTime(400);
+      key(primary, "keydown", "Enter", true); // auto-repeat keeps the hold going
+      expect(action).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(400);
+      await expect(result).resolves.toBe("ok");
+      expect(action).toHaveBeenCalledOnce();
+    });
+
+    it("doesn't confirm when Enter or Space is released early, and Space doesn't click either", async () => {
+      const { ui, primary, status } = setup({ armMs: 0 });
+      const action = vi.fn(async () => "ok");
+      const result = ui.run(HOLD, action, () => ({ retry: false }));
+      vi.advanceTimersByTime(0);
+      tabTo(primary);
+      key(primary, "keydown", " ");
+      vi.advanceTimersByTime(799);
+      expect(key(primary, "keyup", " ").defaultPrevented).toBe(true);
+      expect(primary.classList.contains("ks-holding")).toBe(false);
+      expect(status.textContent).toBe("Press and hold Enter or Space to confirm.");
+      vi.advanceTimersByTime(5_000);
+      expect(action).not.toHaveBeenCalled();
+      key(primary, "keydown", " ");
+      vi.advanceTimersByTime(800);
+      await expect(result).resolves.toBe("ok");
+    });
+
+    it("ignores focus a script moved, a Tab whose moment passed, and keys a script dispatched", () => {
+      const { ui, primary } = setup({ armMs: 0 });
+      const action = vi.fn(async () => "ok");
+      void ui.run(REQ, action, () => ({ retry: false })).catch(() => {});
+      vi.advanceTimersByTime(0);
+      primary.focus();
+      key(primary, "keydown", "Enter");
+      vi.advanceTimersByTime(2_000);
+      primary.blur();
+      key(document.body, "keydown", "Tab");
+      vi.advanceTimersByTime(1);
+      primary.focus();
+      key(primary, "keydown", "Enter");
+      vi.advanceTimersByTime(2_000);
+      expect(action).not.toHaveBeenCalled();
+      document.body.replaceChildren();
+      const untrusted = setup({ armMs: 0, trusted: false });
+      void untrusted.ui.run(REQ, action, () => ({ retry: false })).catch(() => {});
+      vi.advanceTimersByTime(0);
+      tabTo(untrusted.primary);
+      key(untrusted.primary, "keydown", "Enter");
+      vi.advanceTimersByTime(2_000);
+      expect(action).not.toHaveBeenCalled();
+    });
+
+    it("needs a fresh press after focus, and starts over when the button loses focus or the frame is disturbed", async () => {
+      const { ui, primary, cancel } = setup();
+      const action = vi.fn(async () => "ok");
+      const result = ui.run(HOLD, action, () => ({ retry: false }));
+      vi.advanceTimersByTime(800);
+      tabTo(primary);
+      // A key already held down (only its auto-repeat arrives) doesn't start a hold.
+      key(primary, "keydown", "Enter", true);
+      vi.advanceTimersByTime(2_000);
+      key(primary, "keydown", "Enter");
+      vi.advanceTimersByTime(400);
+      primary.blur();
+      vi.advanceTimersByTime(2_000);
+      expect(action).not.toHaveBeenCalled();
+      tabTo(primary);
+      key(primary, "keydown", "Enter");
+      vi.advanceTimersByTime(400);
+      window.dispatchEvent(new Event("resize"));
+      vi.advanceTimersByTime(800);
+      // Armed again, but the keyboard must bring focus back: Tab away and Shift+Tab back.
+      key(primary, "keydown", "Enter");
+      vi.advanceTimersByTime(2_000);
+      expect(action).not.toHaveBeenCalled();
+      tabTo(cancel);
+      tabTo(primary);
+      key(primary, "keydown", "Enter");
+      vi.advanceTimersByTime(800);
+      await expect(result).resolves.toBe("ok");
     });
   });
 

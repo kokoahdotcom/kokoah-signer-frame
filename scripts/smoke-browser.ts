@@ -13,8 +13,8 @@
  * - the signer's real `public/_headers` Permissions-Policy (served unchanged) allows WebAuthn: the full passkey flow
  *   with a **virtual authenticator that supports PRF**: create → sign → lock → unlock (passkey assertion) → sign; after
  *   a reload the key is locked;
- * - the prompt arms (IntersectionObserver v2) and takes real mouse input moved onto its button, never a click a script
- *   dispatches;
+ * - the prompt arms (IntersectionObserver v2) and takes real mouse input moved onto its button, or Tab onto it inside
+ *   the frame and Enter held, never a click a script dispatches;
  * - when the app doesn't delegate WebAuthn (its own Permissions-Policy disables it), passkeys are reported unavailable
  *   and `passkey` falls back to `device`;
  * - Link phone: `createLinkedAgent` in the real frame returns the matching code the computer computes, and the key
@@ -367,6 +367,29 @@ async function main(): Promise<number> {
       await c.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 }, page);
       await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 }, page);
     };
+    /**
+     * Confirms the frame's prompt from the keyboard, as a keyboard user does: a click on its title gives the frame focus,
+     * Tab moves to the primary button (inside the frame, so it counts), then Enter is held past the hold time.
+     */
+    const confirmWithKeyboard = async (frameSession: string) => {
+      await waitUntil("document.querySelector('.ks-primary')?.disabled === false", frameSession);
+      const f = await evaluate<{ x: number; y: number }>("(() => { const r = signer.iframe.getBoundingClientRect(); return { x: r.left + signer.iframe.clientLeft, y: r.top + signer.iframe.clientTop }; })()");
+      const t = await evaluate<{ x: number; y: number }>("(() => { const r = document.querySelector('.ks-title').getBoundingClientRect(); return { x: r.left + 4, y: r.top + r.height / 2 }; })()", frameSession);
+      await c.send("Input.dispatchMouseEvent", { type: "mousePressed", x: f.x + t.x, y: f.y + t.y, button: "left", clickCount: 1 }, page);
+      await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: f.x + t.x, y: f.y + t.y, button: "left", clickCount: 1 }, page);
+      const tab = { key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 };
+      await c.send("Input.dispatchKeyEvent", { type: "keyDown", ...tab }, page);
+      await c.send("Input.dispatchKeyEvent", { type: "keyUp", ...tab }, page);
+      const focused = await evaluate<string>("document.activeElement?.className + ' / ' + document.querySelector('.ks-status')?.textContent", frameSession);
+      const enter = { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 };
+      await c.send("Input.dispatchKeyEvent", { type: "keyDown", ...enter, text: "\r" }, page);
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        await c.send("Input.dispatchKeyEvent", { type: "keyDown", ...enter, text: "\r", autoRepeat: true }, page);
+      }
+      await c.send("Input.dispatchKeyEvent", { type: "keyUp", ...enter }, page);
+      return focused;
+    };
     const mainWallet = privateKeyToAccount(generatePrivateKey());
     const approve = async (prepared: { typedData: unknown }) => {
       const sig = await mainWallet.signTypedData(prepared.typedData as never);
@@ -516,7 +539,8 @@ async function main(): Promise<number> {
       await evaluate("document.querySelector('.ks-primary').click(); true", fb, true);
       await new Promise((r) => setTimeout(r, 500));
       check("a click a script dispatches in the frame doesn't confirm its prompt", !(await evaluate<boolean>("signer.iframe.hidden")));
-      await clickPrimary(fb);
+      const focused = await confirmWithKeyboard(fb);
+      check("the keyboard confirms: Tab onto the button inside the frame, then Enter held", focused === "ks-button ks-primary / Press and hold Enter or Space to confirm.", focused);
       await waitUntil("signer.iframe.hidden");
       const unlocked = await evaluate<{ ok?: { locked: boolean }; err?: string }>("window.unlocking");
       check("lock, then unlock with a passkey assertion (PRF → HKDF → AES-GCM)", locked.locked && unlocked.ok?.locked === false, unlocked);
