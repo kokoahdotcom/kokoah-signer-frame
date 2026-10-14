@@ -144,11 +144,15 @@ The iframe must be visible, on top and clickable. Don't cover it or make it tran
 **How the prompt resists a hostile page.** Its primary button works only after the prompt has been shown for 800 ms
 (where the browser reports occlusion, IntersectionObserver v2, shown whole and unobscured; covering or fading it
 starts over). Then a click counts only after the user's own pointer moved over the button inside the frame (a touch
-press on it, for pointers that can't hover); events a script dispatches, a key press and a pointer that was already
-resting where the button appeared don't count, and leaving the button needs new movement. Resizing the iframe, the
-frame losing focus or the page being hidden starts it all over. The `limits`, `vault-deposit` and `order` prompts are
-confirmed by **pressing and holding** the button for 0.8 s (a bar fills; releasing early does nothing). Focus starts on
-Cancel. So don't resize or move the iframe while `visible`, and give the user a pointer path to it.
+press on it, for pointers that can't hover); events a script dispatches and a pointer that was already resting where
+the button appeared don't count, and leaving the button needs new movement. From the keyboard, any prompt confirms
+only when the user moved focus to the button with Tab or Shift+Tab inside the frame (not focus moved by a script or
+arriving from the parent page) and then holds Enter or Space for 0.8 s; a key press alone never clicks it, and the
+button is described to screen readers as "Press and hold Enter or Space to confirm." Resizing the iframe, the frame
+losing focus or the page being hidden starts it all over. The `limits`, `vault-deposit` and `order` prompts are
+confirmed by **pressing and holding** the button for 0.8 s with the pointer too (a bar fills; releasing early does
+nothing). Focus starts on Cancel. So don't resize or move the iframe while `visible`, and give the user a pointer path
+to it.
 
 ## 4. Methods
 
