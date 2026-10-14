@@ -58,8 +58,28 @@ describe("HLP deposit", () => {
     await h.activeAgent();
     const pending = h.fail("signAndSubmit", { requestId: "d1", intent: deposit("10") });
     await h.clickPrompt("cancel");
-    expect((await pending).code).toBe("USER_CANCELLED");
+    expect(await pending).toMatchObject({ code: "USER_CANCELLED", details: { prompt: "vault-deposit" } });
     expect(h.hl.exchangeCalls).toHaveLength(0);
+  });
+
+  it("needs the button pressed and held, not a click", async () => {
+    h = await FrameHarness.create({ promptHoldMs: 100 });
+    await h.activeAgent();
+    const pending = h.ok("signAndSubmit", { requestId: "d1", intent: deposit("10") });
+    await promptText();
+    const button = h.root!.querySelector<HTMLButtonElement>(".ks-primary")!;
+    expect(button.classList.contains("ks-hold")).toBe(true);
+    const at = (x: number) => ({ bubbles: true, isPrimary: true, pointerType: "mouse", screenX: x, screenY: 5 });
+    button.dispatchEvent(new PointerEvent("pointermove", at(1)));
+    button.dispatchEvent(new PointerEvent("pointermove", at(2)));
+    button.click();
+    button.dispatchEvent(new PointerEvent("pointerdown", { ...at(2), button: 0 }));
+    button.dispatchEvent(new PointerEvent("pointerup", at(2)));
+    await new Promise((r) => setTimeout(r, 200));
+    expect(h.events("promptChanged").at(-1)?.visible).toBe(true);
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    await h.clickPrompt();
+    expect((await pending).status).toBe("ok");
   });
 
   it("never takes a vault, an origin or extra fields from the parent", async () => {

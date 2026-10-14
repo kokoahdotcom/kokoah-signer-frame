@@ -283,7 +283,7 @@ Two more suites run on demand:
 
 - **In-frame confirmation for large or out-of-policy orders** (SECURITY_BASELINE §3 asks for it). v1 denies instead.
 - **Tune the baseline limits.** $250,000 per order and a 5% band (since 2026-10-14) are still wide backstops, and $25M per day is unchanged.
-- **Clickjacking hardening of the in-frame prompt** (IntersectionObserver v2 visibility checks).
+- **Clickjacking of the in-frame prompt is harder, not impossible.** The button needs the user's own pointer movement and, for loosening and HLP deposits, a press and hold; without IntersectionObserver v2 (Firefox, Safari, iOS) a transparent frame under a decoy can't be detected (THREAT_MODEL §5 item 2).
 - **Loosening limits relies on the user reading the frame's prompt**; the clickjacking caveat above applies (THREAT_MODEL A23).
 - **Outcome markets aren't supported, nor unverified spot tokens** (`UNSUPPORTED_MARKET`): spot is limited to
   Convert's stablecoin pairs and, once the user turns spot trading on, the verified pairs (Hyperliquid's "Strict" list),

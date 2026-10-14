@@ -156,6 +156,10 @@ export interface FrameDeps {
   promptTimeoutMs?: number;
   /** How long a prompt is shown (and seen, where the browser can tell) before it can be confirmed. Default PROMPT_ARM_MS. */
   promptArmMs?: number;
+  /** How long a hold-to-confirm prompt's button must be held. Default PROMPT_HOLD_MS. */
+  promptHoldMs?: number;
+  /** Test seam: which input events count as the user's own (default `ev.isTrusted`; jsdom can't make trusted events). */
+  promptIsTrusted?: (ev: Event) => boolean;
   logger?: Logger;
 }
 
@@ -291,7 +295,14 @@ export class FrameCore {
     this.limits = { rev: 0, master: null, accounts: new Map(), policy: this.baseline };
     this.instanceId = bytesToHex(randomBytes(deps.crypto, 8));
     const root = deps.uiRoot ?? deps.document?.body ?? null;
-    this.ui = deps.document && root ? new PromptUi(deps.document, root, (visible, kind) => this.emit("promptChanged", { visible, kind }), deps.promptArmMs) : null;
+    this.ui =
+      deps.document && root
+        ? new PromptUi(deps.document, root, (visible, kind) => this.emit("promptChanged", { visible, kind }), {
+            ...(deps.promptArmMs !== undefined ? { armMs: deps.promptArmMs } : {}),
+            ...(deps.promptHoldMs !== undefined ? { holdMs: deps.promptHoldMs } : {}),
+            ...(deps.promptIsTrusted ? { isTrusted: deps.promptIsTrusted } : {}),
+          })
+        : null;
     if (deps.broadcast) deps.broadcast.onmessage = (ev) => this.onBroadcast(ev.data);
   }
 
@@ -426,7 +437,7 @@ export class FrameCore {
 
   private toSignerError(e: unknown): SignerError {
     if (e instanceof SignerFailure) return e.toJSON();
-    if (e instanceof PromptError) return { code: e.code, message: e.message, retryable: true };
+    if (e instanceof PromptError) return { code: e.code, message: e.message, retryable: true, details: { prompt: e.kind } };
     if (e instanceof SignerBusyError) return { code: "SIGNER_BUSY", message: e.message, retryable: true };
     if (e instanceof Error && e.name === "MainnetWriteBlockedError") {
       return { code: "MAINNET_WRITES_DISABLED", message: "This frame build does not allow mainnet writes.", retryable: false };
@@ -886,7 +897,7 @@ export class FrameCore {
     return this.ui;
   }
 
-  private async prompt<T>(kind: PromptKind, texts: { title: string; body: string; actionLabel: string; fixedStyle?: boolean }, action: () => Promise<T>): Promise<T> {
+  private async prompt<T>(kind: PromptKind, texts: { title: string; body: string; actionLabel: string; fixedStyle?: boolean; hold?: boolean }, action: () => Promise<T>): Promise<T> {
     const ui = this.requirePromptUi();
     return await ui.run({ kind, ...texts, cancelLabel: "Cancel", timeoutMs: this.deps.promptTimeoutMs ?? 120_000 }, action, (e) => this.promptFailure(e));
   }
@@ -1380,6 +1391,7 @@ export class FrameCore {
               body: `The Kokoah app asks to change ${whose} on this device. Confirm only if you asked for this.\n\n${changes.map((c) => c.text).join("\n")}`,
               actionLabel: "Loosen limits",
               fixedStyle: true,
+              hold: true,
             },
             async () => undefined,
           );
@@ -1871,6 +1883,7 @@ export class FrameCore {
             `You can withdraw it ${HLP_LOCKUP_DAYS} days after this deposit. HLP can lose money.`,
           actionLabel: `Deposit ${usdText} USDC`,
           fixedStyle: true,
+          hold: true,
         },
         async () => undefined,
       );

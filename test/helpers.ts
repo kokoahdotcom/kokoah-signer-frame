@@ -388,6 +388,8 @@ export interface HarnessOptions {
   promptTimeoutMs?: number;
   /** Prompt arming delay (default 0 here, so tests don't wait; test/prompt.test.ts covers the real delay). */
   promptArmMs?: number;
+  /** Hold-to-confirm time (default 0 here; test/prompt.test.ts covers the real one). */
+  promptHoldMs?: number;
 }
 
 export class FrameHarness {
@@ -450,6 +452,9 @@ export class FrameHarness {
       ...(o.logger ? { logger: o.logger } : {}),
       ...(o.promptTimeoutMs !== undefined ? { promptTimeoutMs: o.promptTimeoutMs } : {}),
       promptArmMs: o.promptArmMs ?? 0,
+      promptHoldMs: o.promptHoldMs ?? 0,
+      // jsdom can't make trusted events; test/prompt.test.ts covers that untrusted ones never confirm.
+      promptIsTrusted: () => true,
     });
     return new FrameHarness({ core, parent, hl, clock, idb, root, generatedKeys });
   }
@@ -516,12 +521,13 @@ export class FrameHarness {
     return panel && !panel.hidden ? (panel.textContent ?? "") : "";
   }
 
-  /** Waits for the in-frame prompt and clicks its primary button. */
+  /** Waits for the in-frame prompt and clicks its primary button as a user does (moving the pointer onto it, pressing). */
   async clickPrompt(button: "primary" | "cancel" = "primary"): Promise<void> {
     await waitFor(() => this.root?.querySelector<HTMLElement>(".ks-prompt")?.hidden === false);
     const b = this.root?.querySelector<HTMLButtonElement>(button === "primary" ? ".ks-primary" : ".ks-secondary");
     if (!b) throw new Error("no prompt button");
     await waitFor(() => !b.disabled);
+    if (button === "primary") pointerOnto(b);
     b.click();
   }
 
@@ -529,6 +535,18 @@ export class FrameHarness {
     this.core.destroy();
     this.root?.remove();
   }
+}
+
+/**
+ * Moves a mouse pointer onto `el` and presses it (no release): the movement and press a prompt's primary button needs
+ * before a click counts, and the start of a hold.
+ */
+export function pointerOnto(el: HTMLElement, pointerType = "mouse"): void {
+  const at = (x: number) => ({ bubbles: true, isPrimary: true, pointerType, screenX: x, screenY: 20, clientX: x, clientY: 20 });
+  el.dispatchEvent(new PointerEvent("pointerover", at(10)));
+  el.dispatchEvent(new PointerEvent("pointermove", at(12)));
+  el.dispatchEvent(new PointerEvent("pointermove", at(14)));
+  el.dispatchEvent(new PointerEvent("pointerdown", { ...at(14), button: 0 }));
 }
 
 /** Polls until `cond` holds (default 2 s). */

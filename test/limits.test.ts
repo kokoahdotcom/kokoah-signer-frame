@@ -60,8 +60,9 @@ describe("limits stored by the frame", () => {
     expect(h.events("promptChanged").at(-1)).toEqual({ visible: true, kind: "limits" });
     expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Loosen your trading limits?");
     expect(h.promptText()).toContain("Largest order: $100 → $250,000");
-    // Shown in the frame's own fixed style, whatever theme the parent set.
+    // Shown in the frame's own fixed style, whatever theme the parent set, and confirmed by pressing and holding.
     expect(h.root?.querySelector(".ks-prompt")?.classList.contains("ks-prompt--fixed")).toBe(true);
+    expect(h.root?.querySelector(".ks-primary")?.classList.contains("ks-hold")).toBe(true);
     // While the prompt waits, the cap holds.
     expect(codes(await h.fail("signAndSubmit", order("o1")))).toContain("ORDER_NOTIONAL_EXCEEDED");
     expect((await h.ok("getStatus")).policy.maxOrderNotionalUsd).toBe(100);

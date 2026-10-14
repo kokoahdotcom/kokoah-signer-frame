@@ -91,7 +91,7 @@ Trust boundaries:
    - tighter baseline numbers once real usage is known;
    - users setting personal limits (`setLimits`);
    - an in-frame confirmation for orders above a threshold (TODO).
-2. **In-frame prompts can be clickjacked by the parent** (made transparent or covered). The browser's own WebAuthn dialog still appears and names the signer, and the result is still policy-bounded. IntersectionObserver v2 visibility checks are a possible hardening (TODO).
+2. **In-frame prompts can still be clickjacked by the parent, with more effort.** The primary button arms only after the prompt has been shown for 800 ms, and on Chromium (IntersectionObserver v2) only while it is wholly visible and unobscured. A click then counts only after the user's own trusted pointer moved over the armed button inside the frame (a touch press, for pointers that can't hover); a key press, a script's event or a pointer resting where the button appeared never confirms, leaving the button needs new movement, and a resize, focus loss or hidden page starts over (prompt.ts, 2026-10-14). Loosening limits and HLP deposits need the button **pressed and held** for 0.8 s on every browser. What remains: without IntersectionObserver v2 (Firefox, Safari, every iOS browser) the frame can't see that the parent made it transparent or put a decoy over it, so a user can be lured into moving onto and holding an invisible button ("hold to continue"); on Chromium, moving the iframe within the viewport doesn't re-arm it. Passkey prompts still take a click (WebAuthn needs the click's activation), but the browser's own WebAuthn dialog then appears and names the signer, and the result is still policy-bounded.
 3. **Passkeys and headers.** Resolved 2026-09-22: kokoah-infra allows WebAuthn for the signer (`(self)`), and the app delegates it to the signer origin. If a deployment's `Permissions-Policy` disables it again, every `passkey` request falls back to `device` (reported via `storageFallbackReason`).
 4. **User limits are the frame's, not the parent's (A23), with these limits:**
    - **The click.** A compromised parent (A1) can still ask for a loosening and hope the user clicks. The prompt names every change and ignores the parent's theme, but the clickjacking caveat of item 2 applies, and a user who confirms without reading loosens their own limits (never beyond the baseline).
@@ -116,8 +116,8 @@ Trust boundaries:
    start the user's fee trial at a moment the user didn't choose (once per 90 days, per HL). The app explains the
    terms and asks before it sends the action; the frame cannot tell a real click from A1. `setReferrer` can only ever
    carry Kokoah's own code (A14), so A1 gains nothing by triggering it.
-10. **HLP deposits.** A1 can't click the frame's prompt, but a user who clicks without reading can be led to deposit
-   (clickjacking is limited by the fixed styling, not ruled out). The damage is bounded: HLP only, 25,000 USDC per 24
+10. **HLP deposits.** A1 can't click the frame's prompt, but a user who confirms without reading can be led to deposit
+   (clickjacking is limited by the fixed styling and the press and hold, not ruled out; item 2). The damage is bounded: HLP only, 25,000 USDC per 24
    hours, the money stays the account's and is withdrawable after HLP's 4-day lock-up; HLP itself can lose money. The
    cap counts deposits from every device through Hyperliquid's ledger, plus this frame's own last 5 minutes; two frames
    on two devices depositing in the same second, before the ledger shows either, could pass the cap once.

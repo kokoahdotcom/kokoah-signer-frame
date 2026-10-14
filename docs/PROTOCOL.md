@@ -141,6 +141,15 @@ iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min
 
 The iframe must be visible, on top and clickable. Don't cover it or make it transparent.
 
+**How the prompt resists a hostile page.** Its primary button works only after the prompt has been shown for 800 ms
+(where the browser reports occlusion, IntersectionObserver v2, shown whole and unobscured; covering or fading it
+starts over). Then a click counts only after the user's own pointer moved over the button inside the frame (a touch
+press on it, for pointers that can't hover); events a script dispatches, a key press and a pointer that was already
+resting where the button appeared don't count, and leaving the button needs new movement. Resizing the iframe, the
+frame losing focus or the page being hidden starts it all over. The `limits` and `vault-deposit` prompts are
+confirmed by **pressing and holding** the button for 0.8 s (a bar fills; releasing early does nothing). Focus starts on
+Cancel. So don't resize or move the iframe while `visible`, and give the user a pointer path to it.
+
 ## 4. Methods
 
 In the examples, `→` is the `params` the parent sends and `←` is the `result` it receives. Addresses are lower-case hex.
@@ -435,7 +444,7 @@ other fields (a code, a `vaultAddress` or another origin is `INVALID_INTENT`):
   itself and adds the deposits it sent in the last 5 minutes (the ledger can lag); more than 10,000 USDC at once or
   25,000 in 24 hours, or less than 5, is `POLICY_DENIED` (`VAULT_DEPOSIT_LIMIT`), checked before anything is shown.
   Then it shows its own prompt (`promptChanged` kind `vault-deposit`, fixed styling) naming the amount and the 4-day
-  lock-up; only the user's click in the frame signs `{"type":"vaultTransfer","vaultAddress":<HLP>,"isDeposit":true,
+  lock-up; only the user's press and hold on its button in the frame signs `{"type":"vaultTransfer","vaultAddress":<HLP>,"isDeposit":true,
   "usd":250000000}` (USDC × 10^6), after reading the ledger again under the agent lock. Cancel: `USER_CANCELLED`.
 - `{ "kind": "vaultWithdraw", "origin": "manual", "vaultAddress": "0x…", "usd": "120.5" }` withdraws from a vault back
   into the account. The frame reads `{"type":"userVaultEquities","user":<master>}` itself: a vault the account doesn't
@@ -600,14 +609,14 @@ the signer origin, **per network** (the master's, each sub-account's own, and `s
   limits apply to whichever wallet's key the frame holds, and switching to a wallet whose limits in the app's settings
   are looser shows the loosening prompt once.
 
-**Tighten silently, loosen with a click.** Each call is compared with the limits stored now, on the values in force
+**Tighten silently, loosen with the user's confirmation.** Each call is compared with the limits stored now, on the values in force
 for that account (its own, else the master's, else the baseline's):
 
 | Change | What happens | Answer |
 |---|---|---|
 | Identical to the stored limits (the app sends them again at every handshake) | Nothing: no write, no `statusChanged`, no prompt | At once |
 | Only tightens (lower numbers, fewer coins or action types, stop-loss required, spot trading off) | Stored and applied | At once |
-| Loosens anything | The frame shows its own prompt (`promptChanged` kind `limits`, fixed styling the parent's theme can't change) listing every change in plain words, for example `Largest order: $100 → $5,000`. Applied only when the user clicks **Loosen limits** | After the click, or `USER_CANCELLED` / `USER_TIMEOUT` (120 s) with nothing changed |
+| Loosens anything | The frame shows its own prompt (`promptChanged` kind `limits`, fixed styling the parent's theme can't change) listing every change in plain words, for example `Largest order: $100 → $5,000`. Applied only when the user presses and holds **Loosen limits** | After the confirmation, or `USER_CANCELLED` / `USER_TIMEOUT` (120 s) with nothing changed |
 
 Loosening means any of:
 - a higher number;
@@ -726,8 +735,8 @@ Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event":
 | `LIMIT_LOOSENING_REJECTED` | `setLimits` above the baseline, or a loosening in a frame with no user interface (`details.fields`) | Show which limit can't be raised |
 | `PASSKEY_UNAVAILABLE` | WebAuthn/PRF not usable | Offer `device` or `session` |
 | `PASSKEY_FAILED` | The WebAuthn ceremony failed | Retry |
-| `USER_CANCELLED` / `USER_TIMEOUT` | The user cancelled or didn't act within 120 s (a passkey ceremony, an HLP deposit, looser limits) | Let them retry; nothing changed |
-| `PROMPT_BUSY` | A prompt is already open | Wait |
+| `USER_CANCELLED` / `USER_TIMEOUT` | The user cancelled or didn't act within 120 s (a passkey ceremony, an HLP deposit, looser limits). `details.prompt` names the prompt's kind | Let them retry; nothing changed |
+| `PROMPT_BUSY` | A prompt is already open (`details.prompt`: the kind asked for) | Wait |
 | `UNLOCK_FAILED` | Stored key can't be decrypted | Revoke and create a new key |
 | `STORAGE_FAILED` | IndexedDB read or write failed (the key, or the stored limits) | Retry, or use `session` |
 | `MAINNET_WRITES_DISABLED` | The build doesn't allow mainnet writes | Configuration error |
