@@ -6,7 +6,7 @@
 import { recoverL1Signer } from "@kokoah/shared/signing";
 import { HLP_VAULT_ADDRESSES } from "@kokoah/shared/vaults";
 import { afterEach, describe, expect, it } from "vitest";
-import { FrameHarness, T0, testConfig, USER } from "./helpers.js";
+import { FakeLocks, FrameHarness, T0, testConfig, USER } from "./helpers.js";
 
 let h: FrameHarness;
 afterEach(() => h?.destroy());
@@ -113,6 +113,33 @@ describe("HLP deposit", () => {
     }
     expect(codes(await h.fail("signAndSubmit", { requestId: "c", intent: deposit("5000.5") }))).toEqual(["VAULT_DEPOSIT_LIMIT"]);
     expect(h.hl.exchangeCalls).toHaveLength(2);
+  });
+
+  it("counts the deposits another tab or an earlier load of the frame just sent, until the ledger has them", async () => {
+    const locks = new FakeLocks();
+    h = await FrameHarness.create({ locks });
+    await h.activeAgent();
+    for (const id of ["a", "b"]) {
+      const p = h.ok("signAndSubmit", { requestId: id, intent: deposit("10000") });
+      await h.clickPrompt();
+      await p;
+    }
+    // Another tab of the browser (the same storage and locks), or the frame after a reload.
+    const other = await FrameHarness.create({ idb: h.idb, clock: h.clock, hl: h.hl, locks });
+    try {
+      await other.ok("hello", { protocolVersion: 1 });
+      expect(codes(await other.fail("signAndSubmit", { requestId: "c", intent: deposit("5000.5") }))).toEqual(["VAULT_DEPOSIT_LIMIT"]);
+      const fits = other.ok("signAndSubmit", { requestId: "d", intent: deposit("5000") });
+      await other.clickPrompt();
+      expect((await fits).status).toBe("ok");
+      // Five minutes on, only Hyperliquid's ledger counts them (this mock's never shows them).
+      h.clock.advance(5 * 60_000 + 1);
+      const ledgerOnly = h.ok("signAndSubmit", { requestId: "e", intent: deposit("10000") });
+      await h.clickPrompt();
+      expect((await ledgerOnly).status).toBe("ok");
+    } finally {
+      other.destroy();
+    }
   });
 
   it("on mainnet counts deposits into mainnet's HLP only, with the same caps (nothing is signed here)", async () => {

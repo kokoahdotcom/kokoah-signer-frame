@@ -277,11 +277,6 @@ export class FrameCore {
   private notifiedExpiredFor: string | null = null;
   private passkeySupportCache: Promise<PasskeySupport> | null = null;
   private readonly metrics = { ignoredMessages: 0, rejectedRequests: 0, policyDenials: 0, submitted: 0 };
-  /**
-   * HLP deposits this frame sent in the last few minutes, by master: Hyperliquid's ledger can lag a deposit by a few
-   * seconds, so these count towards the 24-hour cap on top of the ledger (counted twice for a moment: stricter).
-   */
-  private readonly hlpSent: Array<{ master: string; at: number; usd: number }> = [];
   private destroyed = false;
 
   private constructor(deps: FrameDeps) {
@@ -1856,6 +1851,9 @@ export class FrameCore {
     }
     const action = compiled.action as { type: "vaultTransfer"; vaultAddress: `0x${string}`; isDeposit: boolean; usd: number };
     const usdText = vaultUnitsToUsd(action.usd);
+    const agent = key.meta.agentAddress;
+    // HLP deposits this browser signed in the last few minutes, every tab's (the usage record): the ledger can lag.
+    let recentDepositsUsd = 0;
 
     // What the rules need, read by the frame itself for the master (never from the parent).
     const facts = async (now: number): Promise<{ network: typeof network; hlpDepositedLast24hUsd?: number; heldEquityUsd?: number }> => {
@@ -1868,8 +1866,12 @@ export class FrameCore {
         } catch {
           throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Hyperliquid's ledger was unreadable; nothing was signed. Try again shortly.", { retryable: true });
         }
-        const recent = this.hlpSent.filter((d) => d.master === master && d.at > now - 5 * 60 * 1000).reduce((sum, d) => sum + d.usd, 0);
-        return { network, hlpDepositedLast24hUsd: fromLedger + recent };
+        try {
+          recentDepositsUsd = await this.coordinator.recentHlpDepositsUsd(agent, master, now);
+        } catch {
+          throw new SignerFailure("STORAGE_FAILED", "Could not read this browser's recent HLP deposits; nothing was signed.", { retryable: true });
+        }
+        return { network, hlpDepositedLast24hUsd: fromLedger + recentDepositsUsd };
       }
       const equities = await this.readInfo({ type: "userVaultEquities", user: master }, "Could not read your vaults from Hyperliquid; nothing was signed. Try again shortly.");
       if (!Array.isArray(equities)) throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Hyperliquid's vault list was unreadable; nothing was signed. Try again shortly.", { retryable: true });
@@ -1906,7 +1908,6 @@ export class FrameCore {
       );
     }
 
-    const agent = key.meta.agentAddress;
     const generation = key.generation;
     return await this.coordinator.withAgentLock(agent, async () => {
       const current = this.key;
@@ -1926,6 +1927,8 @@ export class FrameCore {
           notionalUsd: 0,
           account: { account: master, master },
           limits: { maxOrdersPerMinute: Infinity, maxActionsPerMinute: BASELINE_LIMITS.maxActionsPerMinute, maxDailyNotionalUsd: Infinity, maxAgentDailyNotionalUsd: Infinity },
+          // Recorded with the nonce, for every tab's next cap check.
+          ...(action.isDeposit ? { hlpDeposit: { master, usd: action.usd / 1e6, countedUsd: recentDepositsUsd } } : {}),
         });
       } catch (e) {
         if (e instanceof UsageLimitError) {
@@ -1939,7 +1942,6 @@ export class FrameCore {
       // Signs exactly `compiled.action` (the object the rules checked), for the master account.
       const body = await prepareL1Request({ wallet: current.account, network: this.config.network, compiled: { action: compiled.action }, nonce, expiresAfter });
       markConsumed();
-      if (action.isDeposit) this.hlpSent.push({ master, at: now, usd: action.usd / 1e6 });
       this.metrics.submitted++;
       this.log("sign.submitted", { actionType: decision.actionType, agent });
       const transport = await this.hl.exchange(body);

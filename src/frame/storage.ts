@@ -6,8 +6,8 @@
  * - `keys` (key `slot`): the encrypted agent key record (`device` and `passkey` modes; slot `current`). Never
  *   plaintext. Also the user's limits for each network (slot `limits/<network>`, see {@link StoredLimitsRecord}): kept
  *   in this store so the schema version stays 1 and an older frame build still opens the database.
- * - `usage` (key `agent`): last nonce, recent order times and today's notional, per agent address. Updated in a single
- *   `readwrite` transaction per signature, which IndexedDB serializes across tabs of the origin.
+ * - `usage` (key `agent`): last nonce, recent order times, today's notional and recent HLP deposits, per agent address.
+ *   Updated in a single `readwrite` transaction per signature, which IndexedDB serializes across tabs of the origin.
  * - `agents` (key `address`): every agent address this origin ever generated, so an address is never reused.
  *
  * @module
@@ -109,6 +109,11 @@ export interface UsageRecord {
    * itself accepts a referrer once per account.
    */
   referrerSignedAt?: number;
+  /**
+   * HLP deposits this agent signed in the last `HLP_DEPOSIT_RECENT_MS` (nonces.ts), by master (lowercase): they count
+   * toward the 24-hour cap on top of Hyperliquid's ledger, which can lag a deposit. Missing when there are none.
+   */
+  hlpDeposits?: Array<{ master: string; at: number; usd: number }>;
 }
 
 /** Storage used by the frame. */

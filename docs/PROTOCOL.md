@@ -445,7 +445,8 @@ other fields (a code, a `vaultAddress` or another origin is `INVALID_INTENT`):
 - `{ "kind": "hlpDeposit", "origin": "manual", "usd": "250" }` deposits `usd` USDC (at most 6 decimals) into HLP,
   Hyperliquid's own vault. There is no vault field: the frame signs its own HLP address for its network (shared
   `HLP_VAULT_ADDRESSES`). The frame reads `{"type":"userNonFundingLedgerUpdates","user":<master>,"startTime":<now−24 h>}`
-  itself and adds the deposits it sent in the last 5 minutes (the ledger can lag); more than 10,000 USDC at once or
+  itself and adds the deposits signed in this browser in the last 5 minutes, in any tab (kept with the nonces in its
+  IndexedDB; the ledger can lag); more than 10,000 USDC at once or
   25,000 in 24 hours, or less than 5, is `POLICY_DENIED` (`VAULT_DEPOSIT_LIMIT`), checked before anything is shown.
   Then it shows its own prompt (`promptChanged` kind `vault-deposit`, fixed styling) naming the amount and the 4-day
   lock-up; only the user's press and hold on its button in the frame signs `{"type":"vaultTransfer","vaultAddress":<HLP>,"isDeposit":true,
