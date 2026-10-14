@@ -1367,25 +1367,28 @@ export class FrameCore {
     const whose = sub === undefined ? "your limits" : `the limits of sub-account ${sub.slice(0, 6)}…${sub.slice(-4)}`;
     let confirmedRev: number | undefined;
     for (let attempt = 0; attempt < MAX_LIMITS_ATTEMPTS; attempt++) {
-      const step = await this.serialized("limits", () => this.limitsStep(sub, r.limits, confirmedRev));
-      if (step.kind === "done") return { policy: summarizeFramePolicy(this.limits.policy, this.limits.master, this.limits.accounts, this.market.tradingPairCoins) };
+      let step = await this.serialized("limits", () => this.limitsStep(sub, r.limits, confirmedRev));
       if (step.kind === "confirm") {
-        // One limits prompt at a time in this tab; the limits may have changed while this one waited for its turn.
-        confirmedRev = await this.serialized("limitsPrompt", async () => {
-          if ((await this.readLimits()).rev !== step.before.rev) return undefined;
+        const { before, changes } = step;
+        // One limits prompt at a time in this tab, written before the next one compares; the limits may have changed
+        // while this one waited for its turn.
+        step = await this.serialized("limitsPrompt", async () => {
+          if ((await this.readLimits()).rev !== before.rev) return { kind: "retry" as const };
           await this.prompt(
             "limits",
             {
               title: "Loosen your trading limits?",
-              body: `The Kokoah app asks to change ${whose} on this device. Confirm only if you asked for this.\n\n${step.changes.map((c) => c.text).join("\n")}`,
+              body: `The Kokoah app asks to change ${whose} on this device. Confirm only if you asked for this.\n\n${changes.map((c) => c.text).join("\n")}`,
               actionLabel: "Loosen limits",
               fixedStyle: true,
             },
             async () => undefined,
           );
-          return step.before.rev;
+          confirmedRev = before.rev;
+          return await this.serialized("limits", () => this.limitsStep(sub, r.limits, confirmedRev));
         });
       }
+      if (step.kind === "done") return { policy: summarizeFramePolicy(this.limits.policy, this.limits.master, this.limits.accounts, this.market.tradingPairCoins) };
       // Otherwise another tab wrote first, or changed the limits while this prompt waited: compare again.
     }
     throw new SignerFailure("SIGNER_BUSY", "Your limits kept changing in another tab; nothing was changed. Try again.", { retryable: true });
