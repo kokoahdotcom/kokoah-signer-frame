@@ -13,6 +13,8 @@
  * - the signer's real `public/_headers` Permissions-Policy (served unchanged) allows WebAuthn: the full passkey flow
  *   with a **virtual authenticator that supports PRF**: create → sign → lock → unlock (passkey assertion) → sign; after
  *   a reload the key is locked;
+ * - the prompt arms (IntersectionObserver v2) and takes real mouse input moved onto its button, never a click a script
+ *   dispatches;
  * - when the app doesn't delegate WebAuthn (its own Permissions-Policy disables it), passkeys are reported unavailable
  *   and `passkey` falls back to `device`;
  * - Link phone: `createLinkedAgent` in the real frame returns the matching code the computer computes, and the key
@@ -164,7 +166,9 @@ async function main(): Promise<number> {
     // Parent (app stand-in) + mock HL on 127.0.0.1; frames on localhost (another site → out-of-process iframe).
     const mock = createMockHl({ mode: "mock", log: () => {} });
     const parentFiles: Record<string, [string, string]> = {
-      "/": ["text/html; charset=utf-8", '<!doctype html><html><head><meta charset="utf-8"><title>smoke parent</title><script type="module" src="/parent.js"></script></head><body><div id="slot"></div></body></html>'],
+      "/": ["text/html; charset=utf-8", '<!doctype html><html><head><meta charset="utf-8"><title>smoke parent</title><link rel="stylesheet" href="/parent.css"><script type="module" src="/parent.js"></script></head><body><div id="slot"></div></body></html>'],
+      // The modal size PROTOCOL.md suggests: the frame's prompt arms only once it is seen whole.
+      "/parent.css": ["text/css; charset=utf-8", "iframe[data-kokoah-signer] { width: 420px; height: 480px; border: 0; }\n"],
       "/parent.js": [
         "text/javascript",
         'import { KokoahSignerClient } from "/client/index.js";\nconst frameUrl = new URL(location.href).searchParams.get("frame");\nwindow.signer = new KokoahSignerClient({ frameUrl, container: document.getElementById("slot"), helloTimeoutMs: 20000 });\nwindow.reconnects = [];\nwindow.signer.on("reconnected", (h) => window.reconnects.push(h));\nwindow.smokeReady = true;\n',
@@ -349,6 +353,20 @@ async function main(): Promise<number> {
       }
       throw new Error(`no iframe session for ${origin}`);
     };
+    /**
+     * Clicks the frame's primary button with real input, as a user does (the frame ignores clicks a script dispatches,
+     * and a pointer that didn't move over the button): once it is armed, moves the mouse onto it, presses, releases.
+     */
+    const clickPrimary = async (frameSession: string) => {
+      await waitUntil("document.querySelector('.ks-primary')?.disabled === false", frameSession);
+      const f = await evaluate<{ x: number; y: number }>("(() => { const r = signer.iframe.getBoundingClientRect(); return { x: r.left + signer.iframe.clientLeft, y: r.top + signer.iframe.clientTop }; })()");
+      const b = await evaluate<{ x: number; y: number }>("(() => { const r = document.querySelector('.ks-primary').getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()", frameSession);
+      const x = f.x + b.x;
+      const y = f.y + b.y;
+      for (const dx of [-6, -3, 0]) await c.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: x + dx, y }, page);
+      await c.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 }, page);
+      await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 }, page);
+    };
     const mainWallet = privateKeyToAccount(generatePrivateKey());
     const approve = async (prepared: { typedData: unknown }) => {
       const sig = await mainWallet.signTypedData(prepared.typedData as never);
@@ -473,7 +491,7 @@ async function main(): Promise<number> {
     await waitUntil("!signer.iframe.hidden");
     check("promptChanged makes the client show the iframe", true);
     // A real click inside the frame (user activation), then maybe a second one for the PRF assertion.
-    await evaluate("document.querySelector('.ks-primary').click(); true", fb, true);
+    await clickPrimary(fb);
     for (let i = 0; i < 50; i++) {
       const state = await evaluate<{ done: boolean; title: string; busy: boolean }>(
         "({ done: false, title: document.querySelector('.ks-title')?.textContent ?? '', busy: document.querySelector('.ks-primary')?.disabled ?? false, hidden: document.querySelector('.ks-prompt')?.hidden })",
@@ -481,7 +499,7 @@ async function main(): Promise<number> {
       );
       const finished = await evaluate<boolean>("signer.iframe.hidden");
       if (finished) break;
-      if (state.title === "Confirm your passkey" && !state.busy) await evaluate("document.querySelector('.ks-primary').click(); true", fb, true);
+      if (state.title === "Confirm your passkey" && !state.busy) await clickPrimary(fb);
       await new Promise((r) => setTimeout(r, 100));
     }
     const createdB = await evaluate<{ ok?: { storageMode: string; agentAddress: string; approveAgent: { typedData: unknown } }; err?: string }>("window.creating");
@@ -494,7 +512,11 @@ async function main(): Promise<number> {
       const locked = await evaluate<{ locked: boolean }>("signer.lock()");
       await evaluate("window.unlocking = signer.unlock().then((r) => ({ ok: r }), (e) => ({ err: e.code + ': ' + e.message })); true");
       await waitUntil("!signer.iframe.hidden");
+      await waitUntil("document.querySelector('.ks-primary')?.disabled === false", fb);
       await evaluate("document.querySelector('.ks-primary').click(); true", fb, true);
+      await new Promise((r) => setTimeout(r, 500));
+      check("a click a script dispatches in the frame doesn't confirm its prompt", !(await evaluate<boolean>("signer.iframe.hidden")));
+      await clickPrimary(fb);
       await waitUntil("signer.iframe.hidden");
       const unlocked = await evaluate<{ ok?: { locked: boolean }; err?: string }>("window.unlocking");
       check("lock, then unlock with a passkey assertion (PRF → HKDF → AES-GCM)", locked.locked && unlocked.ok?.locked === false, unlocked);

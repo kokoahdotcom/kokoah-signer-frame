@@ -613,6 +613,8 @@ export interface SignerError {
     compileCode?: string;
     /** LIMIT_LOOSENING_REJECTED: the fields that would loosen the baseline (or the stored limits, in a frame with no UI). */
     fields?: string[];
+    /** USER_CANCELLED / USER_TIMEOUT / PROMPT_BUSY: the kind of the frame's prompt (as in `promptChanged`). */
+    prompt?: EventData["promptChanged"]["kind"];
     /** Anything else worth showing (never secrets). */
     [key: string]: unknown;
   };
