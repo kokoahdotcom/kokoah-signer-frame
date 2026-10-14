@@ -129,7 +129,7 @@ Trust boundaries:
 
 | Control | Where | Verified by |
 |---|---|---|
-| Separate origin, own deploy, own release manifest | Infra plus `scripts/postbuild.ts` | Manifest byte-identical to kokoah-infra's generator |
+| Separate origin, own deploy, own release manifest (with the kokoah-shared commit linked) | Infra plus `scripts/postbuild.ts` | Manifest byte-identical to kokoah-infra's generator, plus the optional `sharedCommit` |
 | CSP header (infra) plus `<meta>` CSP (connect-src narrowed to the network's HL host) | `public/_headers`, `vite.config.ts` | `test/config.test.ts` (meta ⊆ header); postbuild check; headless Chromium (violations blocked, none in normal flows) |
 | Trusted Types `require-trusted-types-for 'script'`, `trusted-types 'none'` | Header plus meta; the UI uses only `createElement`/`textContent` | Headless Chromium: `innerHTML` and `script.src` throw |
 | No inline scripts or styles, SRI on every script and style | `vite.config.ts`, `scripts/postbuild.ts` | Postbuild fails otherwise; Chromium loads with SRI |

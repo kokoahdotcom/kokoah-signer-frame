@@ -72,7 +72,7 @@ corepack pnpm smoke:browser    # real-browser checks in headless Chromium (needs
 2. [`scripts/postbuild.ts`](scripts/postbuild.ts), which:
    - adds `integrity="sha384-…"` to every script and stylesheet;
    - fails on inline scripts or styles, third-party resources, `eval`/`new Function`, source maps, dev-harness code, a CSP `<meta>` that differs from the configuration, `_headers` whose `frame-ancestors`/`connect-src` don't match the configuration or whose `Permissions-Policy` doesn't allow WebAuthn for `self`, or (when kokoah-infra is checked out next to this repo) `_headers` that differ from kokoah-infra's signer copy in anything but deployment-specific origins (`frame-ancestors`, the CSP report endpoint);
-   - writes **`release-manifest.json`** (`kokoah.release-manifest/v1`, see kokoah-infra `docs/RELEASE_MANIFEST.md`). The output is byte-identical to kokoah-infra's own `release-manifest.ts` for the same inputs.
+   - writes **`release-manifest.json`** (`kokoah.release-manifest/v1`, see kokoah-infra `docs/RELEASE_MANIFEST.md`). The output is byte-identical to kokoah-infra's own `release-manifest.ts` for the same inputs, plus the optional `sharedCommit`: the kokoah-shared commit the build linked (`COMMIT_SHARED`, which kokoah-infra's `vercel/build.sh` sets, else the HEAD of the linked checkout, with a warning when it has uncommitted changes).
 3. `tsc -p tsconfig.client.json`: the client and protocol types into `dist-client/`.
 
 Build output:
@@ -80,7 +80,7 @@ Build output:
 | Path | What |
 |---|---|
 | `dist/` | The site: `index.html`, `assets/index-<hash>.js`, `assets/style-<hash>.css`, `_headers` |
-| `release-manifest.json` | SHA-384 of every deployed file (`_headers` excluded), site, version, commit, build time. CI regenerates it with the vendored kokoah-infra tool (`tools/kokoah-infra/`), attests it and publishes it |
+| `release-manifest.json` | SHA-384 of every deployed file (`_headers` excluded), site, version, commit, the kokoah-shared commit, build time. CI regenerates it with the vendored kokoah-infra tool (`tools/kokoah-infra/`), attests it and publishes it |
 | `dist-client/` | `client/index.{js,d.ts}`, `protocol/index.{js,d.ts}` for `@kokoah/signer-frame/client` |
 
 ## Build configuration

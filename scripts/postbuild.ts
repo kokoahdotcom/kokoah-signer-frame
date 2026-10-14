@@ -13,14 +13,15 @@
  *    - no `eval(`/`new Function(` in the JavaScript, no source maps, nothing from the dev harness;
  *    - a mainnet build never uses the placeholder builder address.
  * 3. Writes `release-manifest.json` (kokoah.release-manifest/v1, kokoah-infra/docs/RELEASE_MANIFEST.md) next to
- *    `dist/`: SHA-384 of every deployed file, excluding Cloudflare config files.
+ *    `dist/`: SHA-384 of every deployed file, excluding Cloudflare config files, and the kokoah-shared commit the
+ *    build linked (`sharedCommit`, an optional field v1 readers ignore) when it is known.
  *
  * Usage: node scripts/postbuild.ts [--mode production] [--dist dist] [--out release-manifest.json]
- * Env: SIGNER_SITE_ORIGIN, RELEASE, GIT_COMMIT (or GITHUB_SHA), SOURCE_DATE_EPOCH.
+ * Env: SIGNER_SITE_ORIGIN, RELEASE, GIT_COMMIT (or GITHUB_SHA), COMMIT_SHARED, SOURCE_DATE_EPOCH.
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -37,6 +38,8 @@ export interface ReleaseManifest {
   site: string;
   version: string;
   gitCommit: string;
+  /** The kokoah-shared commit linked into the build (optional: not in kokoah-infra's v1 generator). */
+  sharedCommit?: string;
   builtAt: string;
   entrypoint: string;
   files: Record<string, string>;
@@ -243,6 +246,7 @@ export function validateManifest(m: ReleaseManifest): string[] {
   }
   if (m.version === "") p.push("version must not be empty");
   if (!/^[0-9a-f]{40}$/.test(m.gitCommit)) p.push("gitCommit must be 40 lowercase hex");
+  if (m.sharedCommit !== undefined && !/^[0-9a-f]{40}$/.test(m.sharedCommit)) p.push("sharedCommit must be 40 lowercase hex");
   if (Number.isNaN(Date.parse(m.builtAt))) p.push("builtAt must be ISO 8601");
   if (Object.keys(m.files).length === 0) p.push("files must not be empty");
   for (const [k, v] of Object.entries(m.files)) {
@@ -253,11 +257,12 @@ export function validateManifest(m: ReleaseManifest): string[] {
   return p;
 }
 
-/** Same serialization as kokoah-infra's generator: sorted keys, two-space indent, trailing newline. */
+/** Same serialization as kokoah-infra's generator (plus `sharedCommit` when set): sorted keys, two-space indent, trailing newline. */
 export function serializeManifest(m: ReleaseManifest): string {
   const files: Record<string, string> = {};
   for (const k of Object.keys(m.files).sort()) files[k] = m.files[k] as string;
-  return `${JSON.stringify({ schema: m.schema, site: m.site, version: m.version, gitCommit: m.gitCommit, builtAt: m.builtAt, entrypoint: m.entrypoint, files, inlineScripts: [...m.inlineScripts].sort() }, null, 2)}\n`;
+  const shared = m.sharedCommit !== undefined ? { sharedCommit: m.sharedCommit } : {};
+  return `${JSON.stringify({ schema: m.schema, site: m.site, version: m.version, gitCommit: m.gitCommit, ...shared, builtAt: m.builtAt, entrypoint: m.entrypoint, files, inlineScripts: [...m.inlineScripts].sort() }, null, 2)}\n`;
 }
 
 function gitCommit(root: string): { sha: string; real: boolean } {
@@ -270,6 +275,25 @@ function gitCommit(root: string): { sha: string; real: boolean } {
     // No commit yet.
   }
   return { sha: "0".repeat(40), real: false };
+}
+
+/**
+ * The kokoah-shared commit this build linked: `COMMIT_SHARED` (kokoah-infra's build sets it; its copies have no git
+ * history), else the HEAD of the checkout `@kokoah/shared` links to, with `dirty` when that checkout has uncommitted
+ * changes. Undefined when neither is known.
+ */
+export function linkedSharedCommit(root: string, env: Record<string, string | undefined> = process.env): { sha: string; dirty: boolean } | undefined {
+  const fromEnv = env.COMMIT_SHARED;
+  if (fromEnv && /^[0-9a-fA-F]{40}$/.test(fromEnv)) return { sha: fromEnv.toLowerCase(), dirty: false };
+  try {
+    const cwd = realpathSync(join(root, "node_modules", "@kokoah", "shared"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+    const sha = git("rev-parse", "HEAD");
+    if (/^[0-9a-f]{40}$/.test(sha)) return { sha, dirty: git("status", "--porcelain") !== "" };
+  } catch {
+    // Not linked, or not a git checkout.
+  }
+  return undefined;
 }
 
 function main(): number {
@@ -348,6 +372,9 @@ function main(): number {
   }
   const commit = gitCommit(root);
   if (!commit.real) warnings.push("no git commit (repo has no commits): gitCommit is all zeros; CI sets GITHUB_SHA");
+  const shared = linkedSharedCommit(root);
+  if (!shared) warnings.push("the kokoah-shared commit is unknown (set COMMIT_SHARED): the manifest has no sharedCommit");
+  else if (shared.dirty) warnings.push("kokoah-shared has uncommitted changes: sharedCommit is its HEAD, not exactly what was built");
   const epoch = process.env.SOURCE_DATE_EPOCH;
   const site = process.env.SIGNER_SITE_ORIGIN ?? "https://signer.kokoah.example";
   const manifest: ReleaseManifest = {
@@ -355,6 +382,7 @@ function main(): number {
     site,
     version: process.env.RELEASE ?? commit.sha,
     gitCommit: commit.sha,
+    ...(shared ? { sharedCommit: shared.sha } : {}),
     builtAt: epoch !== undefined && /^\d+$/.test(epoch) ? new Date(Number(epoch) * 1000).toISOString() : new Date().toISOString(),
     entrypoint: "/index.html",
     files: manifestFiles,

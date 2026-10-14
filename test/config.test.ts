@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildMetaCsp, FrameConfigError, parseFrameConfig } from "../src/frame/config.js";
-import { addSri, checkHeaders, headersCsp, headersDrift, parsePermissionsPolicy, serializeManifest, sri, validateManifest, type ReleaseManifest } from "../scripts/postbuild.js";
+import { addSri, checkHeaders, headersCsp, headersDrift, linkedSharedCommit, parsePermissionsPolicy, serializeManifest, sri, validateManifest, type ReleaseManifest } from "../scripts/postbuild.js";
 import { BUILDER, testConfig } from "./helpers.js";
 
 const base = { VITE_ALLOWED_PARENT_ORIGINS: "https://app.kokoah.example", VITE_BUILDER_ADDRESS: BUILDER, VITE_BUILDER_FEE_TENTHS_BPS: "25" };
@@ -188,5 +188,29 @@ describe("post-build SRI and release manifest", () => {
     expect(Object.keys(JSON.parse(text).files)).toEqual(["/index.html", "/z.js"]);
     expect(validateManifest({ ...m, site: "https://signer.kokoah.example/" }).length).toBeGreaterThan(0);
     expect(validateManifest({ ...m, entrypoint: "/nope.html" }).length).toBeGreaterThan(0);
+    expect(JSON.parse(text)).not.toHaveProperty("sharedCommit");
+  });
+
+  it("records the kokoah-shared commit the build linked", () => {
+    const shared = "89abcdef0123456789abcdef0123456789abcdef";
+    const m: ReleaseManifest = {
+      schema: "kokoah.release-manifest/v1",
+      site: "https://signer.kokoah.example",
+      version: "v0.1.0",
+      gitCommit: "0123456789abcdef0123456789abcdef01234567",
+      sharedCommit: shared,
+      builtAt: "2026-09-22T00:00:00.000Z",
+      entrypoint: "/index.html",
+      files: { "/index.html": sri(css) },
+      inlineScripts: [],
+    };
+    expect(validateManifest(m)).toEqual([]);
+    expect(Object.keys(JSON.parse(serializeManifest(m)))).toEqual(["schema", "site", "version", "gitCommit", "sharedCommit", "builtAt", "entrypoint", "files", "inlineScripts"]);
+    expect(validateManifest({ ...m, sharedCommit: "main" })).toEqual(["sharedCommit must be 40 lowercase hex"]);
+    // kokoah-infra's build passes it (its copy of kokoah-shared has no git history); otherwise the linked checkout's HEAD.
+    const root = process.cwd();
+    expect(linkedSharedCommit(root, { COMMIT_SHARED: shared.toUpperCase() })).toEqual({ sha: shared, dirty: false });
+    const local = linkedSharedCommit(root, {});
+    if (local) expect(local.sha).toMatch(/^[0-9a-f]{40}$/);
   });
 });
