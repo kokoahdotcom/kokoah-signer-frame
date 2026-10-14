@@ -426,23 +426,78 @@ export function orderCount(action: Record<string, unknown>): number {
   return wireOrders(action).length;
 }
 
+/** Notional (USD) of one wire order: size × max(limit price, trigger price, mark); 0 when unreadable. */
+function orderNotionalUsd(o: WireOrder, registry: MarketRegistry, markPrices: Readonly<Record<string, number>>): number {
+  const size = Number(o.s);
+  const px = Number(o.p);
+  const trig = typeof o.t === "object" && o.t !== null && "trigger" in o.t ? Number((o.t as { trigger?: { triggerPx?: unknown } }).trigger?.triggerPx) : NaN;
+  const coin = typeof o.a === "number" ? registry.getByAssetId(o.a)?.coin : undefined;
+  const mark = coin !== undefined ? markPrices[coin] : undefined;
+  const price = Math.max(...[px, trig, mark ?? NaN].filter((x) => Number.isFinite(x)));
+  return Number.isFinite(size) && Number.isFinite(price) ? size * price : 0;
+}
+
 /**
  * Notional (USD) counted against the daily limit: for each non-reduce-only order, size × max(limit price, trigger
  * price, mark). Reduce-only orders are exempt, as in the baseline policy.
  */
 export function actionNotionalUsd(action: Record<string, unknown>, registry: MarketRegistry, markPrices: Readonly<Record<string, number>>): number {
   let total = 0;
-  for (const o of wireOrders(action)) {
-    if (o.r === true) continue;
-    const size = Number(o.s);
-    const px = Number(o.p);
-    const trig = typeof o.t === "object" && o.t !== null && "trigger" in o.t ? Number((o.t as { trigger?: { triggerPx?: unknown } }).trigger?.triggerPx) : NaN;
-    const coin = typeof o.a === "number" ? registry.getByAssetId(o.a)?.coin : undefined;
-    const mark = coin !== undefined ? markPrices[coin] : undefined;
-    const price = Math.max(...[px, trig, mark ?? NaN].filter((x) => Number.isFinite(x)));
-    if (Number.isFinite(size) && Number.isFinite(price)) total += size * price;
-  }
+  for (const o of wireOrders(action)) if (o.r !== true) total += orderNotionalUsd(o, registry, markPrices);
   return total;
+}
+
+/**
+ * Orders whose notional is above this in all (every order of one action, reduce-only ones included, as
+ * {@link describeOrders} counts it) are signed only after the user confirms the frame's description of them in its own
+ * prompt (`core.ts`).
+ */
+export const CONFIRM_ORDERS_ABOVE_USD = 25_000;
+
+/** The orders of an action in plain words for the frame's prompt, and their notional in all. */
+export interface OrdersDescription {
+  /** One line per order, e.g. `Buy 0.3 BTC at $100,000 (limit) · about $30,000`. */
+  lines: string[];
+  /** Every order's size × max(limit price, trigger price, mark), reduce-only orders included. */
+  totalUsd: number;
+}
+
+/** Market names come from Hyperliquid (a HIP-3 deployer chooses its own): anything but printable ASCII shows as `?`. */
+function printable(x: string): string {
+  return x.replace(/[^\x20-\x7e]/g, "?");
+}
+
+const plain = (x: unknown): string => Number(x).toLocaleString("en-US", { maximumFractionDigits: 8 });
+
+/**
+ * What an action's orders do, from the exact wire action the frame signs: side, size and market, the limit price (a
+ * market order's worst price) and trigger, reduce-only, and the notional of each. `marketOrder`: the first order is a
+ * market order (compiled as IOC at its worst price). Actions without orders describe nothing.
+ */
+export function describeOrders(action: Record<string, unknown>, registry: MarketRegistry, markPrices: Readonly<Record<string, number>>, marketOrder = false): OrdersDescription {
+  const lines: string[] = [];
+  let totalUsd = 0;
+  for (const [i, o] of wireOrders(action).entries()) {
+    const market = typeof o.a === "number" ? registry.getByAssetId(o.a) : undefined;
+    const name = printable(market?.displayName ?? market?.coin ?? `asset ${String(o.a)}`);
+    const t = (typeof o.t === "object" && o.t !== null ? o.t : {}) as { limit?: { tif?: unknown }; trigger?: { isMarket?: unknown; triggerPx?: unknown; tpsl?: unknown } };
+    const isBuy = o.b === true;
+    let how: string;
+    if (t.trigger) {
+      const kind = t.trigger.tpsl === "tp" ? "take-profit" : "stop-loss";
+      how = `${kind} at $${plain(t.trigger.triggerPx)}, then ${t.trigger.isMarket === true ? `at market (${isBuy ? "up to" : "down to"} $${plain(o.p)})` : `limit $${plain(o.p)}`}`;
+    } else if (i === 0 && marketOrder) {
+      how = `at market, ${isBuy ? "up to" : "down to"} $${plain(o.p)}`;
+    } else {
+      const tif = t.limit?.tif === "Alo" ? "post-only limit" : t.limit?.tif === "Ioc" ? "limit, fill now or cancel" : "limit";
+      how = `at $${plain(o.p)} (${tif})`;
+    }
+    const notional = orderNotionalUsd(o, registry, markPrices);
+    totalUsd += notional;
+    const change = action.type === "order" ? "" : "Change an open order to: ";
+    lines.push(`${change}${isBuy ? "Buy" : "Sell"} ${plain(o.s)} ${name} ${how}${o.r === true ? " · reduce-only" : ""} · about ${usd(notional)}`);
+  }
+  return { lines, totalUsd };
 }
 
 /** Inputs of {@link evaluateFramePolicy}. */

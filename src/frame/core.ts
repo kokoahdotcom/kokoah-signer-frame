@@ -90,7 +90,9 @@ import {
   actionNotionalUsd,
   BASELINE_LIMITS,
   applyUserLimits,
+  CONFIRM_ORDERS_ABOVE_USD,
   createBaselinePolicy,
+  describeOrders,
   evaluateFrameAccountPolicy,
   evaluateFramePolicy,
   hip3PinnedLegs,
@@ -100,6 +102,7 @@ import {
   type LimitsSet,
   MAX_ACCOUNT_LIMITS,
   orderCount,
+  type OrdersDescription,
   policyForAccount,
   separateDailyAccounts,
   storedUserLimits,
@@ -713,6 +716,7 @@ export class FrameCore {
         broadcastChannel: Boolean(this.deps.broadcast),
         vaultTransfers: true,
         confirmsLooserLimits: true,
+        confirmsLargeOrders: true,
       },
       builder: { address: this.config.builder.address, feeTenthsBps: this.config.builder.feeTenthsBps, promo: this.config.builder.promo },
       status: this.status(),
@@ -722,6 +726,7 @@ export class FrameCore {
         maxValidForDays: MAX_VALID_FOR_DAYS,
         expiresAfterMs: EXPIRES_AFTER_MS,
         maxAgentNameLength: MAX_AGENT_NAME_LENGTH,
+        confirmOrdersAboveUsd: CONFIRM_ORDERS_ABOVE_USD,
       },
     };
   }
@@ -1561,17 +1566,7 @@ export class FrameCore {
     // 2. The frame's own clock, market metadata and prices.
     await this.ensureClock();
     const coins = intentCoins({ intent });
-    let snapshot: MarketSnapshot;
-    try {
-      snapshot = await this.market.snapshotFor(coins);
-    } catch (e) {
-      if (e instanceof MarketDataError) {
-        if (e.code === "UNSUPPORTED_MARKET") throw new SignerFailure("UNSUPPORTED_MARKET", e.message);
-        if (e.code === "UNKNOWN_DEX") throw new SignerFailure("COMPILE_FAILED", e.message, { details: { compileCode: "UNKNOWN_MARKET" } });
-        throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Market data from Hyperliquid is unavailable; try again shortly.", { retryable: true });
-      }
-      throw e;
-    }
+    let snapshot = await this.marketSnapshot(coins);
 
     // 3. Compile with the configured builder and the frame's own mid prices.
     let compiled: CompiledAction;
@@ -1596,10 +1591,13 @@ export class FrameCore {
 
     // 3b. Mainnet: on a HIP-3 dex that isn't pinned or has a new deployer (shared perpDexs.ts; the deployer sets the
     // mark the price band trusts), only cancels and reduce-only orders, so the user can always leave such a dex.
-    for (const leg of hip3PinnedLegs(compiled.action as unknown as Record<string, unknown>, snapshot.registry)) {
-      const problem = snapshot.dexProblems[leg.dex];
-      if (problem !== undefined) throw new SignerFailure("UNSUPPORTED_MARKET", problem);
-    }
+    const requirePinnedDexes = () => {
+      for (const leg of hip3PinnedLegs(compiled.action as unknown as Record<string, unknown>, snapshot.registry)) {
+        const problem = snapshot.dexProblems[leg.dex];
+        if (problem !== undefined) throw new SignerFailure("UNSUPPORTED_MARKET", problem);
+      }
+    };
+    requirePinnedDexes();
 
     // 4. The account's current leverage, only needed when the cap (the baseline's or the user's) is below a market's own
     // maximum: Hyperliquid itself keeps leverage within that.
@@ -1614,18 +1612,9 @@ export class FrameCore {
     const generation = key.generation;
     const action = compiled.action as unknown as Record<string, unknown>;
 
-    // 5. Serialize per agent across tabs; policy, nonce, sign and submit under the lock.
-    return await this.coordinator.withAgentLock(agent, async () => {
-      const current = this.key;
-      if (!current || current.generation !== generation || !current.account) {
-        throw new SignerFailure("KEY_CHANGED", "The trading key changed or was locked before signing.", { retryable: true });
-      }
-      // The user's limits again, under the lock: a change made in another tab since binds this signature.
-      const limits = await this.readLimits();
-      if (leverageByCoin === undefined && needsLeverage(limits)) leverageByCoin = await this.accountLeverage(account, coins, snapshot);
+    // The policy on the exact action, with `limits` and this agent's usage at `now`.
+    const evaluate = async (limits: LimitsState, now: number) => {
       const accountPolicy = policyForAccount(limits.policy, limits.accounts, vault, this.market.tradingPairCoins);
-      const now = this.correctedNow();
-      if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
       const expiresAfter = now + EXPIRES_AFTER_MS;
       // Sub-accounts without a daily limit of their own share the master's daily limit and counter.
       const usageAccount = { account, master, separate: separateDailyAccounts(limits.accounts) };
@@ -1652,6 +1641,34 @@ export class FrameCore {
         this.log("sign.denied", { actionType: decision.actionType, codes: decision.violations.map((v) => v.code).join(",") });
         throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: decision.violations } });
       }
+      return { decision, accountPolicy, usageAccount, expiresAfter };
+    };
+
+    // 4b. Orders above CONFIRM_ORDERS_ABOVE_USD in all (reduce-only ones included) wait for the user's confirmation of
+    // the frame's own description of them. Checked first, so the user is never asked to confirm something the rules
+    // refuse; after the prompt (up to two minutes) the prices, dexes and leverage are read again for the check under
+    // the lock.
+    const orders = describeOrders(action, snapshot.registry, snapshot.markPrices, compiled.marketOrder !== undefined);
+    if (orders.totalUsd > CONFIRM_ORDERS_ABOVE_USD) {
+      await evaluate(stored, this.correctedNow());
+      await this.confirmOrders(orders, compiled.vaultAddress);
+      snapshot = await this.marketSnapshot(coins);
+      requirePinnedDexes();
+      leverageByCoin = undefined;
+    }
+
+    // 5. Serialize per agent across tabs; policy, nonce, sign and submit under the lock.
+    return await this.coordinator.withAgentLock(agent, async () => {
+      const current = this.key;
+      if (!current || current.generation !== generation || !current.account) {
+        throw new SignerFailure("KEY_CHANGED", "The trading key changed or was locked before signing.", { retryable: true });
+      }
+      // The user's limits again, under the lock: a change made in another tab since binds this signature.
+      const limits = await this.readLimits();
+      if (leverageByCoin === undefined && needsLeverage(limits)) leverageByCoin = await this.accountLeverage(account, coins, snapshot);
+      const now = this.correctedNow();
+      if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
+      const { decision, accountPolicy, usageAccount, expiresAfter } = await evaluate(limits, now);
 
       let nonce: number;
       try {
@@ -1931,6 +1948,48 @@ export class FrameCore {
       if (result.error && (result.error.code === "INVALID_NONCE" || result.error.code === "ACTION_EXPIRED")) void this.syncClock();
       return result;
     });
+  }
+
+  /** The frame's own market data for `coins` (HL's metadata and prices); HL's failures map to the frame's errors. */
+  private async marketSnapshot(coins: readonly string[]): Promise<MarketSnapshot> {
+    try {
+      return await this.market.snapshotFor(coins);
+    } catch (e) {
+      if (e instanceof MarketDataError) {
+        if (e.code === "UNSUPPORTED_MARKET") throw new SignerFailure("UNSUPPORTED_MARKET", e.message);
+        if (e.code === "UNKNOWN_DEX") throw new SignerFailure("COMPILE_FAILED", e.message, { details: { compileCode: "UNKNOWN_MARKET" } });
+        throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Market data from Hyperliquid is unavailable; try again shortly.", { retryable: true });
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * The frame's own prompt for orders above CONFIRM_ORDERS_ABOVE_USD (`promptChanged` kind `order`, fixed styling): one
+   * line per order as the frame will sign it, and the total; confirmed by pressing and holding. Cancel or timeout:
+   * USER_CANCELLED / USER_TIMEOUT, and nothing is signed. A frame without a UI can't ask, so it refuses them.
+   */
+  private async confirmOrders(orders: OrdersDescription, subAccount: string | undefined): Promise<void> {
+    const total = `$${Math.round(orders.totalUsd).toLocaleString("en-US")}`;
+    if (!this.ui) {
+      this.metrics.policyDenials++;
+      const message = `Orders of more than $${CONFIRM_ORDERS_ABOVE_USD.toLocaleString("en-US")} (${total} here) need your confirmation in the signer frame, which has no user interface here.`;
+      throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: "ORDER_NOTIONAL_EXCEEDED", message }] } });
+    }
+    const one = orders.lines.length === 1;
+    const sub = subAccount?.toLowerCase();
+    const whose = sub === undefined ? "" : ` for sub-account ${sub.slice(0, 6)}…${sub.slice(-4)}`;
+    await this.prompt(
+      "order",
+      {
+        title: one ? "Confirm this order" : `Confirm these ${orders.lines.length} orders`,
+        body: `The Kokoah app asks to send ${one ? "this order" : "these orders"}${whose} to Hyperliquid, about ${total} in all. Confirm only if you placed ${one ? "it" : "them"}.\n\n${orders.lines.join("\n")}`,
+        actionLabel: one ? "Send order" : `Send ${orders.lines.length} orders`,
+        fixedStyle: true,
+        hold: true,
+      },
+      async () => undefined,
+    );
   }
 
   /** The account's current leverage on HL for the perp coins of an action (spot has none), read by the frame itself. */

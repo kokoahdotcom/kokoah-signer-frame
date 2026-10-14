@@ -10,7 +10,7 @@
  *
  * const signer = new KokoahSignerClient({ frameUrl: import.meta.env.VITE_SIGNER_FRAME_URL });
  * signer.on("statusChanged", (s) => …);           // subscribe before hello: some events follow it immediately
- * signer.on("promptChanged", ({ visible }) => …);  // show the iframe while visible (passkeys, deposits, looser limits)
+ * signer.on("promptChanged", ({ visible }) => …);  // show the iframe while visible (passkeys, deposits, looser limits, large orders)
  * signer.on("reconnected", (hello) => { void signer.setLimits(limits); });  // the frame reloaded: re-apply (a no-op when stored)
  * const hello = await signer.hello();          // check hello.network and hello.builder against public-config
  * const r = await signer.signAndSubmit({ requestId: crypto.randomUUID(), intent });
@@ -107,7 +107,11 @@ export interface KokoahSignerClientOptions {
   container?: HTMLElement;
   /** Default request timeout (ms). Default 30 000. */
   requestTimeoutMs?: number;
-  /** Timeout for requests that may wait for the user in the frame (`unlock`, `setStorageMode`, `setLimits`, passkey `createAgent` / `createLinkedAgent`). Default 300 000. */
+  /**
+   * Timeout for requests that may wait for the user in the frame (`unlock`, `setStorageMode`, `setLimits`, passkey
+   * `createAgent` / `createLinkedAgent`), and the least any request waits while the frame shows a prompt (an HLP deposit
+   * or a large order in `signAndSubmit`). Default 300 000.
+   */
   interactiveTimeoutMs?: number;
   /** How long `hello()` keeps trying to reach the frame (ms). Default 15 000. */
   helloTimeoutMs?: number;
@@ -128,7 +132,9 @@ interface Pending {
   method: MethodName;
   resolve: (value: unknown) => void;
   reject: (error: SignerRequestError) => void;
-  timer: ReturnType<typeof setTimeout>;
+  /** The request's own timeout; see {@link KokoahSignerClient.startTimer}. */
+  timeoutMs: number;
+  timer: ReturnType<typeof setTimeout> | undefined;
 }
 
 /** Methods without effects outside the frame's memory: after a reload the client sends them again to the new frame. */
@@ -157,6 +163,8 @@ export class KokoahSignerClient {
   private helloParams: HelloParams | null = null;
   /** The frame reloaded after a completed handshake; the next successful handshake emits `reconnected`. */
   private reconnectPending = false;
+  /** The frame shows a prompt (`promptChanged.visible`): requests may be waiting for the user. */
+  private promptOpen = false;
   private readyWaiters: Array<() => void> = [];
   private loaded = false;
   private destroyed = false;
@@ -272,7 +280,9 @@ export class KokoahSignerClient {
    * Validates, policy-checks, signs and submits a trading intent. The result is the immediate acknowledgement; final
    * order state comes from Hyperliquid's WebSocket. On `status: "unknown"` (or a client `TIMEOUT`), query
    * `orderStatus` by cloid, or call again with the **same** `requestId` (the frame replays the first result and never
-   * signs twice for one id).
+   * signs twice for one id). An HLP deposit, and orders above `hello.limits.confirmOrdersAboveUsd` with
+   * `hello.capabilities.confirmsLargeOrders`, wait for the user's confirmation in the frame's prompt (up to 120 s,
+   * `promptChanged`); the call doesn't time out while it is open, and has its full timeout again once it closes.
    */
   signAndSubmit(params: SignAndSubmitParams): Promise<SignAndSubmitResult> {
     return this.request("signAndSubmit", params, Math.max(this.options.requestTimeoutMs, 45_000));
@@ -381,6 +391,7 @@ export class KokoahSignerClient {
     this.helloResult = null;
     this.helloPromise = null;
     this.reconnectPending = true;
+    this.promptOpen = false;
     for (const [id, p] of this.pending) {
       clearTimeout(p.timer);
       this.pending.delete(id);
@@ -464,20 +475,32 @@ export class KokoahSignerClient {
     const id = this.nextId();
     const msg: RequestMessage<M> = { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, kind: "request", id, method, params };
     return new Promise<MethodResults[M]>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new SignerRequestError(method, { code: "TIMEOUT", message: `The signer frame did not answer ${method} in time.`, retryable: true }));
-      }, timeoutMs);
-      this.pending.set(id, { method, resolve: resolve as (v: unknown) => void, reject, timer });
+      const p: Pending = { method, resolve: resolve as (v: unknown) => void, reject, timeoutMs, timer: undefined };
+      this.pending.set(id, p);
+      this.startTimer(id, p);
       try {
         // Always the frame's exact origin, never "*": if the iframe navigated elsewhere, the browser drops it.
         target.postMessage(msg, this.frameOrigin);
       } catch (e) {
-        clearTimeout(timer);
+        clearTimeout(p.timer);
         this.pending.delete(id);
         reject(new SignerRequestError(method, { code: "INVALID_REQUEST", message: e instanceof Error ? e.message : "postMessage failed", retryable: false }));
       }
     });
+  }
+
+  /**
+   * (Re)starts a request's timeout: its own, or, while the frame shows a prompt, at least `interactiveTimeoutMs`, since
+   * the request may be waiting for the user (the frame ends every prompt itself after 120 s). Restarted for every
+   * pending request when a prompt opens or closes, so time spent waiting for the user doesn't count.
+   */
+  private startTimer(id: string, p: Pending): void {
+    clearTimeout(p.timer);
+    const timeoutMs = this.promptOpen ? Math.max(p.timeoutMs, this.options.interactiveTimeoutMs) : p.timeoutMs;
+    p.timer = setTimeout(() => {
+      this.pending.delete(id);
+      p.reject(new SignerRequestError(p.method, { code: "TIMEOUT", message: `The signer frame did not answer ${p.method} in time.`, retryable: true }));
+    }, timeoutMs);
   }
 
   private handleMessage(ev: MessageEvent): void {
@@ -501,11 +524,17 @@ export class KokoahSignerClient {
       // document (reload): it has forgotten the handshake. During a handshake, its retries reach the new frame.
       this.reconnect();
     }
-    if (msg.event === "promptChanged" && this.options.autoShowOnPrompt) {
+    if (msg.event === "promptChanged") {
       const data = msg.data as EventData["promptChanged"];
-      this.iframe.hidden = !data.visible;
-      if (data.kind) this.iframe.setAttribute("data-kokoah-signer-prompt", data.kind);
-      else this.iframe.removeAttribute("data-kokoah-signer-prompt");
+      if (data.visible !== this.promptOpen) {
+        this.promptOpen = data.visible;
+        for (const [id, p] of this.pending) this.startTimer(id, p);
+      }
+      if (this.options.autoShowOnPrompt) {
+        this.iframe.hidden = !data.visible;
+        if (data.kind) this.iframe.setAttribute("data-kokoah-signer-prompt", data.kind);
+        else this.iframe.removeAttribute("data-kokoah-signer-prompt");
+      }
     }
     this.dispatch(msg.event, msg.data);
   }
