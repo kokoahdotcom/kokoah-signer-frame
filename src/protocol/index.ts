@@ -148,7 +148,7 @@ export interface PolicySummary {
   allowedCoins: "*" | string[];
   maxOrderNotionalUsd: number;
   maxDailyNotionalUsd: number;
-  /** `"market"`: each market's own maximum (baseline). A number: `min(number, market maximum)`. */
+  /** `min(number, market maximum)` per market (baseline 50). `"market"`: each market's own maximum (frames built before the 50x baseline). */
   maxLeverage: number | "market";
   maxOrdersPerMinute: number;
   /** Max distance of a limit price from the mark price, percent. */

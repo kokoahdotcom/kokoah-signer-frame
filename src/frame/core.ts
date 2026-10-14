@@ -98,7 +98,6 @@ import {
   type LimitChange,
   limitChanges,
   type LimitsSet,
-  limitsForAccount,
   MAX_ACCOUNT_LIMITS,
   orderCount,
   policyForAccount,
@@ -1590,9 +1589,13 @@ export class FrameCore {
       if (problem !== undefined) throw new SignerFailure("UNSUPPORTED_MARKET", problem);
     }
 
-    // 4. The user's current leverage, only needed when the user tightened maxLeverage below the market maximum.
+    // 4. The account's current leverage, only needed when the cap (the baseline's or the user's) is below a market's own
+    // maximum: Hyperliquid itself keeps leverage within that.
     const opensExposure = (intent.kind === "order" && !intent.reduceOnly) || (intent.kind === "modify" && !intent.order.reduceOnly);
-    const needsLeverage = (limits: LimitsState) => opensExposure && limitsForAccount(limits.master, limits.accounts, vault)?.maxLeverage !== undefined;
+    const needsLeverage = (limits: LimitsState) => {
+      const cap = policyForAccount(limits.policy, limits.accounts, vault, this.market.tradingPairCoins).maxLeverage;
+      return opensExposure && coins.some((coin) => (snapshot.registry.get(coin)?.maxLeverage ?? 0) > cap);
+    };
     let leverageByCoin = needsLeverage(stored) ? await this.accountLeverage(account, coins, snapshot) : undefined;
 
     const agent = key.meta.agentAddress;

@@ -582,7 +582,7 @@ Setting limits for an address grants nothing: `vaultAddress` is still checked on
 | Field | Constraint (the baseline is in §7) |
 |---|---|
 | `maxOrderNotionalUsd`, `maxDailyNotionalUsd`, `maxOrdersPerMinute`, `priceBandPct` | ≤ baseline |
-| `maxLeverage` | Integer ≥ 1. Effective cap per market = `min(value, market maximum)`. For new orders the frame reads the account's current leverage (`activeAssetData`) |
+| `maxLeverage` | Integer from 1 to the baseline's 50. Effective cap per market = `min(value, market maximum)`. For new orders on a market whose maximum is above it, the frame reads the account's current leverage (`activeAssetData`) |
 | `allowedCoins` | Non-empty list of HL coin names (a subset of the baseline) |
 | `requireStopLossForNewEntries` | `true` tightens; `false` or omitted: not required |
 | `allowedActionTypes` | A subset of the baseline action types |
@@ -750,10 +750,10 @@ The baseline is built into the frame and can't be loosened:
 | HIP-3 (mainnet) | Only the dexes pinned in shared `perpDexs.ts` (name and deployer), checked against the `perpDexs` the frame reads itself. On any other dex HL lists (not pinned, or a new deployer) only cancels (`cancel`, `cancelByCloid`; `scheduleCancel` touches no market) and reduce-only orders (closes, position TP/SL, reduce-only modifies) are signed, so a user can leave it; entries, modifies that aren't reduce-only and every `updateLeverage` and `updateIsolatedMargin` (either way) are `UNSUPPORTED_MARKET`. Without HL's `perpDexs` nothing on a HIP-3 dex is signed (its asset ids need it). Testnet: every dex |
 | Builder | Every `order` carries exactly `{ b: VITE_BUILDER_ADDRESS, f: VITE_BUILDER_FEE_TENTHS_BPS }` |
 | `vaultAddress` | Absent (the master), or one of the master's own sub-accounts as listed by HL `subAccounts`, read by the frame itself. Vaults and any other address are denied (`VAULT_NOT_ALLOWED`) |
-| Price band | Orders that execute now (market, IOC, and marketable limits: a buy at or above min(mark, mid), a sell at or below max(mark, mid)) within **10%** of HL's mark; market-order slippage ≤ 10%. Resting GTC/ALO limits that don't cross may sit up to **50%** from mark (shared `RESTING_PRICE_BAND_PCT`), which still stops typos like 8500 for 85000. Triggers: the limit within 10% of its trigger; an untriggered trigger up to 50% from mark; a trigger that would fire now banded at 10% from mark. Mark and mid come from the frame's own HL reads. `setLimits.priceBandPct` tightens the 10% band only |
-| Leverage | Each market's own maximum (`updateLeverage` above it is denied) |
+| Price band | Orders that execute now (market, IOC, and marketable limits: a buy at or above min(mark, mid), a sell at or below max(mark, mid)) within **5%** of HL's mark, so a market order's slippage can use at most about 5% (the shared schema accepts up to 10%; the IOC limit it gives must still be in the band). Resting GTC/ALO limits that don't cross may sit up to **50%** from mark (shared `RESTING_PRICE_BAND_PCT`), which still stops typos like 8500 for 85000. Triggers: the limit within 10% of its trigger; an untriggered trigger up to 50% from mark; a trigger that would fire now banded at 5% from mark. Mark and mid come from the frame's own HL reads. `setLimits.priceBandPct` tightens the 5% band only |
+| Leverage | **50x**, and never above each market's own maximum (`updateLeverage` above it is denied). Where a market allows more than the cap (the baseline's or the user's), the frame reads the account's leverage on HL itself and refuses new entries while it is set higher |
 | Rate | **60 orders per minute** per agent (TP/SL legs count; cancels don't). Persisted, so a reload doesn't reset it |
-| Notional | $1,000,000 per order, $25,000,000 per UTC day per key across every account (reduce-only orders exempt) |
+| Notional | $250,000 per order, $25,000,000 per UTC day per key across every account (reduce-only orders exempt) |
 | `expiresAfter` | Required; the frame uses now + 15 s (window ≤ 30 s) |
 | Origins | `manual`, `ai_ticket` |
 
@@ -763,8 +763,8 @@ their own:
 ```json
 {
   "allowedActionTypes": ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop", "startFeeTrial"],
-  "allowedCoins": "*", "maxOrderNotionalUsd": 1000000, "maxDailyNotionalUsd": 25000000, "maxLeverage": "market",
-  "maxOrdersPerMinute": 60, "priceBandPct": 10, "requireStopLossForNewEntries": false,
+  "allowedCoins": "*", "maxOrderNotionalUsd": 250000, "maxDailyNotionalUsd": 25000000, "maxLeverage": 50,
+  "maxOrdersPerMinute": 60, "priceBandPct": 5, "requireStopLossForNewEntries": false,
   "builder": { "address": "0x…builder", "feeTenthsBps": 25 }, "vaultAddressAllowed": false, "ownSubAccountsAllowed": true,
   "expiresAfterMs": 15000, "allowedOrigins": ["manual", "ai_ticket"], "spotCoins": ["@166", "@150"], "spotTrading": false, "spotTradingCoins": ["PURR/USDC", "@1", "…", "@107", "@142"], "referralCode": null,
   "userLimits": null,
@@ -776,7 +776,7 @@ Denials come back as `POLICY_DENIED` with every violation, for example:
 
 ```json
 { "code": "POLICY_DENIED", "message": "The action is not allowed by the signer policy.", "retryable": false,
-  "details": { "violations": [ { "code": "PRICE_OUTSIDE_BAND", "message": "ETH buy at 2300 is 15% from the mark price 2000 and would fill immediately; orders that execute now must be within 10% of the mark (a resting limit can be up to 50% away)." } ] } }
+  "details": { "violations": [ { "code": "PRICE_OUTSIDE_BAND", "message": "ETH buy at 2300 is 15% from the mark price 2000 and would fill immediately; orders that execute now must be within 5% of the mark (a resting limit can be up to 50% away)." } ] } }
 ```
 
 ## 8. Key storage and passkeys
