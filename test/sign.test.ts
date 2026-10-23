@@ -154,7 +154,10 @@ describe("signAndSubmit happy path", () => {
     h = await FrameHarness.create();
     await h.activeAgent("device");
     expect((await h.ok("signAndSubmit", { requestId: "t1", intent: { kind: "updateLeverage", coin: "xyz:GOLD", leverage: 8, marginMode: "isolated", origin: "manual" } })).status).toBe("ok");
-    expect((await h.ok("signAndSubmit", { requestId: "t2", intent: { kind: "updateIsolatedMargin", coin: "xyz:GOLD", amountUsd: "-5", origin: "manual" } })).status).toBe("ok");
+    // Taking margin out asks the user first (test/orders.test.ts).
+    const out = h.ok("signAndSubmit", { requestId: "t2", intent: { kind: "updateIsolatedMargin", coin: "xyz:GOLD", amountUsd: "-5", origin: "manual" } });
+    await h.clickPrompt();
+    expect((await out).status).toBe("ok");
     expect((await h.ok("signAndSubmit", { requestId: "t3", intent: { kind: "updateIsolatedMargin", coin: "xyz:GOLD", amountUsd: "5", origin: "manual" } })).status).toBe("ok");
   });
 

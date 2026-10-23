@@ -92,6 +92,7 @@ export type ThemeVariable = (typeof THEME_VARIABLES)[number];
 /**
  * Action types the frame's baseline policy allows. `setLimits.allowedActionTypes` may only be a subset. `setReferrer`
  * is not listed: it is allowed only with the frame's configured referral code (`PolicySummary.referralCode`), once.
+ * `vaultTransfer` is HLP deposits and vault withdrawals (`hlpDeposit`, `vaultWithdraw`): leave it out to turn them off.
  */
 export const BASELINE_ACTION_TYPES = [
   "order",
@@ -104,6 +105,7 @@ export const BASELINE_ACTION_TYPES = [
   "scheduleCancel",
   "noop",
   "startFeeTrial",
+  "vaultTransfer",
 ] as const;
 export type AllowedActionType = (typeof BASELINE_ACTION_TYPES)[number];
 
@@ -280,6 +282,12 @@ export interface HelloResult {
      * "order"`, nothing sent. Absent in older frames, which sign them without a prompt.
      */
     confirmsLargeOrders?: boolean;
+    /**
+     * The frame also asks (the same `order` prompt) before orders that would take what it signed without a prompt in
+     * the last `limits.recentOrdersWindowMs` above `limits.confirmRecentOrdersAboveUsd`, counted the same way, across
+     * every account; a confirmed prompt starts that total again. Absent in older frames.
+     */
+    confirmsRecentOrders?: boolean;
   };
   /**
    * The builder code on every order. `feeTenthsBps` is the standard fee (the most an order pays; the policy's cap).
@@ -299,6 +307,9 @@ export interface HelloResult {
     maxAgentNameLength: number;
     /** With `capabilities.confirmsLargeOrders`: orders above this (USD, in all) need the user's confirmation in the frame. */
     confirmOrdersAboveUsd?: number;
+    /** With `capabilities.confirmsRecentOrders`: the rolling total (USD) of orders signed without a prompt, and its window (ms). */
+    confirmRecentOrdersAboveUsd?: number;
+    recentOrdersWindowMs?: number;
   };
 }
 
@@ -643,8 +654,11 @@ export interface EventData {
   keyExpiringSoon: { agentAddress: Hex; validUntil: number; msRemaining: number };
   /** The key has expired; the frame refuses to sign with it. */
   keyExpired: { agentAddress: Hex; validUntil: number };
-  /** The frame needs (or no longer needs) the user to click inside it. Show the iframe while `visible` is true. */
-  promptChanged: { visible: boolean; kind: "passkey-create" | "passkey-unlock" | "vault-deposit" | "limits" | "order" | null };
+  /**
+   * The frame needs (or no longer needs) the user to click inside it. Show the iframe while `visible` is true. Kinds
+   * added later (`vault-withdraw`, `margin`, 2026-10-23) may appear: show the iframe for any kind.
+   */
+  promptChanged: { visible: boolean; kind: "passkey-create" | "passkey-unlock" | "vault-deposit" | "vault-withdraw" | "limits" | "order" | "margin" | null };
 }
 
 // ---------------------------------------------------------------------------------------------

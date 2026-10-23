@@ -521,14 +521,32 @@ export class FrameHarness {
     return panel && !panel.hidden ? (panel.textContent ?? "") : "";
   }
 
-  /** Waits for the in-frame prompt and clicks its primary button as a user does (moving the pointer onto it, pressing). */
+  /**
+   * Waits for the in-frame prompt and clicks its primary button as a user does (typing the code it shows, when it asks
+   * for one: jsdom has no IntersectionObserver v2; moving the pointer onto the button, pressing).
+   */
   async clickPrompt(button: "primary" | "cancel" = "primary"): Promise<void> {
     await waitFor(() => this.root?.querySelector<HTMLElement>(".ks-prompt")?.hidden === false);
     const b = this.root?.querySelector<HTMLButtonElement>(button === "primary" ? ".ks-primary" : ".ks-secondary");
     if (!b) throw new Error("no prompt button");
+    if (button === "primary") this.typePromptCode();
     await waitFor(() => !b.disabled);
     if (button === "primary") pointerOnto(b);
     b.click();
+  }
+
+  /** The code the open prompt asks for (null: none). */
+  promptCode(): string | null {
+    const box = this.root?.querySelector<HTMLElement>(".ks-code");
+    return box && !box.hidden ? (this.root?.querySelector(".ks-code-value")?.textContent ?? null) : null;
+  }
+
+  /** Types `code` (default: the one shown) into the open prompt's code field, as the user does. */
+  typePromptCode(code: string | null = this.promptCode()): void {
+    const input = this.root?.querySelector<HTMLInputElement>(".ks-code-input");
+    if (code === null || !input) return;
+    input.value = code;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
   }
 
   destroy(): void {

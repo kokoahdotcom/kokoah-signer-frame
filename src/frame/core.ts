@@ -83,7 +83,7 @@ import { RegionGate } from "./eligibility.js";
 import { silentLogger, type Logger } from "./log.js";
 import { MarketData, MarketDataError, type MarketSnapshot } from "./market-data.js";
 import { classifyMessage } from "./messages.js";
-import { ReferrerAlreadySignedError, SignerBusyError, SigningCoordinator, UsageLimitError, type LockManagerLike } from "./nonces.js";
+import { ConfirmationNeededError, ReferrerAlreadySignedError, SignerBusyError, SigningCoordinator, UNPROMPTED_WINDOW_MS, UsageLimitError, type LockManagerLike, type UsageKey } from "./nonces.js";
 import { PasskeyError, type PasskeyProvider } from "./passkey.js";
 import {
   type AccountLimits,
@@ -91,6 +91,7 @@ import {
   BASELINE_LIMITS,
   applyUserLimits,
   CONFIRM_ORDERS_ABOVE_USD,
+  CONFIRM_UNPROMPTED_ABOVE_USD,
   createBaselinePolicy,
   describeOrders,
   evaluateFrameAccountPolicy,
@@ -104,9 +105,11 @@ import {
   orderCount,
   type OrdersDescription,
   policyForAccount,
+  printable,
   separateDailyAccounts,
   storedUserLimits,
   summarizeFramePolicy,
+  vaultTransfersAllowed,
 } from "./policy.js";
 import { applyTheme, invalidThemeVariables, PromptError, PromptUi, type ActionFailure, type PromptKind } from "./prompt.js";
 import { limitsRev, limitsSlot, type SignerStore, type StoredKeyRecord, type StoredLimitsRecord } from "./storage.js";
@@ -712,6 +715,7 @@ export class FrameCore {
         vaultTransfers: true,
         confirmsLooserLimits: true,
         confirmsLargeOrders: true,
+        confirmsRecentOrders: true,
       },
       builder: { address: this.config.builder.address, feeTenthsBps: this.config.builder.feeTenthsBps, promo: this.config.builder.promo },
       status: this.status(),
@@ -722,6 +726,8 @@ export class FrameCore {
         expiresAfterMs: EXPIRES_AFTER_MS,
         maxAgentNameLength: MAX_AGENT_NAME_LENGTH,
         confirmOrdersAboveUsd: CONFIRM_ORDERS_ABOVE_USD,
+        confirmRecentOrdersAboveUsd: CONFIRM_UNPROMPTED_ABOVE_USD,
+        recentOrdersWindowMs: UNPROMPTED_WINDOW_MS,
       },
     };
   }
@@ -1528,6 +1534,15 @@ export class FrameCore {
     return key as LoadedKey & { account: PrivateKeyAccount };
   }
 
+  /**
+   * Where a key's usage (nonce, counters, recent HLP deposits and unconfirmed orders) is kept: its master account's
+   * record, so a new key the parent has the frame create for the same account keeps the counters. The agent's own
+   * record from before stands in until the account's exists.
+   */
+  private usageKey(key: LoadedKey): UsageKey {
+    return { key: `account/${this.config.network.name}/${key.meta.userAddress.toLowerCase()}`, legacy: key.meta.agentAddress };
+  }
+
   private async runSignAndSubmit(p: SignAndSubmitParams, markConsumed: () => void): Promise<SignAndSubmitResult> {
     if (!isWriteAllowed(this.config.network)) throw new SignerFailure("MAINNET_WRITES_DISABLED", "This frame build does not allow mainnet writes.");
     const key = this.requireSigningKey();
@@ -1604,6 +1619,7 @@ export class FrameCore {
     let leverageByCoin = needsLeverage(stored) ? await this.accountLeverage(account, coins, snapshot) : undefined;
 
     const agent = key.meta.agentAddress;
+    const usageKey = this.usageKey(key);
     const generation = key.generation;
     const action = compiled.action as unknown as Record<string, unknown>;
 
@@ -1613,7 +1629,7 @@ export class FrameCore {
       const expiresAfter = now + EXPIRES_AFTER_MS;
       // Sub-accounts without a daily limit of their own share the master's daily limit and counter.
       const usageAccount = { account, master, separate: separateDailyAccounts(limits.accounts) };
-      const usage = await this.coordinator.usage(agent, now, usageAccount);
+      const usage = await this.coordinator.usage(usageKey, now, usageAccount);
       const decision = evaluateFramePolicy({
         compiled,
         expiresAfter,
@@ -1639,14 +1655,22 @@ export class FrameCore {
       return { decision, accountPolicy, usageAccount, expiresAfter };
     };
 
-    // 4b. Orders above CONFIRM_ORDERS_ABOVE_USD in all (reduce-only ones included) wait for the user's confirmation of
-    // the frame's own description of them. Checked first, so the user is never asked to confirm something the rules
-    // refuse; after the prompt (up to two minutes) the prices, dexes and leverage are read again for the check under
-    // the lock.
+    // 4b. Orders above CONFIRM_ORDERS_ABOVE_USD in all (reduce-only ones included), or that would take what this key
+    // signed without a prompt in the last 10 minutes above CONFIRM_UNPROMPTED_ABOVE_USD, wait for the user's
+    // confirmation of the frame's own description of them; so does taking margin out of an isolated position. Checked
+    // first, so the user is never asked to confirm something the rules refuse; after the prompt (up to two minutes) the
+    // prices, dexes and leverage are read again for the check under the lock.
     const orders = describeOrders(action, snapshot.registry, snapshot.markPrices, compiled.marketOrder !== undefined);
-    if (orders.totalUsd > CONFIRM_ORDERS_ABOVE_USD) {
+    const recentUsd = orders.totalUsd > 0 ? (await this.coordinator.usage(usageKey, this.correctedNow())).unpromptedUsd : 0;
+    const large = orders.totalUsd > CONFIRM_ORDERS_ABOVE_USD;
+    const addsUp = !large && orders.totalUsd > 0 && recentUsd + orders.totalUsd > CONFIRM_UNPROMPTED_ABOVE_USD;
+    const marginOut = intent.kind === "updateIsolatedMargin" && Number(intent.amountUsd) < 0 ? { coin: intent.coin, usd: -Number(intent.amountUsd) } : undefined;
+    let confirmed = false;
+    if (large || addsUp || marginOut) {
       await evaluate(stored, this.correctedNow());
-      await this.confirmOrders(orders, compiled.vaultAddress);
+      if (marginOut) await this.confirmMarginRemoval(marginOut, snapshot, compiled.vaultAddress);
+      else await this.confirmOrders(orders, compiled.vaultAddress, addsUp ? recentUsd : undefined);
+      confirmed = true;
       snapshot = await this.marketSnapshot(coins);
       requirePinnedDexes();
       leverageByCoin = undefined;
@@ -1667,7 +1691,7 @@ export class FrameCore {
 
       let nonce: number;
       try {
-        nonce = await this.coordinator.reserve(agent, {
+        nonce = await this.coordinator.reserve(usageKey, {
           now,
           orders: orderCount(action),
           notionalUsd: actionNotionalUsd(action, snapshot.registry, snapshot.markPrices),
@@ -1678,12 +1702,15 @@ export class FrameCore {
             maxDailyNotionalUsd: accountPolicy.maxDailyNotionalUsd,
             maxAgentDailyNotionalUsd: BASELINE_LIMITS.maxDailyNotionalUsd,
           },
+          // Checked again in the record's own transaction: another tab may have signed orders since the check above.
+          unprompted: { usd: orders.totalUsd, confirmed, maxUsd: CONFIRM_UNPROMPTED_ABOVE_USD },
         });
       } catch (e) {
         if (e instanceof UsageLimitError) {
           this.metrics.policyDenials++;
           throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: e.code, message: e.message }] } });
         }
+        if (e instanceof ConfirmationNeededError) throw new SignerFailure("SIGNER_BUSY", e.message, { retryable: true });
         if (e instanceof RangeError) throw new SignerFailure("INTERNAL_ERROR", "Could not produce a valid nonce; check the device clock.");
         throw new SignerFailure("STORAGE_FAILED", "Could not reserve a nonce on this device.", { retryable: true });
       }
@@ -1773,6 +1800,7 @@ export class FrameCore {
     }
 
     const agent = key.meta.agentAddress;
+    const usageKey = this.usageKey(key);
     const generation = key.generation;
     return await this.coordinator.withAgentLock(agent, async () => {
       const current = this.key;
@@ -1782,7 +1810,7 @@ export class FrameCore {
       const now = this.correctedNow();
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
       const expiresAfter = now + EXPIRES_AFTER_MS;
-      const referrer = intent.kind === "setReferrer" ? { alreadyReferred, signedBefore: await this.coordinator.referrerSigned(agent) } : undefined;
+      const referrer = intent.kind === "setReferrer" ? { alreadyReferred, signedBefore: await this.coordinator.referrerSigned(usageKey) } : undefined;
       // The master's limits as stored now (another tab may have changed them).
       const { policy } = await this.readLimits();
       const decision = evaluateFrameAccountPolicy({ compiled, expiresAfter, now, policy, ...(referrer ? { referrer } : {}) });
@@ -1794,7 +1822,7 @@ export class FrameCore {
 
       let nonce: number;
       try {
-        nonce = await this.coordinator.reserve(agent, {
+        nonce = await this.coordinator.reserve(usageKey, {
           now,
           orders: 0,
           notionalUsd: 0,
@@ -1852,6 +1880,7 @@ export class FrameCore {
     const action = compiled.action as { type: "vaultTransfer"; vaultAddress: `0x${string}`; isDeposit: boolean; usd: number };
     const usdText = vaultUnitsToUsd(action.usd);
     const agent = key.meta.agentAddress;
+    const usageKey = this.usageKey(key);
     // HLP deposits this browser signed in the last few minutes, every tab's (the usage record): the ledger can lag.
     let recentDepositsUsd = 0;
 
@@ -1867,7 +1896,7 @@ export class FrameCore {
           throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Hyperliquid's ledger was unreadable; nothing was signed. Try again shortly.", { retryable: true });
         }
         try {
-          recentDepositsUsd = await this.coordinator.recentHlpDepositsUsd(agent, master, now);
+          recentDepositsUsd = await this.coordinator.recentHlpDepositsUsd(usageKey, master, now);
         } catch {
           throw new SignerFailure("STORAGE_FAILED", "Could not read this browser's recent HLP deposits; nothing was signed.", { retryable: true });
         }
@@ -1879,9 +1908,10 @@ export class FrameCore {
       const equity = isRecord(held) ? Number(held.equity) : undefined;
       return { network, ...(equity !== undefined && Number.isFinite(equity) ? { heldEquityUsd: equity } : {}) };
     };
-    const decide = (now: number, vault: Awaited<ReturnType<typeof facts>>, policy: Policy) => {
+    // The master's limits decide whether vault transfers are on at all (`vaultTransfer` in `allowedActionTypes`).
+    const decide = (now: number, vault: Awaited<ReturnType<typeof facts>>, limits: LimitsState) => {
       const expiresAfter = now + EXPIRES_AFTER_MS;
-      const decision = evaluateFrameAccountPolicy({ compiled, expiresAfter, now, policy, vault });
+      const decision = evaluateFrameAccountPolicy({ compiled, expiresAfter, now, policy: limits.policy, vault, vaultTransfersAllowed: vaultTransfersAllowed(limits.master) });
       if (!decision.allowed) {
         this.metrics.policyDenials++;
         this.log("sign.denied", { actionType: decision.actionType, codes: decision.violations.map((v) => v.code).join(",") });
@@ -1891,7 +1921,7 @@ export class FrameCore {
     };
 
     // Checked before asking, so the user is never asked to confirm something the rules refuse.
-    decide(this.correctedNow(), await facts(this.correctedNow()), (await this.readLimits()).policy);
+    decide(this.correctedNow(), await facts(this.correctedNow()), await this.readLimits());
     if (action.isDeposit) {
       await this.prompt(
         "vault-deposit",
@@ -1901,6 +1931,19 @@ export class FrameCore {
             `Move ${usdText} USDC from your Hyperliquid account into HLP, Hyperliquid's own vault. ` +
             `You can withdraw it ${HLP_LOCKUP_DAYS} days after this deposit. HLP can lose money.`,
           actionLabel: `Deposit ${usdText} USDC`,
+          fixedStyle: true,
+          hold: true,
+        },
+        async () => undefined,
+      );
+    } else {
+      const vault = action.vaultAddress;
+      await this.prompt(
+        "vault-withdraw",
+        {
+          title: "Withdraw from a vault",
+          body: `Move ${usdText} USDC from vault ${vault.slice(0, 6)}…${vault.slice(-4)} back into your Hyperliquid account. Confirm only if you asked for this.`,
+          actionLabel: `Withdraw ${usdText} USDC`,
           fixedStyle: true,
           hold: true,
         },
@@ -1917,11 +1960,11 @@ export class FrameCore {
       const now = this.correctedNow();
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
       // Read again under the lock: another tab or device may have deposited, or changed the limits, while the prompt was open.
-      const { decision, expiresAfter } = decide(now, await facts(now), (await this.readLimits()).policy);
+      const { decision, expiresAfter } = decide(now, await facts(now), await this.readLimits());
 
       let nonce: number;
       try {
-        nonce = await this.coordinator.reserve(agent, {
+        nonce = await this.coordinator.reserve(usageKey, {
           now,
           orders: 0,
           notionalUsd: 0,
@@ -1967,26 +2010,63 @@ export class FrameCore {
   }
 
   /**
-   * The frame's own prompt for orders above CONFIRM_ORDERS_ABOVE_USD (`promptChanged` kind `order`, fixed styling): one
-   * line per order as the frame will sign it, and the total; confirmed by pressing and holding. Cancel or timeout:
-   * USER_CANCELLED / USER_TIMEOUT, and nothing is signed. A frame without a UI can't ask, so it refuses them.
+   * The frame's own prompt for orders above CONFIRM_ORDERS_ABOVE_USD, or past CONFIRM_UNPROMPTED_ABOVE_USD with the
+   * orders signed without a prompt in the last 10 minutes (`recentUsd`, their notional) (`promptChanged` kind `order`,
+   * fixed styling): one line per order as the frame will sign it, and the total; confirmed by pressing and holding.
+   * Cancel or timeout: USER_CANCELLED / USER_TIMEOUT, and nothing is signed. A frame without a UI can't ask, so it
+   * refuses them.
    */
-  private async confirmOrders(orders: OrdersDescription, subAccount: string | undefined): Promise<void> {
-    const total = `$${Math.round(orders.totalUsd).toLocaleString("en-US")}`;
+  private async confirmOrders(orders: OrdersDescription, subAccount: string | undefined, recentUsd?: number): Promise<void> {
+    const dollars = (n: number) => `$${Math.round(n).toLocaleString("en-US")}`;
+    const total = dollars(orders.totalUsd);
+    const minutes = Math.round(UNPROMPTED_WINDOW_MS / 60_000);
     if (!this.ui) {
       this.metrics.policyDenials++;
-      const message = `Orders of more than $${CONFIRM_ORDERS_ABOVE_USD.toLocaleString("en-US")} (${total} here) need your confirmation in the signer frame, which has no user interface here.`;
+      const message =
+        recentUsd === undefined
+          ? `Orders of more than $${CONFIRM_ORDERS_ABOVE_USD.toLocaleString("en-US")} (${total} here) need your confirmation in the signer frame, which has no user interface here.`
+          : `Orders past $${CONFIRM_UNPROMPTED_ABOVE_USD.toLocaleString("en-US")} in ${minutes} minutes without a confirmation (${dollars(recentUsd)} so far, ${total} here) need your confirmation in the signer frame, which has no user interface here.`;
       throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: "ORDER_NOTIONAL_EXCEEDED", message }] } });
     }
     const one = orders.lines.length === 1;
     const sub = subAccount?.toLowerCase();
     const whose = sub === undefined ? "" : ` for sub-account ${sub.slice(0, 6)}…${sub.slice(-4)}`;
+    const why = recentUsd === undefined ? "" : ` Orders of about ${dollars(recentUsd)} went out without a confirmation in the last ${minutes} minutes, so ${one ? "this one needs" : "these need"} yours.`;
     await this.prompt(
       "order",
       {
         title: one ? "Confirm this order" : `Confirm these ${orders.lines.length} orders`,
-        body: `The Kokoah app asks to send ${one ? "this order" : "these orders"}${whose} to Hyperliquid, about ${total} in all. Confirm only if you placed ${one ? "it" : "them"}.\n\n${orders.lines.join("\n")}`,
+        body: `The Kokoah app asks to send ${one ? "this order" : "these orders"}${whose} to Hyperliquid, about ${total} in all.${why} Confirm only if you placed ${one ? "it" : "them"}.\n\n${orders.lines.join("\n")}`,
         actionLabel: one ? "Send order" : `Send ${orders.lines.length} orders`,
+        fixedStyle: true,
+        hold: true,
+      },
+      async () => undefined,
+    );
+  }
+
+  /**
+   * The frame's own prompt before margin is taken out of an isolated position (`promptChanged` kind `margin`, fixed
+   * styling, press and hold): it moves the position toward liquidation, which no notional cap covers. Cancel or
+   * timeout: USER_CANCELLED / USER_TIMEOUT, and nothing is signed. A frame without a UI can't ask, so it refuses it.
+   */
+  private async confirmMarginRemoval(margin: { coin: string; usd: number }, snapshot: MarketSnapshot, subAccount: string | undefined): Promise<void> {
+    const amount = `$${margin.usd.toLocaleString("en-US", { maximumFractionDigits: 6 })}`;
+    const market = snapshot.registry.get(margin.coin);
+    const name = printable(market?.displayName ?? market?.coin ?? margin.coin);
+    if (!this.ui) {
+      this.metrics.policyDenials++;
+      const message = "Taking margin out of an isolated position needs your confirmation in the signer frame, which has no user interface here.";
+      throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: "ACTION_TYPE_NOT_ALLOWED", message }] } });
+    }
+    const sub = subAccount?.toLowerCase();
+    const whose = sub === undefined ? "" : ` of sub-account ${sub.slice(0, 6)}…${sub.slice(-4)}`;
+    await this.prompt(
+      "margin",
+      {
+        title: "Take margin out of this position?",
+        body: `The Kokoah app asks to take ${amount} of margin out of the isolated ${name} position${whose}. This moves the position closer to liquidation. Confirm only if you asked for this.`,
+        actionLabel: `Remove ${amount}`,
         fixedStyle: true,
         hold: true,
       },

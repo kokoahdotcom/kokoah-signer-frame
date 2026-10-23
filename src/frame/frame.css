@@ -38,6 +38,7 @@
 
 html,
 body {
+  height: 100%;
   margin: 0;
   padding: 0;
   background: var(--ks-bg);
@@ -52,6 +53,7 @@ body {
 }
 
 .ks-root {
+  height: 100%;
   padding: var(--ks-padding);
 }
 
@@ -61,10 +63,20 @@ body {
   font-size: 0.85em;
 }
 
+/*
+ * The prompt always fits the frame (its order lines scroll inside it), so it can be wholly in view: where the browser
+ * reports it, the prompt arms only then, and a parent that clips part of it leaves it disarmed (prompt.ts).
+ */
 .ks-prompt {
+  display: flex;
+  flex-direction: column;
+  max-height: 100%;
   border: 1px solid var(--ks-border);
   border-radius: var(--ks-radius);
   padding: var(--ks-padding);
+}
+.ks-prompt > * {
+  flex-shrink: 0;
 }
 
 .ks-title {
@@ -74,10 +86,41 @@ body {
 }
 
 .ks-body {
+  flex-shrink: 1;
+  min-height: 3em;
+  overflow-y: auto;
   margin: 0 0 1em;
   color: var(--ks-muted);
   /* One change per line in the limits prompt. */
   white-space: pre-line;
+}
+
+/* The code a fixed-style prompt asks for where the browser can't tell whether the prompt is seen. */
+.ks-code {
+  margin: 0 0 1em;
+}
+.ks-code-label {
+  display: block;
+  margin-bottom: 0.4em;
+}
+.ks-code-value {
+  font-size: 1.3em;
+  letter-spacing: 0.15em;
+  font-variant-numeric: tabular-nums;
+}
+.ks-code-input {
+  width: 6em;
+  min-height: 44px;
+  padding: 0.4em 0.6em;
+  border: 1px solid var(--ks-border);
+  border-radius: var(--ks-radius);
+  font: inherit;
+  font-size: 1.2em;
+  letter-spacing: 0.15em;
+}
+.ks-code-input:focus-visible {
+  outline: 3px solid var(--ks-focus);
+  outline-offset: 2px;
 }
 
 .ks-actions {
@@ -220,6 +263,19 @@ body {
   background: #ffffff;
   border-color: #d9cfc6;
   color: #2b2420;
+}
+.ks-prompt--fixed .ks-code-label,
+.ks-prompt--fixed .ks-code-value {
+  color: #2b2420;
+}
+.ks-prompt--fixed .ks-code-input {
+  background: #ffffff;
+  border-color: #be3a57;
+  color: #2b2420;
+  border-radius: 12px;
+}
+.ks-prompt--fixed .ks-code-input:focus-visible {
+  outline-color: #2b2420;
 }
 /* Fixed focus ring too: on this one prompt the outline colour can't be themed away by the parent. */
 .ks-prompt--fixed .ks-button:focus-visible {

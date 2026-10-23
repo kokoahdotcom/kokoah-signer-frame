@@ -6,7 +6,7 @@
 import { recoverL1Signer } from "@kokoah/shared/signing";
 import { HLP_VAULT_ADDRESSES } from "@kokoah/shared/vaults";
 import { afterEach, describe, expect, it } from "vitest";
-import { FakeLocks, FrameHarness, T0, testConfig, USER } from "./helpers.js";
+import { FakeLocks, FrameHarness, T0, testConfig, USER, waitFor } from "./helpers.js";
 
 let h: FrameHarness;
 afterEach(() => h?.destroy());
@@ -174,14 +174,31 @@ describe("HLP deposit", () => {
 });
 
 describe("vault withdrawal", () => {
-  it("withdraws from a vault the account holds, up to its equity, without a prompt", async () => {
+  it("withdraws from a vault the account holds, up to its equity, after the user's press and hold in the frame", async () => {
     h = await FrameHarness.create();
     await h.activeAgent();
     h.hl.vaultEquities = [{ vaultAddress: OTHER, equity: "120.5" }];
-    const r = await h.ok("signAndSubmit", { requestId: "w1", intent: withdraw("120.5") });
-    expect(r.status).toBe("ok");
+    const pending = h.ok("signAndSubmit", { requestId: "w1", intent: withdraw("120.5") });
+    const text = await promptText();
+    expect(text).toContain("Move 120.5 USDC from vault 0x2222…2222 back into your Hyperliquid account");
+    expect(h.root?.querySelector(".ks-prompt")?.classList.contains("ks-prompt--fixed")).toBe(true);
+    expect(h.root?.querySelector(".ks-primary")?.classList.contains("ks-hold")).toBe(true);
+    expect(h.events("promptChanged").at(-1)).toEqual({ visible: true, kind: "vault-withdraw" });
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    await h.clickPrompt();
+    expect((await pending).status).toBe("ok");
     expect(h.hl.exchangeCalls[0]!.body.action).toEqual({ type: "vaultTransfer", vaultAddress: OTHER, isDeposit: false, usd: 120_500_000 });
-    expect(h.events("promptChanged")).toHaveLength(0);
+  });
+
+  it("signs nothing when the user cancels the withdrawal", async () => {
+    h = await FrameHarness.create();
+    await h.activeAgent();
+    h.hl.vaultEquities = [{ vaultAddress: OTHER, equity: "120.5" }];
+    const pending = h.fail("signAndSubmit", { requestId: "w1", intent: withdraw("100") });
+    await promptText();
+    await h.clickPrompt("cancel");
+    expect(await pending).toMatchObject({ code: "USER_CANCELLED", details: { prompt: "vault-withdraw" } });
+    expect(h.hl.exchangeCalls).toHaveLength(0);
   });
 
   it("refuses a vault the account doesn't hold, or more than its equity", async () => {
@@ -193,5 +210,43 @@ describe("vault withdrawal", () => {
     h.hl.vaultEquities = { not: "a list" };
     expect((await h.fail("signAndSubmit", { requestId: "w3", intent: withdraw("1") })).code).toBe("MARKET_DATA_UNAVAILABLE");
     expect(h.hl.exchangeCalls).toHaveLength(0);
+  });
+});
+
+describe("turning vault transfers off (allowedActionTypes)", () => {
+  it("refuses deposits and withdrawals, before asking, when the user's limits leave vaultTransfer out", async () => {
+    h = await FrameHarness.create();
+    await h.activeAgent();
+    h.hl.vaultEquities = [{ vaultAddress: OTHER, equity: "100" }];
+    const r = await h.ok("setLimits", { allowedActionTypes: ["order", "cancel", "cancelByCloid"] });
+    expect(r.policy.allowedActionTypes).toEqual(["order", "cancel", "cancelByCloid"]);
+    for (const [id, intent] of [["d", deposit("10")], ["w", withdraw("10")]] as const) {
+      const e = await h.fail("signAndSubmit", { requestId: id, intent });
+      expect(codes(e)).toEqual(["ACTION_TYPE_NOT_ALLOWED"]);
+    }
+    expect(h.events("promptChanged")).toHaveLength(0);
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+  });
+
+  it("keeps them on with every baseline type (or no list), and turning them back on is a loosening", async () => {
+    h = await FrameHarness.create();
+    await h.activeAgent();
+    expect((await h.ok("getStatus")).policy.allowedActionTypes).toContain("vaultTransfer");
+    await h.ok("setLimits", { allowedActionTypes: ["order", "vaultTransfer"] });
+    expect((await h.ok("getStatus")).policy.allowedActionTypes).toEqual(["order", "vaultTransfer"]);
+    // Off: a tightening, applied at once.
+    await h.ok("setLimits", { allowedActionTypes: ["order"] });
+    // Back on, or the list removed: only with the user's confirmation, which names the change.
+    const pending = h.request("setLimits", { allowedActionTypes: ["order", "vaultTransfer"] });
+    await waitFor(() => h.promptText().includes("Allowed actions: order → order, vaultTransfer"));
+    await h.clickPrompt("cancel");
+    expect((await pending).ok).toBe(false);
+    expect((await h.ok("getStatus")).policy.allowedActionTypes).toEqual(["order"]);
+    const removed = h.request("setLimits", {});
+    await waitFor(() => h.promptText().includes("Allowed actions: order → all"));
+    await h.clickPrompt("cancel");
+    expect((await removed).ok).toBe(false);
+    // A list with nothing but vault transfers isn't a trading policy.
+    expect((await h.fail("setLimits", { allowedActionTypes: ["vaultTransfer"] })).code).toBe("LIMIT_LOOSENING_REJECTED");
   });
 });

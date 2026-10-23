@@ -6,8 +6,10 @@
  * - `keys` (key `slot`): the encrypted agent key record (`device` and `passkey` modes; slot `current`). Never
  *   plaintext. Also the user's limits for each network (slot `limits/<network>`, see {@link StoredLimitsRecord}): kept
  *   in this store so the schema version stays 1 and an older frame build still opens the database.
- * - `usage` (key `agent`): last nonce, recent order times, today's notional and recent HLP deposits, per agent address.
- *   Updated in a single `readwrite` transaction per signature, which IndexedDB serializes across tabs of the origin.
+ * - `usage` (key `agent`): last nonce, recent order times, today's notional, recent HLP deposits and recent orders
+ *   signed without a prompt, per master account (`account/<network>/<master>`, so a new key for the account keeps
+ *   them; records from before are per agent address). Updated in a single `readwrite` transaction per signature,
+ *   which IndexedDB serializes across tabs of the origin.
  * - `agents` (key `address`): every agent address this origin ever generated, so an address is never reused.
  *
  * @module
@@ -86,10 +88,11 @@ export function regionSlot(network: NetworkName): StoredRegionRecord["slot"] {
   return `region/${network}`;
 }
 
-/** Per-agent usage and nonce state. */
+/** Usage and nonce state of a master account (or, in records from before, of one agent). */
 export interface UsageRecord {
+  /** The record's key: `account/<network>/<master>`, or an agent address in records from before. */
   agent: string;
-  /** Highest nonce issued for this agent on this origin. */
+  /** Highest nonce issued for this record's keys on this origin. */
   lastNonce: number;
   /** Times (ms, corrected clock) of orders signed in roughly the last minute, one entry per order. */
   orderTimes: number[];
@@ -114,6 +117,12 @@ export interface UsageRecord {
    * toward the 24-hour cap on top of Hyperliquid's ledger, which can lag a deposit. Missing when there are none.
    */
   hlpDeposits?: Array<{ master: string; at: number; usd: number }>;
+  /**
+   * Orders signed without the user's confirmation in the frame's prompt in the last `UNPROMPTED_WINDOW_MS` (nonces.ts),
+   * as their notional in all (`describeOrders`), by time: past `CONFIRM_UNPROMPTED_ABOVE_USD` the next ones need the
+   * prompt. A confirmed prompt clears it. Missing when there are none.
+   */
+  unprompted?: Array<{ at: number; usd: number }>;
 }
 
 /** Storage used by the frame. */

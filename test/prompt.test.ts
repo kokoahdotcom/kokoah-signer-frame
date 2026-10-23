@@ -336,15 +336,20 @@ describe("prompt arming", () => {
   });
 
   describe("with IntersectionObserver v2", () => {
-    let callback: ((entries: Array<{ isVisible: boolean }>) => void) | undefined;
+    type Entry = { isVisible: boolean; isIntersecting?: boolean; intersectionRatio?: number };
+    let callback: ((entries: Entry[]) => void) | undefined;
+    let options: { threshold?: number[] } | undefined;
+    const seen = { isVisible: true, isIntersecting: true, intersectionRatio: 1 };
+    const hidden = { isVisible: false, isIntersecting: true, intersectionRatio: 1 };
     const original = { io: window.IntersectionObserver, entry: (window as { IntersectionObserverEntry?: unknown }).IntersectionObserverEntry };
     beforeEach(() => {
       class FakeEntry {}
       Object.defineProperty(FakeEntry.prototype, "isVisible", { value: false });
       class FakeObserver {
-        constructor(cb: (entries: Array<{ isVisible: boolean }>) => void, init: { trackVisibility?: boolean }) {
+        constructor(cb: (entries: Entry[]) => void, init: { trackVisibility?: boolean; threshold?: number[] }) {
           expect(init.trackVisibility).toBe(true);
           callback = cb;
+          options = init;
         }
         observe() {}
         disconnect() {
@@ -361,21 +366,21 @@ describe("prompt arming", () => {
       const result = ui.run(REQ, action, () => ({ retry: false }));
       vi.advanceTimersByTime(5_000);
       expect(primary.disabled).toBe(true);
-      callback!([{ isVisible: true }]);
+      callback!([seen]);
       vi.advanceTimersByTime(500);
-      callback!([{ isVisible: false }]);
+      callback!([hidden]);
       vi.advanceTimersByTime(5_000);
       expect(primary.disabled).toBe(true);
-      callback!([{ isVisible: true }]);
+      callback!([seen]);
       vi.advanceTimersByTime(800);
       expect(primary.disabled).toBe(false);
       move(primary, 10);
       move(primary, 11);
-      callback!([{ isVisible: false }]);
+      callback!([hidden]);
       expect(primary.disabled).toBe(true);
       primary.click();
       expect(action).not.toHaveBeenCalled();
-      callback!([{ isVisible: true }]);
+      callback!([seen]);
       vi.advanceTimersByTime(800);
       // Covered meanwhile: the pointer must move again.
       primary.click();
@@ -386,5 +391,125 @@ describe("prompt arming", () => {
       await expect(result).resolves.toBe("ok");
       expect(callback).toBeUndefined();
     });
+
+    it("stays disarmed while any part of the prompt is clipped, even when what shows is unobscured", () => {
+      const { ui, primary } = setup();
+      const action = vi.fn(async () => "ok");
+      void ui.run(HOLD, action, () => ({ retry: false })).catch(() => {});
+      expect(options?.threshold).toContain(1);
+      // The parent hides the order lines (overflow: hidden, a smaller box): visible, intersecting, but not all of it.
+      callback!([{ isVisible: true, isIntersecting: true, intersectionRatio: 0.6 }]);
+      vi.advanceTimersByTime(5_000);
+      expect(primary.disabled).toBe(true);
+      callback!([{ isVisible: true, isIntersecting: false, intersectionRatio: 0 }]);
+      vi.advanceTimersByTime(5_000);
+      expect(primary.disabled).toBe(true);
+      // Whole again (give or take rounding): armed after the delay.
+      callback!([{ isVisible: true, isIntersecting: true, intersectionRatio: 0.999 }]);
+      vi.advanceTimersByTime(800);
+      expect(primary.disabled).toBe(false);
+      callback!([{ isVisible: true, isIntersecting: true, intersectionRatio: 0.9 }]);
+      expect(primary.disabled).toBe(true);
+    });
+
+    it("asks for no code: the browser tells whether the prompt is seen", () => {
+      const { ui, root } = setup();
+      void ui.run({ ...HOLD, fixedStyle: true }, async () => "ok", () => ({ retry: false })).catch(() => {});
+      expect(root.querySelector<HTMLElement>(".ks-code")!.hidden).toBe(true);
+    });
+  });
+
+  describe("a code to type where the browser can't tell whether the prompt is seen", () => {
+    const FIXED: PromptRequest = { ...HOLD, fixedStyle: true };
+    const codeOf = (root: HTMLElement) => root.querySelector(".ks-code-value")!.textContent!;
+    const type = (root: HTMLElement, text: string) => {
+      const input = root.querySelector<HTMLInputElement>(".ks-code-input")!;
+      input.value = text;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    const digits = (...codes: string[]) => {
+      const queue = [...codes];
+      return () => queue.shift() ?? "999";
+    };
+
+    it("shows a random code on fixed-style prompts and keeps the button off until it is typed", async () => {
+      const root = document.createElement("div");
+      document.body.append(root);
+      const ui = new PromptUi(document, root, () => {}, { armMs: 800, holdMs: 800, isTrusted: () => true, randomDigits: digits("482") });
+      const primary = root.querySelector<HTMLButtonElement>(".ks-primary")!;
+      const action = vi.fn(async () => "ok");
+      const result = ui.run(FIXED, action, () => ({ retry: false }));
+      expect(root.querySelector<HTMLElement>(".ks-code")!.hidden).toBe(false);
+      expect(codeOf(root)).toBe("482");
+      expect(document.activeElement).toBe(root.querySelector(".ks-code-input"));
+      expect(root.querySelector(".ks-status")!.textContent).toBe("Type the code shown above first.");
+      vi.advanceTimersByTime(5_000);
+      // A decoy's "hold to confirm": armed in time, but without the code nothing works.
+      expect(primary.disabled).toBe(true);
+      pointerOnto(primary);
+      vi.advanceTimersByTime(2_000);
+      expect(action).not.toHaveBeenCalled();
+      type(root, "48");
+      expect(primary.disabled).toBe(true);
+      type(root, "482");
+      expect(primary.disabled).toBe(false);
+      pointerOnto(primary);
+      vi.advanceTimersByTime(800);
+      await expect(result).resolves.toBe("ok");
+      expect(root.querySelector<HTMLElement>(".ks-code")!.hidden).toBe(true);
+    });
+
+    it("shows a new code after a wrong one, and gives up after three", async () => {
+      const root = document.createElement("div");
+      document.body.append(root);
+      const ui = new PromptUi(document, root, () => {}, { armMs: 0, holdMs: 0, isTrusted: () => true, randomDigits: digits("111", "222", "333") });
+      const result = ui.run(FIXED, async () => "ok", () => ({ retry: false }));
+      type(root, "123");
+      expect(codeOf(root)).toBe("222");
+      expect(root.querySelector(".ks-status")!.textContent).toContain("not the code shown");
+      // The old code no longer works.
+      type(root, "111");
+      expect(codeOf(root)).toBe("333");
+      type(root, "000");
+      await expect(result).rejects.toMatchObject({ code: "USER_CANCELLED", kind: "limits" });
+    });
+
+    it("ignores what a script types, and asks nothing on prompts that aren't fixed-style", () => {
+      const root = document.createElement("div");
+      document.body.append(root);
+      const ui = new PromptUi(document, root, () => {}, { armMs: 0, holdMs: 0, isTrusted: () => false, randomDigits: digits("482") });
+      const primary = root.querySelector<HTMLButtonElement>(".ks-primary")!;
+      void ui.run(FIXED, async () => "ok", () => ({ retry: false })).catch(() => {});
+      vi.advanceTimersByTime(0);
+      type(root, "482");
+      expect(primary.disabled).toBe(true);
+      document.body.replaceChildren();
+      const plain = setup({ armMs: 0 });
+      void plain.ui.run(REQ, async () => "ok", () => ({ retry: false })).catch(() => {});
+      expect(plain.root.querySelector<HTMLElement>(".ks-code")!.hidden).toBe(true);
+    });
+
+    it("draws its digits from crypto.getRandomValues by default", () => {
+      const { ui, root } = setup();
+      void ui.run(FIXED, async () => "ok", () => ({ retry: false })).catch(() => {});
+      expect(codeOf(root)).toMatch(/^\d{3}$/);
+    });
+  });
+
+  it("scrolls back and starts over when the parent moves the frame to a fragment", async () => {
+    const { ui, primary } = setup();
+    const action = vi.fn(async () => "ok");
+    const result = ui.run(REQ, action, () => ({ retry: false }));
+    vi.advanceTimersByTime(800);
+    expect(primary.disabled).toBe(false);
+    document.documentElement.scrollTop = 120;
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    expect(document.documentElement.scrollTop).toBe(0);
+    expect(primary.disabled).toBe(true);
+    vi.advanceTimersByTime(800);
+    move(primary, 10);
+    move(primary, 11);
+    primary.click();
+    await expect(result).resolves.toBe("ok");
   });
 });

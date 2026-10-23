@@ -2,7 +2,7 @@ import { IDBFactory } from "fake-indexeddb";
 import { afterEach, describe, expect, it } from "vitest";
 import { HLP_DEPOSIT_RECENT_MS, nextUsage, SignerBusyError, SigningCoordinator, UsageLimitError, usageOf } from "../src/frame/nonces.js";
 import { IdbSignerStore, MemorySignerStore } from "../src/frame/storage.js";
-import { Clock, FakeLocks, FrameHarness, limitOrder, MockHl, T0 } from "./helpers.js";
+import { Clock, FakeLocks, FrameHarness, limitOrder, MockHl, T0, USER } from "./helpers.js";
 
 const harnesses: FrameHarness[] = [];
 async function frame(o: Parameters<typeof FrameHarness.create>[0] = {}): Promise<FrameHarness> {
@@ -92,7 +92,7 @@ describe("nonces across two tabs sharing IndexedDB", () => {
     expect(Math.min(...nonces)).toBe(T0);
     expect(Math.max(...nonces)).toBe(T0 + 49);
     const usage = usageOf(await s1.readUsage("0xabc"), T0);
-    expect(usage).toEqual({ ordersInLastMinute: 50, actionsInLastMinute: 50, dailyNotionalUsedUsd: 500, accountDailyNotionalUsd: 500 });
+    expect(usage).toEqual({ ordersInLastMinute: 50, actionsInLastMinute: 50, dailyNotionalUsedUsd: 500, accountDailyNotionalUsd: 500, unpromptedUsd: 0 });
   });
 
   it("checks the limits again inside the reservation, so tabs without a shared lock can't both pass", async () => {
@@ -173,5 +173,46 @@ describe("SigningCoordinator", () => {
     expect(nextDay.dayNotionalUsd).toBe(10);
     const corrupt = nextUsage("0xa", { ...first, lastNonce: T0 + 3 * 86_400_000 }, T0, 0, 0);
     expect(corrupt.lastNonce).toBe(T0);
+  });
+});
+
+describe("usage kept per account, not per key", () => {
+  const codes = (e: { details?: { violations?: Array<{ code: string }> } }) => (e.details?.violations ?? []).map((v) => v.code);
+  /** createAgent with replaceExisting, approved and confirmed: what a parent can have the frame do. */
+  async function replaceKey(h: FrameHarness): Promise<`0x${string}`> {
+    const created = await h.createAgent({ userAddress: USER, validForDays: 30, storageMode: "device", replaceExisting: true });
+    h.hl.approve(USER, created.agentAddress, created.agentName, created.validUntil);
+    await h.ok("confirmAgent", {});
+    return created.agentAddress;
+  }
+
+  it("keeps the daily notional, the order rate and the nonces when the parent replaces the key", async () => {
+    const h = await frame();
+    const first = await h.activeAgent("device");
+    await h.ok("setLimits", { maxDailyNotionalUsd: 1_000, maxOrdersPerMinute: 4 });
+    for (const id of ["a", "b", "c"]) expect((await h.ok("signAndSubmit", { requestId: id, intent: limitOrder() })).status).toBe("ok"); // $200 each
+    const second = await replaceKey(h);
+    expect(second).not.toBe(first.address);
+    expect((await h.ok("signAndSubmit", { requestId: "d", intent: limitOrder() })).status).toBe("ok");
+    // A fifth order in the minute, and $1,000 for the day: both counted across the two keys.
+    const e = await h.fail("signAndSubmit", { requestId: "e", intent: limitOrder() });
+    expect(codes(e)).toEqual(expect.arrayContaining(["ORDER_RATE_EXCEEDED"]));
+    h.clock.advance(61_000);
+    expect(codes(await h.fail("signAndSubmit", { requestId: "f", intent: limitOrder({ size: "0.2" }) }))).toEqual(["DAILY_NOTIONAL_EXCEEDED"]);
+    const nonces = h.hl.exchangeCalls.map((c) => c.body.nonce);
+    expect(nonces.every((n, i) => i === 0 || n > nonces[i - 1]!)).toBe(true);
+  });
+
+  it("takes over the key's own record from before (nonce, counters), until the account's exists", async () => {
+    const h = await frame();
+    const { address } = await h.activeAgent("device");
+    await h.ok("setLimits", { maxDailyNotionalUsd: 1_000 });
+    // What an older frame build left: the agent's own record, $900 signed today and a nonce ahead of the clock.
+    const store = await IdbSignerStore.open(h.idb);
+    await store.updateUsage(address, () => ({ agent: address, lastNonce: T0 + 5_000, orderTimes: [], day: new Date(T0).toISOString().slice(0, 10), dayNotionalUsd: 900 }));
+    expect(codes(await h.fail("signAndSubmit", { requestId: "a", intent: limitOrder() }))).toEqual(["DAILY_NOTIONAL_EXCEEDED"]);
+    expect((await h.ok("signAndSubmit", { requestId: "b", intent: limitOrder({ size: "0.05" }) })).nonce).toBe(T0 + 5_001);
+    const account = await store.readUsage(`account/testnet/${USER.toLowerCase()}`);
+    expect(account).toMatchObject({ lastNonce: T0 + 5_001, dayNotionalUsd: 1_000 });
   });
 });
