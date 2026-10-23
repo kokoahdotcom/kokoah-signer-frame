@@ -267,7 +267,7 @@ Creates a **fresh** key (never reused; the frame refuses an address it has gener
 | `storageMode` | `passkey` \| `device` \| `session` ([§8](#8-key-storage-and-passkeys)). `device` is the recommended default: it survives reloads with no prompt. Offer `passkey` as an opt-in upgrade (`setStorageMode`) |
 | `agentName` | Optional, 1–16 of `A–Z a–z 0–9 . _ -`, not containing `valid_until`. Default `kokoah-web`. Hyperliquid allows 3 named agents per account, and approving a name again replaces that agent: give each device its own name (e.g. `kokoah-a1b2`) so enabling a second device doesn't cut off the first |
 | `signatureChainId` | Optional hex chain id of the main wallet's current chain. Default: the network's default (`0x66eee` testnet, `0xa4b1` mainnet). Browser wallets usually want their connected chain |
-| `replaceExisting` | Required (`true`) when a non-expired key exists. The old key is **wiped** when the new one is created; trading resumes after the new one is confirmed |
+| `replaceExisting` | Required (`true`) when a non-expired key exists. The old key is **wiped** when the new one is created; trading resumes after the new one is confirmed. Replacing a key protected with a passkey by one in another storage mode first needs the user's confirmation in the frame (`promptChanged` kind `key-remove`, 2026-10-23); cancel or timeout: `USER_CANCELLED` / `USER_TIMEOUT`, and the old key stays |
 
 ←
 ```json
@@ -726,7 +726,7 @@ last for this frame load only.
 }
 ```
 
-- The local key (memory and storage) is wiped **immediately**, in every tab of this browser, if its name matches `agentName`.
+- The local key (memory and storage) is wiped **immediately**, in every tab of this browser, if its name matches `agentName`. A key protected with a passkey is wiped only after the user confirms it in the frame's own prompt (`promptChanged` kind `key-remove`, fixed styling, press and hold; no passkey needed, so a lost passkey can still be removed; 2026-10-23); cancel or timeout: `USER_CANCELLED` / `USER_TIMEOUT` with `details.prompt: "key-remove"`, and the key stays.
 - If its stored copy can't be deleted (IndexedDB failure), the result has `wiped: false`, the key's `agentAddress` and a `wipeError`. The key is out of memory in this tab, but a reload would bring it back. Post `revokeAgent` anyway (Hyperliquid then rejects the key) and call `revoke` again: a later `revoke` deletes a stored copy with that name even when it is no longer in memory.
 - `revokeAgent` is shared `buildRevokeAgent`: the main wallet signs it and the parent posts it with `buildExchangeRequest`. Until it is posted, the agent is still registered on HL, but nobody has its key any more.
 - Revoking another name (for example another device's `kokoah-pwa`) returns its typed data and leaves this device's key alone (`wiped: false`).

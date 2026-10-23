@@ -249,7 +249,11 @@ export class KokoahSignerClient {
     return this.request("getStatus", {});
   }
 
-  /** Creates a fresh named agent key; the main wallet then signs `result.approveAgent.typedData` and the app posts it. */
+  /**
+   * Creates a fresh named agent key; the main wallet then signs `result.approveAgent.typedData` and the app posts it.
+   * Replacing a passkey-protected key with one in another storage mode first waits for the user's confirmation in the
+   * frame's prompt (`promptChanged` kind `key-remove`).
+   */
   createAgent(params: CreateAgentParams): Promise<CreateAgentResult> {
     return this.request("createAgent", params, params.storageMode === "passkey" ? this.options.interactiveTimeoutMs : undefined);
   }
@@ -297,7 +301,11 @@ export class KokoahSignerClient {
     return this.request("setLimits", params, this.options.interactiveTimeoutMs);
   }
 
-  /** Wipes this device's key and returns `revokeAgent` typed data for the main wallet to sign and the app to post. */
+  /**
+   * Wipes this device's key and returns `revokeAgent` typed data for the main wallet to sign and the app to post. A key
+   * protected with a passkey is wiped only after the user confirms it in the frame's prompt (`promptChanged` kind
+   * `key-remove`): keep the iframe visible while `promptChanged.visible`.
+   */
   revoke(params: RevokeParams = {}): Promise<RevokeResult> {
     return this.request("revoke", params);
   }

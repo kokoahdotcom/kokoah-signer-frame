@@ -17,8 +17,9 @@ import { THEME_VARIABLES, type SetThemeParams, type ThemeVariable } from "../pro
  * a vault withdrawal. `limits`: the user confirms a `setLimits` that loosens their stored limits. `order`: the user
  * confirms orders above `CONFIRM_ORDERS_ABOVE_USD`, or past `CONFIRM_UNPROMPTED_ABOVE_USD` signed without a prompt
  * lately (policy.ts), before they are signed. `margin`: the user confirms taking margin out of an isolated position.
+ * `key-remove`: the user confirms deleting a passkey-protected key, or replacing it with one that unlocks without it.
  */
-export type PromptKind = "passkey-create" | "passkey-unlock" | "vault-deposit" | "vault-withdraw" | "limits" | "order" | "margin";
+export type PromptKind = "passkey-create" | "passkey-unlock" | "vault-deposit" | "vault-withdraw" | "limits" | "order" | "margin" | "key-remove";
 
 export interface PromptRequest {
   kind: PromptKind;

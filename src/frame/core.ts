@@ -822,6 +822,9 @@ export class FrameCore {
       } catch {
         previousRecord = undefined;
       }
+      // A new key that unlocks without the passkey must not silently take the place of one protected by it.
+      const protectedKey = existing?.meta.storageMode === "passkey" || (previousRecord?.network === this.config.network.name && previousRecord.storageMode === "passkey");
+      if (protectedKey && mode !== "passkey") await this.confirmKeyRemoval("replace");
 
       // Fresh key, never reused.
       const generate = this.deps.generatePrivateKey ?? viemGeneratePrivateKey;
@@ -1264,6 +1267,8 @@ export class FrameCore {
         stored = undefined;
       }
       const agentAddress: Hex | null = inMemory?.meta.agentAddress ?? stored?.agentAddress ?? null;
+      // A key protected with a passkey is deleted only after the user confirms it in the frame.
+      if (inMemory?.meta.storageMode === "passkey" || stored?.storageMode === "passkey") await this.confirmKeyRemoval("revoke");
       let wiped = false;
       let wipeError: string | undefined;
       if (inMemory || stored) {
@@ -2094,6 +2099,34 @@ export class FrameCore {
         fixedStyle: true,
         hold: true,
       },
+      async () => undefined,
+    );
+  }
+
+  /**
+   * The frame's own prompt before a key protected with a passkey is deleted (`revoke`) or replaced by one that unlocks
+   * without it (`createAgent` / `createLinkedAgent` with `replaceExisting` and another storage mode): `promptChanged`
+   * kind `key-remove`, fixed styling, press and hold. Cancel or timeout: USER_CANCELLED / USER_TIMEOUT, and the key
+   * stays.
+   */
+  private async confirmKeyRemoval(why: "revoke" | "replace"): Promise<void> {
+    await this.prompt(
+      "key-remove",
+      why === "revoke"
+        ? {
+            title: "Remove the trading key from this device?",
+            body: "The Kokoah app asks to delete this device's trading key, which is protected with your passkey. To trade here again you will approve a new key in your wallet. Confirm only if you asked for this.",
+            actionLabel: "Remove key",
+            fixedStyle: true,
+            hold: true,
+          }
+        : {
+            title: "Replace your passkey-protected trading key?",
+            body: "The Kokoah app asks to replace this device's trading key, which is protected with your passkey, with a new one that unlocks without your passkey. Confirm only if you asked for this.",
+            actionLabel: "Replace key",
+            fixedStyle: true,
+            hold: true,
+          },
       async () => undefined,
     );
   }

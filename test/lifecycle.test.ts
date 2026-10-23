@@ -14,6 +14,64 @@ afterEach(() => {
   for (const h of harnesses.splice(0)) h.destroy();
 });
 
+describe("removing a passkey-protected key", () => {
+  const removePrompts = (h: FrameHarness) => h.events("promptChanged").filter((e) => e.visible && e.kind === "key-remove");
+
+  it("asks in the frame before revoke deletes it, and keeps it when the user cancels", async () => {
+    const h = await frame();
+    const { address } = await h.activeAgent("passkey");
+    const cancelled = h.fail("revoke", {});
+    await waitFor(() => h.promptText() !== "");
+    expect(removePrompts(h)).toHaveLength(1);
+    expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Remove the trading key from this device?");
+    expect(h.promptText()).toContain("protected with your passkey");
+    expect(h.root?.querySelector(".ks-prompt")?.classList.contains("ks-prompt--fixed")).toBe(true);
+    expect(h.root?.querySelector(".ks-primary")?.classList.contains("ks-hold")).toBe(true);
+    await h.clickPrompt("cancel");
+    expect(await cancelled).toMatchObject({ code: "USER_CANCELLED", details: { prompt: "key-remove" } });
+    expect(await h.ok("getStatus")).toMatchObject({ hasKey: true, agentAddress: address });
+    expect(await (await IdbSignerStore.open(h.idb)).getKeyRecord()).toMatchObject({ agentAddress: address, storageMode: "passkey" });
+    const removed = h.ok("revoke", {});
+    await h.clickPrompt();
+    expect(await removed).toMatchObject({ wiped: true, agentAddress: address, status: { hasKey: false } });
+    expect(await (await IdbSignerStore.open(h.idb)).getKeyRecord()).toBeUndefined();
+  });
+
+  it("asks before a key without the passkey replaces it, but not for a renewal with the passkey", async () => {
+    const h = await frame();
+    const { address } = await h.activeAgent("passkey");
+    const replace = (storageMode: "device" | "session" | "passkey") => h.request("createAgent", { userAddress: USER, validForDays: 30, storageMode, replaceExisting: true });
+    const device = replace("device");
+    await waitFor(() => h.promptText() !== "");
+    expect(removePrompts(h)).toHaveLength(1);
+    expect(h.promptText()).toContain("unlocks without your passkey");
+    await h.clickPrompt("cancel");
+    expect((await device).ok).toBe(false);
+    expect(await h.ok("getStatus")).toMatchObject({ agentAddress: address, storageMode: "passkey" });
+    for (const mode of ["session", "device"] as const) {
+      const r = replace(mode);
+      await waitFor(() => removePrompts(h).length > (mode === "session" ? 1 : 2));
+      await h.clickPrompt(mode === "session" ? "cancel" : "primary");
+      const out = await r;
+      expect(out.ok).toBe(mode === "device");
+    }
+    expect(await h.ok("getStatus")).toMatchObject({ storageMode: "device", keyState: "pending" });
+    // A device key is replaced (or revoked) without asking.
+    expect((await h.ok("createAgent", { userAddress: USER, validForDays: 30, storageMode: "device", replaceExisting: true })).storageMode).toBe("device");
+    expect((await h.ok("revoke", {})).wiped).toBe(true);
+    expect(removePrompts(h)).toHaveLength(3);
+  });
+
+  it("renews a passkey key with the passkey without asking to remove it", async () => {
+    const h = await frame();
+    await h.activeAgent("passkey");
+    const renewal = h.createAgent({ userAddress: USER, validForDays: 30, storageMode: "passkey", replaceExisting: true });
+    await h.clickPrompt();
+    expect((await renewal).storageMode).toBe("passkey");
+    expect(removePrompts(h)).toHaveLength(0);
+  });
+});
+
 describe("revoke", () => {
   it("wipes the local key immediately and returns buildRevokeAgent typed data for the main wallet", async () => {
     const h = await frame();
