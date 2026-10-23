@@ -118,9 +118,10 @@ export interface UsageRecord {
    */
   hlpDeposits?: Array<{ master: string; at: number; usd: number }>;
   /**
-   * Orders signed without the user's confirmation in the frame's prompt in the last `UNPROMPTED_WINDOW_MS` (nonces.ts),
-   * as their notional in all (`describeOrders`), by time: past `CONFIRM_UNPROMPTED_ABOVE_USD` the next ones need the
-   * prompt. A confirmed prompt clears it. Missing when there are none.
+   * Orders signed without the user's confirmation in the frame's prompt in the last `UNPROMPTED_DAY_MS` (nonces.ts), as
+   * their notional in all (`describeOrders`), summed per minute (`at`: that minute's latest order): past
+   * `CONFIRM_UNPROMPTED_ABOVE_USD` in 10 minutes or `CONFIRM_UNPROMPTED_DAY_ABOVE_USD` in 24 hours the next ones need
+   * the prompt. A confirmed prompt that showed them clears it. Missing when there are none.
    */
   unprompted?: Array<{ at: number; usd: number }>;
 }

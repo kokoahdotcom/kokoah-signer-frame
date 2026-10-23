@@ -187,7 +187,7 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
   },
   "builder": { "address": "0x…builder", "feeTenthsBps": 25 },
   "status": { "hasKey": true, "keyState": "active", "expiringSoon": true, "expired": false, "…": "SignerStatus, see getStatus" },
-  "limits": { "maxMessageBytes": 65536, "minValidForDays": 1, "maxValidForDays": 30, "expiresAfterMs": 15000, "maxAgentNameLength": 16, "confirmOrdersAboveUsd": 25000, "confirmRecentOrdersAboveUsd": 100000, "recentOrdersWindowMs": 600000 }
+  "limits": { "maxMessageBytes": 65536, "minValidForDays": 1, "maxValidForDays": 30, "expiresAfterMs": 15000, "maxAgentNameLength": 16, "confirmOrdersAboveUsd": 25000, "confirmRecentOrdersAboveUsd": 100000, "recentOrdersWindowMs": 600000, "confirmDailyOrdersAboveUsd": 250000 }
 }
 ```
 
@@ -204,7 +204,8 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
   ($25,000) in all (see `signAndSubmit`). Only then tell the user to confirm such an order in the signer window. Absent
   in older frames, which sign them without asking.
 - `confirmsRecentOrders` is true when the frame also asks before orders that would take what it signed without a
-  prompt in the last `limits.recentOrdersWindowMs` (10 minutes) above `limits.confirmRecentOrdersAboveUsd` ($100,000)
+  prompt in the last `limits.recentOrdersWindowMs` (10 minutes) above `limits.confirmRecentOrdersAboveUsd` ($100,000),
+  or in the last 24 hours above `limits.confirmDailyOrdersAboveUsd` ($250,000; absent in frames before 2026-10-23)
   (see `signAndSubmit`). Absent in older frames.
 - `status` is the frame's `SignerStatus` at the handshake (see `getStatus`), including the key's expiry state.
 - Errors: `UNSUPPORTED_VERSION`.
@@ -606,12 +607,14 @@ prompt lists each order as it will be signed, for example `Buy 0.3 BTC at $100,0
   full timeout again once the prompt closes). While the call waits, tell the user to confirm in the Kokoah signer
   window, and keep the iframe on top: a modal `<dialog>` of the app must step aside, or the user can't reach the button.
 
-**Many orders without a prompt** (`hello.capabilities.confirmsRecentOrders`, 2026-10-23). The frame keeps a rolling
-total of the orders it signed without a prompt in the last `hello.limits.recentOrdersWindowMs` (10 minutes), counted
-as above, across every account of the key's master, in every tab and across reloads and new keys. Orders that would
-take it above `hello.limits.confirmRecentOrdersAboveUsd` ($100,000) wait for the same `order` prompt, which then also
-says how much went out without a confirmation lately; a confirmed prompt starts the total again. So a hijacked page
-can't trade large amounts as many orders just under $25,000. A frame without a UI refuses them (`POLICY_DENIED`,
+**Many orders without a prompt** (`hello.capabilities.confirmsRecentOrders`, 2026-10-23). The frame keeps rolling
+totals of the orders it signed without a prompt in the last `hello.limits.recentOrdersWindowMs` (10 minutes) and the
+last 24 hours, counted as above, across every account of the key's master, in every tab and across reloads and new
+keys. Orders that would take the first above `hello.limits.confirmRecentOrdersAboveUsd` ($100,000), or the second above
+`hello.limits.confirmDailyOrdersAboveUsd` ($250,000), wait for the same `order` prompt, which then also says how much
+went out without a confirmation in that time; confirming it starts both totals again (confirming a large order whose
+prompt didn't show them leaves them). Confirmed orders never count. So a hijacked page can't trade large amounts as
+many orders just under $25,000, however it spreads them out: at most $250,000 a day without the user. A frame without a UI refuses them (`POLICY_DENIED`,
 `ORDER_NOTIONAL_EXCEEDED`). When another tab signed orders between the check and the signature, the call fails with
 `SIGNER_BUSY` (retryable, nothing sent): send it again and it asks.
 

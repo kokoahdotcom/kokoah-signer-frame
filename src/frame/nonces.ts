@@ -11,8 +11,8 @@
  *   persisted value and the clock offset comes from HL `exchangeStatus` server time.
  *
  * The same record tracks per-minute order counts, today's notional, the last few minutes of HLP deposits and the last
- * minutes of orders signed without a prompt, so reloading the frame or using another tab does not reset the rate
- * limit, the HLP cap or the prompt. It is kept per master account ({@link UsageKey}), so a new key for the same
+ * 24 hours of orders signed without a prompt (summed per minute), so reloading the frame or using another tab does not
+ * reset the rate limit, the HLP cap or the prompt. It is kept per master account ({@link UsageKey}), so a new key for the same
  * account (one the parent made the frame create) doesn't reset them either.
  *
  * @module
@@ -49,8 +49,24 @@ const MINUTE = 60_000;
  */
 export const HLP_DEPOSIT_RECENT_MS = 5 * MINUTE;
 
-/** How long an order signed without the user's confirmation counts toward the prompt's rolling total. */
+/** How long an order signed without the user's confirmation counts toward the prompt's short rolling total. */
 export const UNPROMPTED_WINDOW_MS = 10 * MINUTE;
+
+/** How long it counts toward the prompt's daily rolling total (and is kept, summed per minute). */
+export const UNPROMPTED_DAY_MS = 24 * 60 * MINUTE;
+
+/** What a reservation records about orders signed without the user's confirmation (see {@link SigningCoordinator.reserve}). */
+export interface UnpromptedOrders {
+  /** The action's orders' notional in all (`describeOrders`). */
+  usd: number;
+  /** The user confirmed this action in the frame's prompt: it isn't counted. */
+  confirmed: boolean;
+  /** That prompt showed the total of unconfirmed orders, so the user saw it: the record of them starts again. */
+  clears: boolean;
+  /** Most unconfirmed notional in {@link UNPROMPTED_WINDOW_MS}, and in {@link UNPROMPTED_DAY_MS}. */
+  maxUsd: number;
+  maxDayUsd: number;
+}
 
 /**
  * Where usage is kept: `key` (the master account's record), and `legacy`, the agent's own record from before records
@@ -111,6 +127,8 @@ export interface Usage {
   accountDailyNotionalUsd: number;
   /** Notional of the orders signed without a prompt in the last {@link UNPROMPTED_WINDOW_MS}, across every account. */
   unpromptedUsd: number;
+  /** The same over the last {@link UNPROMPTED_DAY_MS}. */
+  unpromptedDayUsd: number;
 }
 
 /** Which account a usage question or reservation is about. */
@@ -198,9 +216,10 @@ export class SigningCoordinator {
    * `hlpDeposit`: this action is an HLP deposit of `usd` for `master`; it is recorded in the same transaction, which
    * fails with VAULT_DEPOSIT_LIMIT when the recent deposits are more than the `countedUsd` the caller's cap check counted
    * (another tab deposited in between; with Web Locks it can't).
-   * `unprompted`: the orders' notional in all and whether the user confirmed them in the frame's prompt: confirmed
-   * clears the rolling record of orders signed without a prompt; otherwise they join it, and the reservation fails with
-   * {@link ConfirmationNeededError} when that would pass `maxUsd` (another tab signed in between).
+   * `unprompted`: the orders' notional in all and whether the user confirmed them in the frame's prompt: unconfirmed ones
+   * join the rolling record of orders signed without a prompt, and the reservation fails with
+   * {@link ConfirmationNeededError} when that would pass `maxUsd` or `maxDayUsd` (another tab signed in between); a
+   * confirmation whose prompt showed that record (`clears`) starts it again.
    * Throws if the nonce would fall outside HL's accepted window.
    */
   async reserve(
@@ -213,7 +232,7 @@ export class SigningCoordinator {
       referrer?: boolean;
       limits?: ReserveLimits;
       hlpDeposit?: { master: string; usd: number; countedUsd: number };
-      unprompted?: { usd: number; confirmed: boolean; maxUsd: number };
+      unprompted?: UnpromptedOrders;
     },
   ): Promise<number> {
     const now = Math.floor(params.now);
@@ -278,7 +297,7 @@ export class SigningCoordinator {
 
 /** Usage counters of a record at `now`. Without `account`, the account figure is the master's. */
 export function usageOf(record: UsageRecord | undefined, now: number, account?: UsageAccount): Usage {
-  if (!record) return { ordersInLastMinute: 0, actionsInLastMinute: 0, dailyNotionalUsedUsd: 0, accountDailyNotionalUsd: 0, unpromptedUsd: 0 };
+  if (!record) return { ordersInLastMinute: 0, actionsInLastMinute: 0, dailyNotionalUsedUsd: 0, accountDailyNotionalUsd: 0, unpromptedUsd: 0, unpromptedDayUsd: 0 };
   const today = record.day === utcDay(now);
   const inLastMinute = (t: number) => t > now - MINUTE && t <= now + MINUTE;
   return {
@@ -286,19 +305,26 @@ export function usageOf(record: UsageRecord | undefined, now: number, account?: 
     actionsInLastMinute: (record.actionTimes ?? []).filter(inLastMinute).length,
     dailyNotionalUsedUsd: today ? record.dayNotionalUsd : 0,
     accountDailyNotionalUsd: today ? accountNotional(record, account) : 0,
-    unpromptedUsd: recentUnprompted(record, now).reduce((sum, o) => sum + o.usd, 0),
+    unpromptedUsd: sumUsd(recentUnprompted(record, now, UNPROMPTED_WINDOW_MS)),
+    unpromptedDayUsd: sumUsd(recentUnprompted(record, now, UNPROMPTED_DAY_MS)),
   };
 }
 
-/** The record's orders signed without a prompt in the last {@link UNPROMPTED_WINDOW_MS} before `now`. */
-function recentUnprompted(record: UsageRecord | undefined, now: number): Array<{ at: number; usd: number }> {
-  return (record?.unprompted ?? []).filter((o) => o.at > now - UNPROMPTED_WINDOW_MS && o.at <= now + MINUTE && Number.isFinite(o.usd) && o.usd > 0);
+const sumUsd = (entries: ReadonlyArray<{ usd: number }>): number => entries.reduce((sum, o) => sum + o.usd, 0);
+
+/**
+ * The record's orders signed without a prompt in the last `windowMs` before `now` (per-minute sums, each stamped with
+ * its minute's latest order, so an order counts for its whole window or up to a minute longer).
+ */
+function recentUnprompted(record: UsageRecord | undefined, now: number, windowMs: number): Array<{ at: number; usd: number }> {
+  return (record?.unprompted ?? []).filter((o) => o.at > now - windowMs && o.at <= now + MINUTE && Number.isFinite(o.usd) && o.usd > 0);
 }
 
-/** Unconfirmed orders that would pass the rolling total another tab's orders left (see `reserve`). */
-function unpromptedProblem(prev: UsageRecord | undefined, now: number, p: { usd: number; confirmed: boolean; maxUsd: number } | undefined): ConfirmationNeededError | undefined {
+/** Unconfirmed orders that would pass a rolling total another tab's orders left (see `reserve`). */
+function unpromptedProblem(prev: UsageRecord | undefined, now: number, p: UnpromptedOrders | undefined): ConfirmationNeededError | undefined {
   if (!p || p.confirmed || !(p.usd > 0)) return undefined;
-  return usageOf(prev, now).unpromptedUsd + p.usd > p.maxUsd ? new ConfirmationNeededError() : undefined;
+  const usage = usageOf(prev, now);
+  return usage.unpromptedUsd + p.usd > p.maxUsd || usage.unpromptedDayUsd + p.usd > p.maxDayUsd ? new ConfirmationNeededError() : undefined;
 }
 
 function accountNotional(record: UsageRecord, account: UsageAccount | undefined): number {
@@ -345,7 +371,8 @@ function limitProblem(usage: Usage, p: { orders: number; notionalUsd: number; li
 
 /**
  * Pure update of the usage record (runs inside the IndexedDB transaction). `hlpDeposit`: this action deposits into HLP.
- * `unprompted`: its orders' notional, and whether the user confirmed them (which clears the record of unconfirmed ones).
+ * `unprompted`: its orders' notional, whether the user confirmed them (then they aren't recorded), and whether that
+ * prompt showed the unconfirmed ones (which clears their record).
  */
 export function nextUsage(
   agent: string,
@@ -355,7 +382,7 @@ export function nextUsage(
   notionalUsd: number,
   account?: UsageAccount,
   hlpDeposit?: { master: string; usd: number },
-  unprompted?: { usd: number; confirmed: boolean },
+  unprompted?: Pick<UnpromptedOrders, "usd" | "confirmed" | "clears">,
 ): UsageRecord {
   const mgr = new MonotonicNonceManager({ now: () => now });
   const last = prev?.lastNonce;
@@ -376,9 +403,14 @@ export function nextUsage(
   const deposits = (prev?.hlpDeposits ?? []).filter((d) => d.at > now - HLP_DEPOSIT_RECENT_MS);
   if (hlpDeposit) deposits.push({ master: hlpDeposit.master.toLowerCase(), at: now, usd: hlpDeposit.usd });
   if (deposits.length > 0) record.hlpDeposits = deposits;
-  const unconfirmed = unprompted?.confirmed === true ? [] : recentUnprompted(prev, now);
-  if (unprompted !== undefined && !unprompted.confirmed && unprompted.usd > 0 && Number.isFinite(unprompted.usd)) unconfirmed.push({ at: now, usd: unprompted.usd });
-  if (unconfirmed.length > 0) record.unprompted = unconfirmed.slice(-10_000);
+  const unconfirmed = unprompted?.confirmed === true && unprompted.clears ? [] : recentUnprompted(prev, now, UNPROMPTED_DAY_MS);
+  if (unprompted !== undefined && !unprompted.confirmed && unprompted.usd > 0 && Number.isFinite(unprompted.usd)) {
+    // Summed per minute, so a day of orders is at most 1,440 entries.
+    const last = unconfirmed.at(-1);
+    if (last !== undefined && last.at <= now && Math.floor(last.at / MINUTE) === Math.floor(now / MINUTE)) unconfirmed[unconfirmed.length - 1] = { at: now, usd: last.usd + unprompted.usd };
+    else unconfirmed.push({ at: now, usd: unprompted.usd });
+  }
+  if (unconfirmed.length > 0) record.unprompted = unconfirmed.slice(-2_000);
   if (account !== undefined || prev?.accountNotionalUsd !== undefined) {
     const byAccount: Record<string, number> = {};
     if (sameDay) {

@@ -484,9 +484,16 @@ export const CONFIRM_ORDERS_ABOVE_USD = 25_000;
  * Orders the frame signed without a prompt count toward a rolling total over `UNPROMPTED_WINDOW_MS` (10 minutes,
  * nonces.ts; counted as {@link describeOrders} counts them, across every account): orders that would take it above
  * this need the same confirmation, so many orders just under {@link CONFIRM_ORDERS_ABOVE_USD} can't add up unseen. A
- * confirmed prompt starts the total again.
+ * confirmed prompt that showed the total starts it again.
  */
 export const CONFIRM_UNPROMPTED_ABOVE_USD = 100_000;
+
+/**
+ * The same over `UNPROMPTED_DAY_MS` (24 hours): the most a page can have the frame sign without the user seeing a
+ * prompt in a day, however it spreads the orders out. Confirmed orders don't count; a confirmed prompt that showed the
+ * total starts it again.
+ */
+export const CONFIRM_UNPROMPTED_DAY_ABOVE_USD = 250_000;
 
 /** The orders of an action in plain words for the frame's prompt, and their notional in all. */
 export interface OrdersDescription {
