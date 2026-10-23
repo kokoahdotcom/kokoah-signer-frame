@@ -18,8 +18,10 @@ import { THEME_VARIABLES, type SetThemeParams, type ThemeVariable } from "../pro
  * confirms orders above `CONFIRM_ORDERS_ABOVE_USD`, or past `CONFIRM_UNPROMPTED_ABOVE_USD` signed without a prompt
  * lately (policy.ts), before they are signed. `margin`: the user confirms taking margin out of an isolated position.
  * `key-remove`: the user confirms deleting a passkey-protected key, or replacing it with one that unlocks without it.
+ * `agent-approval`: not a prompt but a notice ({@link PromptUi.showNotice}): the new key's address while the main
+ * wallet approves it.
  */
-export type PromptKind = "passkey-create" | "passkey-unlock" | "vault-deposit" | "vault-withdraw" | "limits" | "order" | "margin" | "key-remove";
+export type PromptKind = "passkey-create" | "passkey-unlock" | "vault-deposit" | "vault-withdraw" | "limits" | "order" | "margin" | "key-remove" | "agent-approval";
 
 export interface PromptRequest {
   kind: PromptKind;
@@ -39,6 +41,24 @@ export interface PromptRequest {
    * that moves money or loosens the user's protection, so a click the parent lured onto the button isn't enough.
    */
   hold?: boolean;
+}
+
+/**
+ * A panel that needs no action (`PromptUi.showNotice`): shown in the frame's own fixed look while no prompt is open, a
+ * prompt takes its place until it closes. `lines` are shown one per line in a monospace font (an address, a code).
+ */
+export interface NoticeRequest {
+  kind: PromptKind;
+  title: string;
+  body: string;
+  lines: string[];
+  closeLabel: string;
+  timeoutMs: number;
+}
+
+interface NoticeEntry {
+  kind: PromptKind;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 /** Why a prompt ended without success. `kind`: the prompt's. */
@@ -164,6 +184,13 @@ export class PromptUi {
   private readonly secondary: HTMLButtonElement;
   private readonly status: HTMLElement;
   private active: PromptKind | null = null;
+  /** The notice shown while no prompt is open (see {@link PromptUi.showNotice}). */
+  private notice: NoticeEntry | null = null;
+  private readonly noticePanel: HTMLElement;
+  private readonly noticeTitle: HTMLElement;
+  private readonly noticeBody: HTMLElement;
+  private readonly noticeLines: HTMLElement;
+  private readonly noticeClose: HTMLButtonElement;
 
   constructor(doc: Document, root: HTMLElement, onChange: (visible: boolean, kind: PromptKind | null) => void, options: PromptUiOptions = {}) {
     this.onChange = onChange;
@@ -218,7 +245,24 @@ export class PromptUi {
     this.status.setAttribute("aria-live", "polite");
     this.panel.append(this.title, this.body, this.codeBox, actions, keyHint, this.status);
     this.codeInput.addEventListener("input", (ev) => this.onCode(ev));
-    root.append(this.idle, this.panel);
+
+    // The notice: a region, not a dialog (it asks for nothing and never takes focus), always in the frame's own look.
+    this.noticePanel = el(doc, "section", "ks-notice ks-notice--fixed");
+    this.noticePanel.hidden = true;
+    this.noticePanel.setAttribute("role", "region");
+    this.noticePanel.setAttribute("aria-live", "polite");
+    this.noticeTitle = el(doc, "h1", "ks-notice-title");
+    this.noticeTitle.id = "ks-notice-title";
+    this.noticePanel.setAttribute("aria-labelledby", "ks-notice-title");
+    this.noticeBody = el(doc, "p", "ks-notice-body");
+    this.noticeLines = el(doc, "div", "ks-notice-lines");
+    this.noticeClose = el(doc, "button", "ks-button ks-secondary ks-notice-close");
+    this.noticeClose.type = "button";
+    this.noticeClose.addEventListener("click", (ev) => {
+      if (this.isTrusted(ev)) this.endNotice();
+    });
+    this.noticePanel.append(this.noticeTitle, this.noticeBody, this.noticeLines, this.noticeClose);
+    root.append(this.idle, this.panel, this.noticePanel);
 
     const button = this.primary;
     button.addEventListener("pointerover", (ev) => this.onPointer(ev, false));
@@ -256,6 +300,41 @@ export class PromptUi {
       this.scrollToTop();
       this.rearm();
     });
+  }
+
+  /**
+   * Shows a notice (replacing any other) until the returned function ends it, the user hides it, or `timeoutMs` passes.
+   * While a prompt is open the notice waits behind it; `onChange` reports whichever is shown. The notice takes no focus
+   * and has no action but hiding it.
+   */
+  showNotice(req: NoticeRequest): () => void {
+    this.endNotice();
+    const doc = this.noticePanel.ownerDocument;
+    this.noticeTitle.textContent = req.title;
+    this.noticeBody.textContent = req.body;
+    this.noticeLines.replaceChildren(...req.lines.map((line) => el(doc, "p", "ks-notice-line", line)));
+    this.noticeClose.textContent = req.closeLabel;
+    const entry: NoticeEntry = { kind: req.kind, timer: setTimeout(() => this.endNotice(entry), req.timeoutMs) };
+    this.notice = entry;
+    if (this.active === null) {
+      this.idle.hidden = true;
+      this.noticePanel.hidden = false;
+      this.onChange(true, req.kind);
+    }
+    return () => this.endNotice(entry);
+  }
+
+  /** Ends the notice (only `entry`, when given). */
+  private endNotice(entry?: NoticeEntry): void {
+    const n = this.notice;
+    if (n === null || (entry !== undefined && entry !== n)) return;
+    clearTimeout(n.timer);
+    this.notice = null;
+    this.noticePanel.hidden = true;
+    if (this.active === null) {
+      this.idle.hidden = false;
+      this.onChange(false, null);
+    }
   }
 
   /** Updates the idle status line (network, key state). */
@@ -331,6 +410,7 @@ export class PromptUi {
     this.newCode(req.fixedStyle === true && !this.tracksVisibility());
     this.setBusy(false, this.restingStatus());
     this.idle.hidden = true;
+    this.noticePanel.hidden = true;
     this.panel.hidden = false;
     this.scrollToTop();
     this.onChange(true, req.kind);
@@ -535,10 +615,16 @@ export class PromptUi {
     this.hold = false;
     this.primary.classList.remove("ks-hold");
     this.panel.hidden = true;
-    this.idle.hidden = false;
     this.active = null;
     this.status.textContent = "";
-    this.onChange(false, null);
+    // A notice that waited behind the prompt comes back.
+    if (this.notice !== null) {
+      this.noticePanel.hidden = false;
+      this.onChange(true, this.notice.kind);
+    } else {
+      this.idle.hidden = false;
+      this.onChange(false, null);
+    }
   }
 
   private setBusy(busy: boolean, status: string): void {

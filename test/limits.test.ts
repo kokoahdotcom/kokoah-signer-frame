@@ -24,7 +24,7 @@ const feeTrial = { kind: "startFeeTrial", origin: "manual", tier: 1 };
 const codes = (e: { details?: { violations?: Array<{ code: string }> } }) => (e.details?.violations ?? []).map((v) => v.code);
 /** A $200 ETH buy (0.1 at 2000). */
 const order = (requestId: string, o: Record<string, unknown> = {}) => ({ requestId, intent: limitOrder(o) });
-const shownPrompts = (h: FrameHarness) => h.events("promptChanged").filter((e) => e.visible);
+const shownPrompts = (h: FrameHarness) => h.promptEvents().filter((e) => e.visible);
 
 /** Sends a loosening setLimits and waits until the frame shows its prompt; `answer` is the frame's response. */
 async function asking(h: FrameHarness, params: Record<string, unknown>) {
@@ -57,7 +57,7 @@ describe("limits stored by the frame", () => {
     expect(shownPrompts(h)).toHaveLength(0);
 
     const reset = await asking(h, {});
-    expect(h.events("promptChanged").at(-1)).toEqual({ visible: true, kind: "limits" });
+    expect(h.promptEvents().at(-1)).toEqual({ visible: true, kind: "limits" });
     expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Loosen your trading limits?");
     expect(h.promptText()).toContain("Largest order: $100 → $250,000");
     // Shown in the frame's own fixed style, whatever theme the parent set, and confirmed by pressing and holding.

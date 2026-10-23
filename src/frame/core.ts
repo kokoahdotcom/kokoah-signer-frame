@@ -36,6 +36,8 @@ import { HLP_LOCKUP_DAYS, HLP_VAULT_ADDRESSES, vaultDepositsSince, vaultUnitsToU
 import { bytesToHex, hexToBytes } from "viem";
 import { generatePrivateKey as viemGeneratePrivateKey, privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import {
+  AGENT_APPROVAL_PANEL_MS,
+  agentAddressCheckCode,
   EXPIRES_AFTER_MS,
   EXPIRING_SOON_MS,
   MAX_AGENT_NAME_LENGTH,
@@ -180,6 +182,8 @@ export interface FrameDeps {
   promptHoldMs?: number;
   /** Test seam: which input events count as the user's own (default `ev.isTrusted`; jsdom can't make trusted events). */
   promptIsTrusted?: (ev: Event) => boolean;
+  /** How long the agent approval panel stays without `confirmAgent`. Default AGENT_APPROVAL_PANEL_MS. */
+  agentApprovalTimeoutMs?: number;
   logger?: Logger;
 }
 
@@ -293,6 +297,8 @@ export class FrameCore {
   private notifiedExpiringFor: string | null = null;
   private notifiedExpiredFor: string | null = null;
   private passkeySupportCache: Promise<PasskeySupport> | null = null;
+  /** The agent approval panel shown for a new key, and how to end it (see `showAgentApproval`). */
+  private approval: { agent: Hex; end: () => void } | null = null;
   private readonly metrics = { ignoredMessages: 0, rejectedRequests: 0, policyDenials: 0, submitted: 0 };
   private destroyed = false;
 
@@ -535,6 +541,8 @@ export class FrameCore {
   }
 
   private setKey(key: Omit<LoadedKey, "generation"> | null): void {
+    // The approval panel is about one key: another key (or none) ends it.
+    if (this.approval !== null && this.approval.agent !== key?.meta.agentAddress) this.endAgentApproval();
     this.generation++;
     this.key = key === null ? null : { ...key, generation: this.generation };
     this.notifiedExpiringFor = null;
@@ -743,6 +751,7 @@ export class FrameCore {
         confirmsLooserLimits: true,
         confirmsLargeOrders: true,
         confirmsRecentOrders: true,
+        showsAgentApproval: true,
       },
       builder: { address: this.config.builder.address, feeTenthsBps: this.config.builder.feeTenthsBps, promo: this.config.builder.promo },
       status: this.status(),
@@ -765,7 +774,7 @@ export class FrameCore {
   // -------------------------------------------------------------------------------------------
 
   private async createAgent(p: CreateAgentParams): Promise<CreateAgentResult> {
-    return await this.createKey({ ...p, agentName: p.agentName ?? this.config.defaultAgentName }, "local", (meta) => ({
+    const created = await this.createKey({ ...p, agentName: p.agentName ?? this.config.defaultAgentName }, "local", (meta) => ({
       approveAgent: buildApproveAgent({
         agentAddress: meta.agentAddress,
         agentName: meta.agentName,
@@ -776,6 +785,37 @@ export class FrameCore {
         ...(p.signatureChainId !== undefined ? { signatureChainId: p.signatureChainId } : {}),
       }),
     }));
+    // The main wallet signs `approveAgent` next: the user compares its `agentAddress` with the frame's own panel.
+    if (this.key?.meta.agentAddress === created.agentAddress) this.showAgentApproval(created.agentAddress);
+    return created;
+  }
+
+  /**
+   * The frame's own panel while the main wallet approves a new key (`promptChanged` kind `agent-approval`, fixed look,
+   * no action): the key's full address and its check code (protocol `agentAddressCheckCode`), so the user can tell the
+   * wallet's request for this key from one for an address the page chose. Ends with `confirmAgent`, the user's Hide,
+   * another key, or `agentApprovalTimeoutMs`.
+   */
+  private showAgentApproval(agent: Hex): void {
+    if (!this.ui) return;
+    this.endAgentApproval();
+    const end = this.ui.showNotice({
+      kind: "agent-approval",
+      title: "Check the new trading key in your wallet",
+      body: "Your wallet will ask you to approve a trading key for this device. Approve it only if your wallet shows this address:",
+      lines: [agent, `Check: ${agentAddressCheckCode(agent)}`],
+      closeLabel: "Hide",
+      timeoutMs: this.deps.agentApprovalTimeoutMs ?? AGENT_APPROVAL_PANEL_MS,
+    });
+    this.approval = { agent, end };
+  }
+
+  /** Ends the agent approval panel, if one is open (for `agent` only, when given). */
+  private endAgentApproval(agent?: Hex): void {
+    const a = this.approval;
+    if (a === null || (agent !== undefined && a.agent !== agent)) return;
+    this.approval = null;
+    a.end();
   }
 
   /**
@@ -1024,6 +1064,16 @@ export class FrameCore {
   // -------------------------------------------------------------------------------------------
 
   private async confirmAgent(p: ConfirmAgentParams): Promise<SignerStatus> {
+    // Whatever the answer, the wallet step it waited for is over: the approval panel ends with it.
+    const agent = this.key?.meta.agentAddress;
+    try {
+      return await this.checkAgent(p);
+    } finally {
+      if (agent !== undefined) this.endAgentApproval(agent);
+    }
+  }
+
+  private async checkAgent(p: ConfirmAgentParams): Promise<SignerStatus> {
     const key = this.key;
     if (!key) throw new SignerFailure("NO_KEY", "There is no trading key on this device; call createAgent first.");
     const state = this.keyStateOf(key);

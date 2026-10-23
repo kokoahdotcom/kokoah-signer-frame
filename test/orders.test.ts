@@ -23,7 +23,7 @@ async function ready(o: HarnessOptions = {}): Promise<FrameHarness> {
 const codes = (e: { details?: { violations?: Array<{ code: string }> } }) => (e.details?.violations ?? []).map((v) => v.code);
 /** A BTC buy at the mark (100,000): 0.3 is $30,000. */
 const btc = (size: string, o: Record<string, unknown> = {}) => limitOrder({ coin: "BTC", size, price: "100000", ...o });
-const orderPrompts = () => h.events("promptChanged").filter((e) => e.visible && e.kind === "order");
+const orderPrompts = () => h.promptEvents().filter((e) => e.visible && e.kind === "order");
 const shown = () => waitFor(() => h.promptText() !== "");
 
 describe("large orders", () => {
@@ -39,7 +39,7 @@ describe("large orders", () => {
     await ready();
     expect((await h.ok("signAndSubmit", { requestId: "a", intent: limitOrder({ size: "12.5" }) })).status).toBe("ok"); // exactly $25,000
     expect((await h.ok("signAndSubmit", { requestId: "b", intent: btc("0.2", { side: "sell", reduceOnly: true }) })).status).toBe("ok");
-    expect(h.events("promptChanged")).toHaveLength(0);
+    expect(h.promptEvents()).toHaveLength(0);
     expect(h.hl.exchangeCalls).toHaveLength(2);
   });
 
@@ -105,7 +105,7 @@ describe("large orders", () => {
     await h.ok("setLimits", { maxOrderNotionalUsd: 28_000 });
     expect(codes(await h.fail("signAndSubmit", { requestId: "x", intent: btc("0.3") }))).toEqual(["ORDER_NOTIONAL_EXCEEDED"]);
     expect(codes(await h.fail("signAndSubmit", { requestId: "y", intent: btc("0.27", { price: "106000" }) }))).toContain("PRICE_OUTSIDE_BAND");
-    expect(h.events("promptChanged")).toHaveLength(0);
+    expect(h.promptEvents()).toHaveLength(0);
   });
 
   it("reads the market again after the prompt: a move past the band while it waited refuses the order", async () => {
@@ -167,7 +167,7 @@ describe("many orders without a prompt", () => {
   it("need the user's confirmation once they would pass $100,000 in 10 minutes; then the total starts again", async () => {
     await ready();
     for (const id of ["a", "b", "c", "d"]) expect((await just(id)).status).toBe("ok");
-    expect(h.events("promptChanged")).toHaveLength(0);
+    expect(h.promptEvents()).toHaveLength(0);
     const fifth = just("e");
     await shown();
     expect(orderPrompts()).toHaveLength(1);
@@ -227,7 +227,7 @@ describe("many orders without a prompt", () => {
       expect((await just(`a${i}`)).status).toBe("ok");
       h.clock.advance(11 * 60_000);
     }
-    expect(h.events("promptChanged")).toHaveLength(0);
+    expect(h.promptEvents()).toHaveLength(0);
     const eleventh = just("b");
     await shown();
     expect(h.promptText()).toContain("Orders of about $240,000 went out without a confirmation in the last 24 hours, so this one needs yours.");
@@ -306,7 +306,7 @@ describe("taking margin out of an isolated position", () => {
     await ready();
     const pending = h.ok("signAndSubmit", { requestId: "m", intent: out("-250.5") });
     await shown();
-    expect(h.events("promptChanged").at(-1)).toEqual({ visible: true, kind: "margin" });
+    expect(h.promptEvents().at(-1)).toEqual({ visible: true, kind: "margin" });
     expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Take margin out of this position?");
     expect(h.promptText()).toContain("take $250.5 of margin out of the isolated BTC position. This moves the position closer to liquidation.");
     expect(h.root?.querySelector(".ks-prompt")?.classList.contains("ks-prompt--fixed")).toBe(true);
@@ -324,7 +324,7 @@ describe("taking margin out of an isolated position", () => {
     await h.clickPrompt("cancel");
     expect(await pending).toMatchObject({ code: "USER_CANCELLED", details: { prompt: "margin" } });
     expect((await h.ok("signAndSubmit", { requestId: "add", intent: out("5") })).status).toBe("ok");
-    expect(h.events("promptChanged").filter((e) => e.visible)).toHaveLength(1);
+    expect(h.promptEvents().filter((e) => e.visible)).toHaveLength(1);
     h.destroy();
     await ready({ withUi: false });
     expect(codes(await h.fail("signAndSubmit", { requestId: "n", intent: out("-5") }))).toEqual(["ACTION_TYPE_NOT_ALLOWED"]);
