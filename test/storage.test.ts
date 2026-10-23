@@ -212,8 +212,11 @@ describe("passkey storage (mocked WebAuthn PRF)", () => {
     expect(!failed.ok && failed.error.code).toBe("UNLOCK_FAILED");
     // Nothing is thrown away on a failed unlock.
     expect(await b.ok("getStatus")).toMatchObject({ hasKey: true, locked: true, agentAddress: lost.address });
-    // The way out needs no passkey: remove this device's key (the app has the main wallet sign revokeAgent)…
-    const revoked = await b.ok("revoke", {});
+    // The way out needs no passkey: remove this device's key once the user confirms it in the frame (the app has the
+    // main wallet sign revokeAgent)…
+    const revoking = b.ok("revoke", {});
+    await b.clickPrompt();
+    const revoked = await revoking;
     expect(revoked).toMatchObject({ wiped: true, agentAddress: lost.address, agentName: "kokoah-web" });
     expect(revoked.revokeAgent.action.agentName).toBe("kokoah-web");
     expect(await b.ok("getStatus")).toMatchObject({ hasKey: false });

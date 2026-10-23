@@ -32,7 +32,9 @@ describe("the private key never leaves the frame", () => {
     await h.clickPrompt();
     await pending;
     const passkeyKey = h.generatedKeys.at(-1)!;
-    await h.ok("revoke", {});
+    const revoking = h.ok("revoke", {});
+    await h.clickPrompt();
+    await revoking;
 
     const posted = h.parent.postMessage.mock.calls.map((c) => JSON.stringify(c[0]));
     expect(posted.length).toBeGreaterThan(15);

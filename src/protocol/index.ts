@@ -659,9 +659,9 @@ export interface EventData {
   keyExpired: { agentAddress: Hex; validUntil: number };
   /**
    * The frame needs (or no longer needs) the user to click inside it. Show the iframe while `visible` is true. Kinds
-   * added later (`vault-withdraw`, `margin`, 2026-10-23) may appear: show the iframe for any kind.
+   * added later (`vault-withdraw`, `margin`, `key-remove`, 2026-10-23) may appear: show the iframe for any kind.
    */
-  promptChanged: { visible: boolean; kind: "passkey-create" | "passkey-unlock" | "vault-deposit" | "vault-withdraw" | "limits" | "order" | "margin" | null };
+  promptChanged: { visible: boolean; kind: "passkey-create" | "passkey-unlock" | "vault-deposit" | "vault-withdraw" | "limits" | "order" | "margin" | "key-remove" | null };
 }
 
 // ---------------------------------------------------------------------------------------------
