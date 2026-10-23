@@ -83,7 +83,17 @@ import { RegionGate } from "./eligibility.js";
 import { silentLogger, type Logger } from "./log.js";
 import { MarketData, MarketDataError, type MarketSnapshot } from "./market-data.js";
 import { classifyMessage } from "./messages.js";
-import { ConfirmationNeededError, ReferrerAlreadySignedError, SignerBusyError, SigningCoordinator, UNPROMPTED_WINDOW_MS, UsageLimitError, type LockManagerLike, type UsageKey } from "./nonces.js";
+import {
+  ConfirmationNeededError,
+  ReferrerAlreadySignedError,
+  SignerBusyError,
+  SigningCoordinator,
+  UNPROMPTED_DAY_MS,
+  UNPROMPTED_WINDOW_MS,
+  UsageLimitError,
+  type LockManagerLike,
+  type UsageKey,
+} from "./nonces.js";
 import { PasskeyError, type PasskeyProvider } from "./passkey.js";
 import {
   type AccountLimits,
@@ -92,6 +102,7 @@ import {
   applyUserLimits,
   CONFIRM_ORDERS_ABOVE_USD,
   CONFIRM_UNPROMPTED_ABOVE_USD,
+  CONFIRM_UNPROMPTED_DAY_ABOVE_USD,
   createBaselinePolicy,
   describeOrders,
   evaluateFrameAccountPolicy,
@@ -728,6 +739,7 @@ export class FrameCore {
         confirmOrdersAboveUsd: CONFIRM_ORDERS_ABOVE_USD,
         confirmRecentOrdersAboveUsd: CONFIRM_UNPROMPTED_ABOVE_USD,
         recentOrdersWindowMs: UNPROMPTED_WINDOW_MS,
+        confirmDailyOrdersAboveUsd: CONFIRM_UNPROMPTED_DAY_ABOVE_USD,
       },
     };
   }
@@ -1655,21 +1667,30 @@ export class FrameCore {
       return { decision, accountPolicy, usageAccount, expiresAfter };
     };
 
-    // 4b. Orders above CONFIRM_ORDERS_ABOVE_USD in all (reduce-only ones included), or that would take what this key
-    // signed without a prompt in the last 10 minutes above CONFIRM_UNPROMPTED_ABOVE_USD, wait for the user's
-    // confirmation of the frame's own description of them; so does taking margin out of an isolated position. Checked
-    // first, so the user is never asked to confirm something the rules refuse; after the prompt (up to two minutes) the
-    // prices, dexes and leverage are read again for the check under the lock.
+    // 4b. Orders above CONFIRM_ORDERS_ABOVE_USD in all (reduce-only ones included), or that would take what this account
+    // signed without a prompt above CONFIRM_UNPROMPTED_ABOVE_USD in the last 10 minutes or
+    // CONFIRM_UNPROMPTED_DAY_ABOVE_USD in the last 24 hours, wait for the user's confirmation of the frame's own
+    // description of them; so does taking margin out of an isolated position. Checked first, so the user is never asked
+    // to confirm something the rules refuse; after the prompt (up to two minutes) the prices, dexes and leverage are read
+    // again for the check under the lock.
     const orders = describeOrders(action, snapshot.registry, snapshot.markPrices, compiled.marketOrder !== undefined);
-    const recentUsd = orders.totalUsd > 0 ? (await this.coordinator.usage(usageKey, this.correctedNow())).unpromptedUsd : 0;
+    const recent = orders.totalUsd > 0 ? await this.coordinator.usage(usageKey, this.correctedNow()) : undefined;
     const large = orders.totalUsd > CONFIRM_ORDERS_ABOVE_USD;
-    const addsUp = !large && orders.totalUsd > 0 && recentUsd + orders.totalUsd > CONFIRM_UNPROMPTED_ABOVE_USD;
+    // The total the prompt shows: the 10 minutes' when they pass their limit, else the day's when it does.
+    const addsUp =
+      recent === undefined
+        ? undefined
+        : recent.unpromptedUsd + orders.totalUsd > CONFIRM_UNPROMPTED_ABOVE_USD
+          ? { usd: recent.unpromptedUsd, windowMs: UNPROMPTED_WINDOW_MS }
+          : recent.unpromptedDayUsd + orders.totalUsd > CONFIRM_UNPROMPTED_DAY_ABOVE_USD
+            ? { usd: recent.unpromptedDayUsd, windowMs: UNPROMPTED_DAY_MS }
+            : undefined;
     const marginOut = intent.kind === "updateIsolatedMargin" && Number(intent.amountUsd) < 0 ? { coin: intent.coin, usd: -Number(intent.amountUsd) } : undefined;
     let confirmed = false;
     if (large || addsUp || marginOut) {
       await evaluate(stored, this.correctedNow());
       if (marginOut) await this.confirmMarginRemoval(marginOut, snapshot, compiled.vaultAddress);
-      else await this.confirmOrders(orders, compiled.vaultAddress, addsUp ? recentUsd : undefined);
+      else await this.confirmOrders(orders, compiled.vaultAddress, addsUp);
       confirmed = true;
       snapshot = await this.marketSnapshot(coins);
       requirePinnedDexes();
@@ -1702,8 +1723,9 @@ export class FrameCore {
             maxDailyNotionalUsd: accountPolicy.maxDailyNotionalUsd,
             maxAgentDailyNotionalUsd: BASELINE_LIMITS.maxDailyNotionalUsd,
           },
-          // Checked again in the record's own transaction: another tab may have signed orders since the check above.
-          unprompted: { usd: orders.totalUsd, confirmed, maxUsd: CONFIRM_UNPROMPTED_ABOVE_USD },
+          // Checked again in the record's own transaction: another tab may have signed orders since the check above. A
+          // confirmation whose prompt showed the unconfirmed total starts it again; one that didn't leaves it.
+          unprompted: { usd: orders.totalUsd, confirmed, clears: confirmed && addsUp !== undefined, maxUsd: CONFIRM_UNPROMPTED_ABOVE_USD, maxDayUsd: CONFIRM_UNPROMPTED_DAY_ABOVE_USD },
         });
       } catch (e) {
         if (e instanceof UsageLimitError) {
@@ -2010,28 +2032,30 @@ export class FrameCore {
   }
 
   /**
-   * The frame's own prompt for orders above CONFIRM_ORDERS_ABOVE_USD, or past CONFIRM_UNPROMPTED_ABOVE_USD with the
-   * orders signed without a prompt in the last 10 minutes (`recentUsd`, their notional) (`promptChanged` kind `order`,
-   * fixed styling): one line per order as the frame will sign it, and the total; confirmed by pressing and holding.
-   * Cancel or timeout: USER_CANCELLED / USER_TIMEOUT, and nothing is signed. A frame without a UI can't ask, so it
-   * refuses them.
+   * The frame's own prompt for orders above CONFIRM_ORDERS_ABOVE_USD, or past the rolling total of orders signed
+   * without a prompt (`recent`: that total's notional and window, 10 minutes or 24 hours) (`promptChanged` kind
+   * `order`, fixed styling): one line per order as the frame will sign it, and the total; confirmed by pressing and
+   * holding. Cancel or timeout: USER_CANCELLED / USER_TIMEOUT, and nothing is signed. A frame without a UI can't ask,
+   * so it refuses them.
    */
-  private async confirmOrders(orders: OrdersDescription, subAccount: string | undefined, recentUsd?: number): Promise<void> {
+  private async confirmOrders(orders: OrdersDescription, subAccount: string | undefined, recent?: { usd: number; windowMs: number }): Promise<void> {
     const dollars = (n: number) => `$${Math.round(n).toLocaleString("en-US")}`;
     const total = dollars(orders.totalUsd);
-    const minutes = Math.round(UNPROMPTED_WINDOW_MS / 60_000);
+    const day = recent !== undefined && recent.windowMs >= UNPROMPTED_DAY_MS;
+    const window = day ? "24 hours" : `${Math.round(UNPROMPTED_WINDOW_MS / 60_000)} minutes`;
+    const limit = day ? CONFIRM_UNPROMPTED_DAY_ABOVE_USD : CONFIRM_UNPROMPTED_ABOVE_USD;
     if (!this.ui) {
       this.metrics.policyDenials++;
       const message =
-        recentUsd === undefined
+        recent === undefined
           ? `Orders of more than $${CONFIRM_ORDERS_ABOVE_USD.toLocaleString("en-US")} (${total} here) need your confirmation in the signer frame, which has no user interface here.`
-          : `Orders past $${CONFIRM_UNPROMPTED_ABOVE_USD.toLocaleString("en-US")} in ${minutes} minutes without a confirmation (${dollars(recentUsd)} so far, ${total} here) need your confirmation in the signer frame, which has no user interface here.`;
+          : `Orders past $${limit.toLocaleString("en-US")} in ${window} without a confirmation (${dollars(recent.usd)} so far, ${total} here) need your confirmation in the signer frame, which has no user interface here.`;
       throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: "ORDER_NOTIONAL_EXCEEDED", message }] } });
     }
     const one = orders.lines.length === 1;
     const sub = subAccount?.toLowerCase();
     const whose = sub === undefined ? "" : ` for sub-account ${sub.slice(0, 6)}…${sub.slice(-4)}`;
-    const why = recentUsd === undefined ? "" : ` Orders of about ${dollars(recentUsd)} went out without a confirmation in the last ${minutes} minutes, so ${one ? "this one needs" : "these need"} yours.`;
+    const why = recent === undefined ? "" : ` Orders of about ${dollars(recent.usd)} went out without a confirmation in the last ${window}, so ${one ? "this one needs" : "these need"} yours.`;
     await this.prompt(
       "order",
       {

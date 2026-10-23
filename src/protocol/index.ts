@@ -284,8 +284,9 @@ export interface HelloResult {
     confirmsLargeOrders?: boolean;
     /**
      * The frame also asks (the same `order` prompt) before orders that would take what it signed without a prompt in
-     * the last `limits.recentOrdersWindowMs` above `limits.confirmRecentOrdersAboveUsd`, counted the same way, across
-     * every account; a confirmed prompt starts that total again. Absent in older frames.
+     * the last `limits.recentOrdersWindowMs` above `limits.confirmRecentOrdersAboveUsd`, or in the last 24 hours above
+     * `limits.confirmDailyOrdersAboveUsd` (when present), counted the same way, across every account; a confirmed
+     * prompt that showed that total starts it again. Absent in older frames.
      */
     confirmsRecentOrders?: boolean;
   };
@@ -310,6 +311,8 @@ export interface HelloResult {
     /** With `capabilities.confirmsRecentOrders`: the rolling total (USD) of orders signed without a prompt, and its window (ms). */
     confirmRecentOrdersAboveUsd?: number;
     recentOrdersWindowMs?: number;
+    /** With `capabilities.confirmsRecentOrders`: the same total over the last 24 hours (2026-10-23; absent before). */
+    confirmDailyOrdersAboveUsd?: number;
   };
 }
 
