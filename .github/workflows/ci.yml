@@ -1,4 +1,5 @@
-# Copied from kokoah-infra/ci/workflows/static-site.yml (2026-09-22), unchanged apart from this header.
+# Copied from kokoah-infra/ci/workflows/static-site.yml (2026-09-22). Apart from this header: kokoah-shared is checked
+# out and built beside this checkout (the frame's @kokoah/shared is link:../kokoah-shared).
 # Deploy builds must set the VITE_* build variables (README.md, .env.example); without them the build uses the
 # placeholder .env.production (testnet, placeholder builder), which the frontend refuses to trade with.
 # The real-browser smoke test (pnpm smoke:browser) needs Chromium and is run manually, not here.
@@ -97,6 +98,23 @@ jobs:
 
       - name: Enable pnpm via corepack
         run: corepack enable pnpm
+
+      # @kokoah/shared is link:../kokoah-shared: its last commit, as the deploy build uses it (kokoah-infra
+      # vercel/build.sh), read with its read-only deploy key (KOKOAH_SHARED_DEPLOY_KEY, also a Dependabot secret),
+      # moved beside this checkout and built.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/kokoah-shared
+          ssh-key: ${{ secrets.KOKOAH_SHARED_DEPLOY_KEY }}
+          persist-credentials: false
+          path: .kokoah-shared
+
+      - name: Build kokoah-shared beside this checkout
+        run: |
+          mv .kokoah-shared ../kokoah-shared
+          cd ../kokoah-shared
+          pnpm install --frozen-lockfile
+          pnpm run build
 
       - name: Check SITE_ORIGIN is set
         run: |
