@@ -1,7 +1,7 @@
 import { buildRevokeAgent } from "@kokoah/shared/signing";
 import { afterEach, describe, expect, it } from "vitest";
 import { IdbSignerStore } from "../src/frame/storage.js";
-import { Clock, DAY, FakeBus, FrameHarness, limitOrder, MockHl, T0, testConfig, USER, waitFor } from "./helpers.js";
+import { Clock, DAY, FakeBus, FrameHarness, limitOrder, MockHl, MockPasskeys, T0, testConfig, USER, waitFor } from "./helpers.js";
 import { IDBFactory } from "fake-indexeddb";
 
 const harnesses: FrameHarness[] = [];
@@ -168,6 +168,28 @@ describe("revoke", () => {
     await a.ok("revoke", {});
     await waitFor(() => b.events("statusChanged").some((s) => !s.hasKey));
     expect((await b.fail("signAndSubmit", { requestId: "x", intent: limitOrder() })).code).toBe("NO_KEY");
+  });
+
+  it("a lock in one tab locks the same key in the other tabs; a passkey key there then needs the passkey again", async () => {
+    const clock = new Clock();
+    const hl = new MockHl(clock);
+    const idb = new IDBFactory();
+    const bus = new FakeBus();
+    const passkeys = new MockPasskeys();
+    const a = await frame({ clock, hl, idb, bus, passkeys });
+    await a.activeAgent("passkey");
+    const b = await frame({ clock, hl, idb, bus, passkeys });
+    await b.ok("hello", { protocolVersion: 1 });
+    const unlocking = b.ok("unlock");
+    await b.clickPrompt();
+    expect((await unlocking).locked).toBe(false);
+    expect((await b.ok("signAndSubmit", { requestId: "before", intent: limitOrder() })).status).toBe("ok");
+    expect((await a.ok("lock")).locked).toBe(true);
+    await waitFor(() => b.events("statusChanged").some((s) => s.locked));
+    expect((await b.fail("signAndSubmit", { requestId: "after", intent: limitOrder() })).code).toBe("LOCKED");
+    const again = b.ok("unlock");
+    await b.clickPrompt();
+    expect((await again).locked).toBe(false);
   });
 
   it("a key created or confirmed in one tab appears in the other tabs", async () => {
