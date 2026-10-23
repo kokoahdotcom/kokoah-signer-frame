@@ -133,7 +133,7 @@ signer.on("reconnected", (hello) => {
 
 The client sets no `sandbox`. If the app adds one, it must include `allow-scripts allow-same-origin`; without `allow-same-origin` the frame loses its origin and its storage. Passkeys in sandboxed iframes are unverified.
 
-**Showing the prompt.** When the frame needs the user (passkey ceremonies, an HLP deposit, a loosening of the user's limits, a large order), it emits `promptChanged {visible: true}`. The client then removes `hidden` from the iframe and sets `data-kokoah-signer-prompt="<kind>"`. Style that state as a modal, for example:
+**Showing the prompt.** When the frame needs the user (passkey ceremonies, an HLP deposit or a vault withdrawal, a loosening of the user's limits, a large order or many orders in a short time, margin taken out of an isolated position), it emits `promptChanged {visible: true}`. The client then removes `hidden` from the iframe and sets `data-kokoah-signer-prompt="<kind>"`. Style that state as a modal, for example:
 
 ```css
 iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min(420px, 92vw); height: min(480px, 92vh); border: 0; border-radius: 12px; z-index: 1000; }
@@ -142,14 +142,18 @@ iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min
 The iframe must be visible, on top and clickable. Don't cover it or make it transparent.
 
 **How the prompt resists a hostile page.** Its primary button works only after the prompt has been shown for 800 ms
-(where the browser reports occlusion, IntersectionObserver v2, shown whole and unobscured; covering or fading it
-starts over). Then a click counts only after the user's own pointer moved over the button inside the frame (a touch
+(where the browser reports occlusion, IntersectionObserver v2, shown whole, wholly in view and unobscured; covering,
+fading or clipping part of it starts over). The prompt always fits the frame (its order lines scroll inside it). Where
+the browser can't report occlusion (Firefox, Safari, every iOS browser), the fixed-style prompts (`limits`,
+`vault-deposit`, `vault-withdraw`, `order`, `margin` and removing passkey protection) also show a random 3-digit code
+the user types before the button works; a wrong code shows a new one, and after three wrong ones the prompt ends with
+`USER_CANCELLED` (2026-10-23). Moving the frame to a fragment (`#…`) scrolls it back and starts over. Then a click counts only after the user's own pointer moved over the button inside the frame (a touch
 press on it, for pointers that can't hover); events a script dispatches and a pointer that was already resting where
 the button appeared don't count, and leaving the button needs new movement. From the keyboard, any prompt confirms
 only when the user moved focus to the button with Tab or Shift+Tab inside the frame (not focus moved by a script or
 arriving from the parent page) and then holds Enter or Space for 0.8 s; a key press alone never clicks it, and the
 button is described to screen readers as "Press and hold Enter or Space to confirm." Resizing the iframe, the frame
-losing focus or the page being hidden starts it all over. The `limits`, `vault-deposit` and `order` prompts are
+losing focus or the page being hidden starts it all over. The `limits`, `vault-deposit`, `vault-withdraw`, `order` and `margin` prompts are
 confirmed by **pressing and holding** the button for 0.8 s with the pointer too (a bar fills; releasing early does
 nothing). Focus starts on Cancel. So don't resize or move the iframe while `visible`, and give the user a pointer path
 to it.
@@ -178,11 +182,12 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
     "broadcastChannel": true,
     "vaultTransfers": true,
     "confirmsLooserLimits": true,
-    "confirmsLargeOrders": true
+    "confirmsLargeOrders": true,
+    "confirmsRecentOrders": true
   },
   "builder": { "address": "0x…builder", "feeTenthsBps": 25 },
   "status": { "hasKey": true, "keyState": "active", "expiringSoon": true, "expired": false, "…": "SignerStatus, see getStatus" },
-  "limits": { "maxMessageBytes": 65536, "minValidForDays": 1, "maxValidForDays": 30, "expiresAfterMs": 15000, "maxAgentNameLength": 16, "confirmOrdersAboveUsd": 25000 }
+  "limits": { "maxMessageBytes": 65536, "minValidForDays": 1, "maxValidForDays": 30, "expiresAfterMs": 15000, "maxAgentNameLength": 16, "confirmOrdersAboveUsd": 25000, "confirmRecentOrdersAboveUsd": 100000, "recentOrdersWindowMs": 600000 }
 }
 ```
 
@@ -198,6 +203,9 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
 - `confirmsLargeOrders` is true when the frame asks the user before signing orders above `limits.confirmOrdersAboveUsd`
   ($25,000) in all (see `signAndSubmit`). Only then tell the user to confirm such an order in the signer window. Absent
   in older frames, which sign them without asking.
+- `confirmsRecentOrders` is true when the frame also asks before orders that would take what it signed without a
+  prompt in the last `limits.recentOrdersWindowMs` (10 minutes) above `limits.confirmRecentOrdersAboveUsd` ($100,000)
+  (see `signAndSubmit`). Absent in older frames.
 - `status` is the frame's `SignerStatus` at the handshake (see `getStatus`), including the key's expiry state.
 - Errors: `UNSUPPORTED_VERSION`.
 
@@ -457,8 +465,11 @@ other fields (a code, a `vaultAddress` or another origin is `INVALID_INTENT`):
   "usd":250000000}` (USDC × 10^6), after reading the ledger again under the agent lock. Cancel: `USER_CANCELLED`.
 - `{ "kind": "vaultWithdraw", "origin": "manual", "vaultAddress": "0x…", "usd": "120.5" }` withdraws from a vault back
   into the account. The frame reads `{"type":"userVaultEquities","user":<master>}` itself: a vault the account doesn't
-  hold, or more than its equity there, is `POLICY_DENIED` (`VAULT_NOT_ALLOWED`). No prompt (the money comes back to the
-  account). Hyperliquid itself refuses a withdrawal inside the lock-up.
+  hold, or more than its equity there, is `POLICY_DENIED` (`VAULT_NOT_ALLOWED`). Then it shows its own prompt
+  (`promptChanged` kind `vault-withdraw`, fixed styling, press and hold) naming the amount and the vault (2026-10-23;
+  before, no prompt). Cancel: `USER_CANCELLED`. Hyperliquid itself refuses a withdrawal inside the lock-up.
+- Both are the action type `vaultTransfer`: limits whose `allowedActionTypes` leave it out refuse them with
+  `POLICY_DENIED` (`ACTION_TYPE_NOT_ALLOWED`) before anything is shown.
 
 An unreadable ledger or vault list is `MARKET_DATA_UNAVAILABLE`; nothing is signed.
 
@@ -595,6 +606,20 @@ prompt lists each order as it will be signed, for example `Buy 0.3 BTC at $100,0
   full timeout again once the prompt closes). While the call waits, tell the user to confirm in the Kokoah signer
   window, and keep the iframe on top: a modal `<dialog>` of the app must step aside, or the user can't reach the button.
 
+**Many orders without a prompt** (`hello.capabilities.confirmsRecentOrders`, 2026-10-23). The frame keeps a rolling
+total of the orders it signed without a prompt in the last `hello.limits.recentOrdersWindowMs` (10 minutes), counted
+as above, across every account of the key's master, in every tab and across reloads and new keys. Orders that would
+take it above `hello.limits.confirmRecentOrdersAboveUsd` ($100,000) wait for the same `order` prompt, which then also
+says how much went out without a confirmation lately; a confirmed prompt starts the total again. So a hijacked page
+can't trade large amounts as many orders just under $25,000. A frame without a UI refuses them (`POLICY_DENIED`,
+`ORDER_NOTIONAL_EXCEEDED`). When another tab signed orders between the check and the signature, the call fails with
+`SIGNER_BUSY` (retryable, nothing sent): send it again and it asks.
+
+**Taking margin out of an isolated position** (`updateIsolatedMargin` with a negative `amountUsd`, 2026-10-23) waits for
+the frame's own prompt (`promptChanged` kind `margin`, fixed styling, press and hold) naming the amount and the market:
+it moves the position toward liquidation, which no notional cap covers. Cancel or timeout: `USER_CANCELLED` /
+`USER_TIMEOUT`; a frame without a UI refuses it. Adding margin signs at once.
+
 ### `setLimits`
 
 Personal limits (Settings, §B11.4). They **replace** the previous limits of one account (`{}` resets the master to the
@@ -620,7 +645,7 @@ Setting limits for an address grants nothing: `vaultAddress` is still checked on
 | `maxLeverage` | Integer from 1 to the baseline's 50. Effective cap per market = `min(value, market maximum)`. For new orders on a market whose maximum is above it, the frame reads the account's current leverage (`activeAssetData`) |
 | `allowedCoins` | Non-empty list of HL coin names (a subset of the baseline) |
 | `requireStopLossForNewEntries` | `true` tightens; `false` or omitted: not required |
-| `allowedActionTypes` | A subset of the baseline action types |
+| `allowedActionTypes` | A subset of the baseline action types; leave out `vaultTransfer` to turn HLP deposits and vault withdrawals off. At least one other type stays |
 | `spotTrading` | `true` turns spot trading on (the verified pairs in `spotTradingCoins`, see `signAndSubmit`); omitted or `false`: off, the default. It is the one setting that starts off, and it never goes beyond the baseline |
 | `account` | Optional sub-account address (see above) |
 
@@ -725,7 +750,7 @@ Allowed variables:
 | `statusChanged` | `SignerStatus` | Key created, confirmed, locked, unlocked, revoked, expired, changed in another tab; limits changed (in this tab or another) |
 | `keyExpiringSoon` | `{ agentAddress, validUntil, msRemaining }` | Once per key per frame load, when it expires within 7 days (right after `hello`, and on a timer). Show the renew banner. Also in `status.expiringSoon` |
 | `keyExpired` | `{ agentAddress, validUntil }` | Once per key per frame load, at `validUntil − 15 s`. The frame refuses to sign from then on. Also in `status.expired` |
-| `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| "vault-deposit" \| "limits" \| "order" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true** |
+| `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| "vault-deposit" \| "vault-withdraw" \| "limits" \| "order" \| "margin" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true**, whatever the kind (`vault-withdraw` and `margin` since 2026-10-23) |
 | `reconnected` (client-side, not sent by the frame) | `HelloResult` | `KokoahSignerClient` re-ran `hello` after the frame reloaded ([§3](#3-the-client)). Re-apply `setLimits` (a no-op when stored) and `setTheme` |
 
 Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event": "promptChanged", "data": { "visible": true, "kind": "passkey-unlock" } }`
@@ -779,7 +804,7 @@ The baseline is built into the frame and can't be loosened:
 
 | Rule | Baseline |
 |---|---|
-| Allowed action types | `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `updateLeverage`, `updateIsolatedMargin`, `scheduleCancel`, `noop`, `startFeeTrial`. Everything else is denied, and fund movements, vault/sub-account actions, approvals, TWAP etc. are hard-denied by the shared policy anyway |
+| Allowed action types | `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `updateLeverage`, `updateIsolatedMargin`, `scheduleCancel`, `noop`, `startFeeTrial`, `vaultTransfer` (HLP deposits and vault withdrawals, on their own rules). Everything else is denied, and fund movements, vault/sub-account actions, approvals, TWAP etc. are hard-denied by the shared policy anyway |
 | `setReferrer` | Only with the frame's `VITE_HL_REFERRAL_CODE` (shared policy `referralCode`), for the master, while HL reports no referrer, once per key. No code configured: denied |
 | Spot | The network's pinned stablecoin/USDC pairs (shared `STABLECOIN_PAIRS`) with one IOC order; once the parent sets `spotTrading: true`, also the verified token/USDC pairs (shared `VERIFIED_SPOT_PAIRS`) with market orders and GTC, IOC and post-only limits. Every pair is checked against the frame's own `spotMetaAndAssetCtxs`; master account only; no triggers, reduce-only, TP/SL or modify; builder on sells and none on buys; on mainnet one order on a verified pair ≤ 10% of its 24 h volume. Spot legs skip the leverage and stop-loss rules but count toward notional and rate limits. Every other spot market is denied |
 | HIP-3 (mainnet) | Only the dexes pinned in shared `perpDexs.ts` (name and deployer), checked against the `perpDexs` the frame reads itself. On any other dex HL lists (not pinned, or a new deployer) only cancels (`cancel`, `cancelByCloid`; `scheduleCancel` touches no market) and reduce-only orders (closes, position TP/SL, reduce-only modifies) are signed, so a user can leave it; entries, modifies that aren't reduce-only and every `updateLeverage` and `updateIsolatedMargin` (either way) are `UNSUPPORTED_MARKET`. Without HL's `perpDexs` nothing on a HIP-3 dex is signed (its asset ids need it). Testnet: every dex |
@@ -798,7 +823,7 @@ their own:
 
 ```json
 {
-  "allowedActionTypes": ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop", "startFeeTrial"],
+  "allowedActionTypes": ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop", "startFeeTrial", "vaultTransfer"],
   "allowedCoins": "*", "maxOrderNotionalUsd": 250000, "maxDailyNotionalUsd": 25000000, "maxLeverage": 50,
   "maxOrdersPerMinute": 60, "priceBandPct": 5, "requireStopLossForNewEntries": false,
   "builder": { "address": "0x…builder", "feeTenthsBps": 25 }, "vaultAddressAllowed": false, "ownSubAccountsAllowed": true,
