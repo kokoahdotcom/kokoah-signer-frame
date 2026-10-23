@@ -75,7 +75,7 @@ jobs:
         name: Audit the lockfile
         run: |
           corepack enable pnpm
-          pnpm audit --audit-level high
+          pnpm audit --audit-level low
 
   build:
     name: build and release manifest
