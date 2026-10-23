@@ -54,10 +54,27 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+      # GitHub's dependency review needs Advanced Security on a private repository. There the lockfile is checked
+      # against npm's advisories instead: an existing low or moderate one doesn't block, a high or critical one does.
+      - if: ${{ !github.event.repository.private }}
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: low
           show-openssf-scorecard: true
+      - if: ${{ github.event.repository.private }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: ${{ github.event.repository.private }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - if: ${{ github.event.repository.private }}
+        name: Audit the lockfile
+        run: |
+          corepack enable pnpm
+          pnpm audit --audit-level high
 
   build:
     name: build and release manifest
@@ -136,7 +153,9 @@ jobs:
   attest:
     name: attest build provenance
     needs: build
-    if: github.event_name == 'push'
+    # GitHub's artifact attestations aren't available for a private repository on this organisation's plan (the
+    # step fails with "Feature not available"): attested once the repository is public.
+    if: github.event_name == 'push' && !github.event.repository.private
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -161,8 +180,9 @@ jobs:
 
   publish-hashes:
     name: publish hash list to the GitHub release
-    needs: attest
-    if: github.ref_type == 'tag'
+    needs: [build, attest]
+    # Also without an attestation (a private repository, above): the hash list is published either way.
+    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.build.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.attest.result) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
