@@ -26,3 +26,9 @@ strictDepBuilds: true
 
 # Save exact versions (no ^ or ~ range) when adding dependencies.
 savePrefix: ''
+
+# Security advisories in the test tooling (vitest's vite, postcss's source-map-js; none of it ships): only patch
+# releases of the same line.
+overrides:
+  'vite@>=8.0.0 <8.3.3': '8.3.5'
+  'source-map-js@<1.2.2': '1.2.2'
