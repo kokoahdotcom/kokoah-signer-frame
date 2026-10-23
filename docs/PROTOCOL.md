@@ -390,6 +390,10 @@ The frame itself asks Hyperliquid (`info extraAgents` for `userAddress`) whether
 ← `SignerStatus`.
 
 - Drops the key from memory. Stored keys stay stored.
+- A stored key is locked in this browser's other tabs too (2026-10-23): their frames get the notice over their own
+  BroadcastChannel (their pages can't stop it) and report `statusChanged` with `locked: true`; a `passkey` key there
+  then needs the passkey again. A `device` key unlocks again without a prompt (`unlock`), and is unlocked again on the
+  next load: locking is no protection for a device key against a page that calls `unlock`.
 - A `session` key is **discarded** (it can't be unlocked again).
 - An in-flight `signAndSubmit` that hasn't signed yet fails with `KEY_CHANGED`.
 

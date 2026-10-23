@@ -142,7 +142,10 @@ export interface ParentLike {
   postMessage(message: unknown, targetOrigin: string): void;
 }
 
-/** A BroadcastChannel (same-origin tabs) used only for "the stored key / limits changed" notices, never key material. */
+/**
+ * A BroadcastChannel (same-origin tabs) used only for "the stored key / limits changed" and "this key was locked" notices
+ * (with the agent's address at most), never key material.
+ */
 export interface BroadcastLike {
   postMessage(message: unknown): void;
   onmessage: ((ev: { data: unknown }) => void) | null;
@@ -538,9 +541,9 @@ export class FrameCore {
     this.notifiedExpiredFor = null;
   }
 
-  private notifyOtherTabs(type: "keyChanged" | "limitsChanged" = "keyChanged"): void {
+  private notifyOtherTabs(type: "keyChanged" | "limitsChanged" | "keyLocked" = "keyChanged", agent?: Hex): void {
     try {
-      this.deps.broadcast?.postMessage({ type, from: this.instanceId });
+      this.deps.broadcast?.postMessage({ type, from: this.instanceId, ...(agent !== undefined ? { agent } : {}) });
     } catch {
       // Best effort.
     }
@@ -562,6 +565,19 @@ export class FrameCore {
     if (!isRecord(data) || data.from === this.instanceId) return;
     if (data.type === "limitsChanged") {
       void this.refreshLimits();
+      return;
+    }
+    if (data.type === "keyLocked") {
+      // The user locked this key in another tab: lock it here too (a passkey key then needs the passkey again).
+      void this.withState(async () => {
+        const key = this.key;
+        if (!key || key.account === null || key.meta.storageMode === "session" || key.meta.agentAddress !== data.agent) return;
+        key.account = null;
+        this.generation++;
+        key.generation = this.generation;
+        this.log("key.locked", { agent: key.meta.agentAddress, storageMode: key.meta.storageMode, reason: "locked in another tab" });
+        this.statusChanged();
+      });
       return;
     }
     if (data.type !== "keyChanged") return;
@@ -1146,6 +1162,8 @@ export class FrameCore {
         key.account = null;
         this.generation++;
         key.generation = this.generation;
+        // The same key in this browser's other tabs is locked too (their frames get the notice, not their pages).
+        this.notifyOtherTabs("keyLocked", key.meta.agentAddress);
       }
       this.log("key.locked", { agent: key.meta.agentAddress, storageMode: key.meta.storageMode });
       this.statusChanged();
