@@ -15,7 +15,7 @@ afterEach(() => {
 });
 
 describe("removing a passkey-protected key", () => {
-  const removePrompts = (h: FrameHarness) => h.events("promptChanged").filter((e) => e.visible && e.kind === "key-remove");
+  const removePrompts = (h: FrameHarness) => h.promptEvents().filter((e) => e.visible && e.kind === "key-remove");
 
   it("asks in the frame before revoke deletes it, and keeps it when the user cancels", async () => {
     const h = await frame();

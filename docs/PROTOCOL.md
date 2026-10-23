@@ -141,11 +141,16 @@ iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min
 
 The iframe must be visible, on top and clickable. Don't cover it or make it transparent.
 
+**The agent approval panel** (`promptChanged` kind `agent-approval`, `hello.capabilities.showsAgentApproval`,
+2026-10-23) is the one exception to "style it as a modal": it is shown while the main wallet's own window asks the user
+to approve a new key (see `createAgent`), and must sit **beside** that window, never over it (for example docked at a
+corner, not centred over the page). It asks for nothing and takes no focus.
+
 **How the prompt resists a hostile page.** Its primary button works only after the prompt has been shown for 800 ms
 (where the browser reports occlusion, IntersectionObserver v2, shown whole, wholly in view and unobscured; covering,
 fading or clipping part of it starts over). The prompt always fits the frame (its order lines scroll inside it). Where
 the browser can't report occlusion (Firefox, Safari, every iOS browser), the fixed-style prompts (`limits`,
-`vault-deposit`, `vault-withdraw`, `order`, `margin` and removing passkey protection) also show a random 3-digit code
+`vault-deposit`, `vault-withdraw`, `order`, `margin`, `key-remove` and removing passkey protection) also show a random 3-digit code
 the user types before the button works; a wrong code shows a new one, and after three wrong ones the prompt ends with
 `USER_CANCELLED` (2026-10-23). Moving the frame to a fragment (`#…`) scrolls it back and starts over. Then a click counts only after the user's own pointer moved over the button inside the frame (a touch
 press on it, for pointers that can't hover); events a script dispatches and a pointer that was already resting where
@@ -207,6 +212,8 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
   prompt in the last `limits.recentOrdersWindowMs` (10 minutes) above `limits.confirmRecentOrdersAboveUsd` ($100,000),
   or in the last 24 hours above `limits.confirmDailyOrdersAboveUsd` ($250,000; absent in frames before 2026-10-23)
   (see `signAndSubmit`). Absent in older frames.
+- `showsAgentApproval` is true when the frame shows its agent approval panel after `createAgent` (see there). Absent
+  in older frames.
 - `status` is the frame's `SignerStatus` at the handshake (see `getStatus`), including the key's expiry state.
 - Errors: `UNSUPPORTED_VERSION`.
 
@@ -298,6 +305,18 @@ Creates a **fresh** key (never reused; the frame refuses an address it has gener
 2. Sign `approveAgent.typedData` with the main wallet (`signTypedData`).
 3. Post `buildExchangeRequest({ network, action: approveAgent.action, nonce: approveAgent.nonce, signature })` to HL `/exchange`.
 4. Call `confirmAgent`.
+
+**Agent approval panel** (2026-10-23, `hello.capabilities.showsAgentApproval`). Right before `createAgent` answers,
+the frame opens its own panel (`promptChanged {visible: true, kind: "agent-approval"}`, the frame's fixed look whatever
+`setTheme` set) showing the new key's **full** `agentAddress` and its check code, the address's first and last 8 hex
+digits in groups of four (`1a2b 3c4d … 5e6f 7a8b`; protocol `agentAddressCheckCode`, which an app showing the code
+must use). It tells the user to approve the wallet's request only if the wallet shows that address, so a request for an
+address the page chose stands out. Keep the iframe visible **beside the wallet's window, never over it** while the
+panel is up (steps 2–4): it asks for nothing, takes no focus and has only a Hide button. It ends
+(`promptChanged {visible: false}`) when `confirmAgent` answers, either way; when the user hides it; when the key is
+replaced or removed; or after `AGENT_APPROVAL_PANEL_MS` (5 minutes). A prompt the frame opens meanwhile takes its place
+and gives it back when it closes (`promptChanged` with that prompt's kind, then `agent-approval` again). Not shown for
+`createLinkedAgent` (the phone shows its matching code instead) or in a frame without a user interface.
 
 - `storageFallbackReason` is set when `passkey` was requested but `device` was used (WebAuthn blocked, no PRF support), or when `device`/`passkey` fell back to `session` (no IndexedDB). Tell the user.
 - With `storageMode: "passkey"`, the frame shows its prompt and waits for a click inside it ([§8](#8-key-storage-and-passkeys)). The response arrives after the ceremony, or with `USER_CANCELLED`/`USER_TIMEOUT` (120 s).
@@ -757,7 +776,7 @@ Allowed variables:
 | `statusChanged` | `SignerStatus` | Key created, confirmed, locked, unlocked, revoked, expired, changed in another tab; limits changed (in this tab or another) |
 | `keyExpiringSoon` | `{ agentAddress, validUntil, msRemaining }` | Once per key per frame load, when it expires within 7 days (right after `hello`, and on a timer). Show the renew banner. Also in `status.expiringSoon` |
 | `keyExpired` | `{ agentAddress, validUntil }` | Once per key per frame load, at `validUntil − 15 s`. The frame refuses to sign from then on. Also in `status.expired` |
-| `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| "vault-deposit" \| "vault-withdraw" \| "limits" \| "order" \| "margin" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true**, whatever the kind (`vault-withdraw` and `margin` since 2026-10-23) |
+| `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| "vault-deposit" \| "vault-withdraw" \| "limits" \| "order" \| "margin" \| "key-remove" \| "agent-approval" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true**, whatever the kind (`vault-withdraw`, `margin`, `key-remove` and `agent-approval` since 2026-10-23). `agent-approval` is the panel shown while the main wallet approves a new key: beside the wallet's window, never over it (see `createAgent`) |
 | `reconnected` (client-side, not sent by the frame) | `HelloResult` | `KokoahSignerClient` re-ran `hello` after the frame reloaded ([§3](#3-the-client)). Re-apply `setLimits` (a no-op when stored) and `setTheme` |
 
 Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event": "promptChanged", "data": { "visible": true, "kind": "passkey-unlock" } }`

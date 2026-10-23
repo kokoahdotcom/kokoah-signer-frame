@@ -37,7 +37,7 @@ describe("HLP deposit", () => {
     expect(text).toContain("Deposit into HLP");
     expect(text).toContain("250 USDC");
     expect(text).toContain("4 days");
-    expect(h.events("promptChanged").at(-1)).toEqual({ visible: true, kind: "vault-deposit" });
+    expect(h.promptEvents().at(-1)).toEqual({ visible: true, kind: "vault-deposit" });
     expect(h.hl.exchangeCalls).toHaveLength(0);
     await h.clickPrompt();
     const r = await pending;
@@ -76,7 +76,7 @@ describe("HLP deposit", () => {
     button.dispatchEvent(new PointerEvent("pointerdown", { ...at(2), button: 0 }));
     button.dispatchEvent(new PointerEvent("pointerup", at(2)));
     await new Promise((r) => setTimeout(r, 200));
-    expect(h.events("promptChanged").at(-1)?.visible).toBe(true);
+    expect(h.promptEvents().at(-1)?.visible).toBe(true);
     expect(h.hl.exchangeCalls).toHaveLength(0);
     await h.clickPrompt();
     expect((await pending).status).toBe("ok");
@@ -183,7 +183,7 @@ describe("vault withdrawal", () => {
     expect(text).toContain("Move 120.5 USDC from vault 0x2222…2222 back into your Hyperliquid account");
     expect(h.root?.querySelector(".ks-prompt")?.classList.contains("ks-prompt--fixed")).toBe(true);
     expect(h.root?.querySelector(".ks-primary")?.classList.contains("ks-hold")).toBe(true);
-    expect(h.events("promptChanged").at(-1)).toEqual({ visible: true, kind: "vault-withdraw" });
+    expect(h.promptEvents().at(-1)).toEqual({ visible: true, kind: "vault-withdraw" });
     expect(h.hl.exchangeCalls).toHaveLength(0);
     await h.clickPrompt();
     expect((await pending).status).toBe("ok");
@@ -224,7 +224,7 @@ describe("turning vault transfers off (allowedActionTypes)", () => {
       const e = await h.fail("signAndSubmit", { requestId: id, intent });
       expect(codes(e)).toEqual(["ACTION_TYPE_NOT_ALLOWED"]);
     }
-    expect(h.events("promptChanged")).toHaveLength(0);
+    expect(h.promptEvents()).toHaveLength(0);
     expect(h.hl.exchangeCalls).toHaveLength(0);
   });
 

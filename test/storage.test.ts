@@ -141,13 +141,13 @@ describe("passkey storage (mocked WebAuthn PRF)", () => {
     const a = await frame({ passkeys });
     await a.ok("hello", { protocolVersion: 1 });
     const pending = a.createAgent({ userAddress: USER, validForDays: 30, storageMode: "passkey" });
-    await waitFor(() => a.events("promptChanged").some((e) => e.visible));
-    expect(a.events("promptChanged")[0]).toEqual({ visible: true, kind: "passkey-create" });
+    await waitFor(() => a.promptEvents().some((e) => e.visible));
+    expect(a.promptEvents()[0]).toEqual({ visible: true, kind: "passkey-create" });
     expect(a.root?.querySelector(".ks-title")?.textContent).toBe("Protect your trading key");
     await a.clickPrompt();
     const created = await pending;
     expect(created.storageMode).toBe("passkey");
-    expect(a.events("promptChanged").at(-1)).toEqual({ visible: false, kind: null });
+    expect(a.promptEvents().at(-1)).toEqual({ visible: false, kind: null });
     expect(passkeys.createCalls).toHaveLength(1);
     expect(passkeys.createCalls[0]?.rpId).toBe("signer.kokoah.example");
     const privateKey = a.generatedKeys.at(-1)!;
@@ -170,7 +170,7 @@ describe("passkey storage (mocked WebAuthn PRF)", () => {
     expect(await b.ok("getStatus")).toMatchObject({ hasKey: true, locked: true, storageMode: "passkey", keyState: "active" });
     expect((await b.fail("signAndSubmit", { requestId: "p1", intent: limitOrder() })).code).toBe("LOCKED");
     const unlocking = b.ok("unlock");
-    await waitFor(() => b.events("promptChanged").some((e) => e.visible && e.kind === "passkey-unlock"));
+    await waitFor(() => b.promptEvents().some((e) => e.visible && e.kind === "passkey-unlock"));
     await b.clickPrompt();
     expect((await unlocking).locked).toBe(false);
     expect(passkeys.getCalls).toHaveLength(1);
@@ -243,7 +243,7 @@ describe("passkey storage (mocked WebAuthn PRF)", () => {
     await a.clickPrompt("cancel");
     const r = await cancelled;
     expect(!r.ok && r.error.code).toBe("USER_CANCELLED");
-    expect(a.events("promptChanged").at(-1)).toEqual({ visible: false, kind: null });
+    expect(a.promptEvents().at(-1)).toEqual({ visible: false, kind: null });
   });
 
   it("times out when the user never clicks", async () => {
@@ -277,7 +277,7 @@ describe("passkey storage (mocked WebAuthn PRF)", () => {
     const r = await a.createAgent({ userAddress: USER, validForDays: 30, storageMode: "passkey" });
     expect(r).toMatchObject({ storageMode: "device", requestedStorageMode: "passkey" });
     expect(r.storageFallbackReason).toMatch(/Permissions-Policy/);
-    expect(a.events("promptChanged")).toHaveLength(0);
+    expect(a.promptEvents()).toHaveLength(0);
 
     const noPrf = new MockPasskeys();
     noPrf.prfEnabled = false;
@@ -307,13 +307,13 @@ describe("passkey storage (mocked WebAuthn PRF)", () => {
     await a.activeAgent("passkey");
     await a.ok("lock");
     const first = a.request("unlock", {});
-    await waitFor(() => a.events("promptChanged").filter((e) => e.visible).length >= 2);
+    await waitFor(() => a.promptEvents().filter((e) => e.visible).length >= 2);
     // A second unlock waits for the first (key operations are serialized), so it doesn't open a second prompt.
     const second = a.request("unlock", {});
     await a.clickPrompt();
     expect((await first).ok).toBe(true);
     expect((await second).ok).toBe(true);
-    expect(a.events("promptChanged").filter((e) => e.visible)).toHaveLength(2);
+    expect(a.promptEvents().filter((e) => e.visible)).toHaveLength(2);
   });
 });
 
@@ -324,7 +324,7 @@ describe("setStorageMode (passkey protection without a new approveAgent)", () =>
     const { address, privateKey } = await a.activeAgent("device");
     const approvals = a.hl.exchangeCalls.length;
     const changing = a.ok("setStorageMode", { to: "passkey" });
-    await waitFor(() => a.events("promptChanged").some((e) => e.visible && e.kind === "passkey-create"));
+    await waitFor(() => a.promptEvents().some((e) => e.visible && e.kind === "passkey-create"));
     await a.clickPrompt();
     const status = await changing;
     expect(status).toMatchObject({ storageMode: "passkey", keyState: "active", locked: false, agentAddress: address });

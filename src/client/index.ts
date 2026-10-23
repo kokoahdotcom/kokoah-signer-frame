@@ -252,7 +252,8 @@ export class KokoahSignerClient {
   /**
    * Creates a fresh named agent key; the main wallet then signs `result.approveAgent.typedData` and the app posts it.
    * Replacing a passkey-protected key with one in another storage mode first waits for the user's confirmation in the
-   * frame's prompt (`promptChanged` kind `key-remove`).
+   * frame's prompt (`promptChanged` kind `key-remove`). Once it answers, the frame shows the new key's address
+   * (`promptChanged` kind `agent-approval`) until `confirmAgent` answers: keep the iframe beside the wallet's window.
    */
   createAgent(params: CreateAgentParams): Promise<CreateAgentResult> {
     return this.request("createAgent", params, params.storageMode === "passkey" ? this.options.interactiveTimeoutMs : undefined);

@@ -51,6 +51,23 @@ export const EXPIRES_AFTER_MS = 15_000;
 /** `confirmAgent.timeoutMs` upper bound. */
 export const MAX_CONFIRM_TIMEOUT_MS = 60_000;
 
+/**
+ * How long the frame's agent approval panel (`promptChanged` kind `agent-approval`, see `CreateAgentResult`) stays up
+ * at most when `confirmAgent` never comes.
+ */
+export const AGENT_APPROVAL_PANEL_MS = 5 * 60 * 1000;
+
+/**
+ * The short check code the agent approval panel shows next to a new key's full address: its first and last 8 hex
+ * digits (lowercase), in groups of four, e.g. `1a2b 3c4d … 5e6f 7a8b`. The user compares it with the `agentAddress`
+ * the main wallet shows; an app that shows the code too must use exactly this.
+ */
+export function agentAddressCheckCode(address: string): string {
+  const hex = address.toLowerCase().replace(/^0x/, "");
+  const fours = (x: string) => x.match(/.{1,4}/g)?.join(" ") ?? x;
+  return `${fours(hex.slice(0, 8))} … ${fours(hex.slice(-8))}`;
+}
+
 /** Every request method. */
 export const METHODS = [
   "hello",
@@ -289,6 +306,11 @@ export interface HelloResult {
      * prompt that showed that total starts it again. Absent in older frames.
      */
     confirmsRecentOrders?: boolean;
+    /**
+     * After `createAgent` the frame shows the new key's address and check code until `confirmAgent` answers
+     * (`promptChanged` kind `agent-approval`; see `CreateAgentResult.approveAgent`). Absent in older frames.
+     */
+    showsAgentApproval?: boolean;
   };
   /**
    * The builder code on every order. `feeTenthsBps` is the standard fee (the most an order pays; the policy's cap).
@@ -346,7 +368,15 @@ export interface CreateAgentResult {
   /** Set when `passkey` was requested but `device` was used. */
   storageFallbackReason?: string;
   keyState: "pending";
-  /** From `@kokoah/shared` `buildApproveAgent`: the main wallet signs `typedData`; the parent posts `action`. */
+  /**
+   * From `@kokoah/shared` `buildApproveAgent`: the main wallet signs `typedData`; the parent posts `action`. While it
+   * does, the frame shows its own panel with `agentAddress` in full and its {@link agentAddressCheckCode}
+   * (`promptChanged` kind `agent-approval`, with `capabilities.showsAgentApproval`, 2026-10-23), so the user can compare
+   * them with the address the wallet shows. Keep the iframe visible beside the wallet's window, never over it: the
+   * panel needs no action and takes no focus. It ends when `confirmAgent` answers (either way), when the user hides
+   * it, when the key is replaced or removed, or after {@link AGENT_APPROVAL_PANEL_MS}; a prompt opened meanwhile takes
+   * its place and gives it back.
+   */
   approveAgent: PreparedUserSignedAction;
 }
 
@@ -659,9 +689,14 @@ export interface EventData {
   keyExpired: { agentAddress: Hex; validUntil: number };
   /**
    * The frame needs (or no longer needs) the user to click inside it. Show the iframe while `visible` is true. Kinds
-   * added later (`vault-withdraw`, `margin`, `key-remove`, 2026-10-23) may appear: show the iframe for any kind.
+   * added later (`vault-withdraw`, `margin`, `key-remove`, `agent-approval`, 2026-10-23) may appear: show the iframe
+   * for any kind. `agent-approval` is the panel shown while the main wallet approves a new key (see
+   * `CreateAgentResult.approveAgent`): place the iframe beside the wallet's window, never over it.
    */
-  promptChanged: { visible: boolean; kind: "passkey-create" | "passkey-unlock" | "vault-deposit" | "vault-withdraw" | "limits" | "order" | "margin" | "key-remove" | null };
+  promptChanged: {
+    visible: boolean;
+    kind: "passkey-create" | "passkey-unlock" | "vault-deposit" | "vault-withdraw" | "limits" | "order" | "margin" | "key-remove" | "agent-approval" | null;
+  };
 }
 
 // ---------------------------------------------------------------------------------------------

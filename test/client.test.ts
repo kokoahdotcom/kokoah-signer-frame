@@ -131,7 +131,7 @@ describe("KokoahSignerClient", () => {
     expect(d).toMatchObject({ code: "LIMIT_LOOSENING_REJECTED", details: { fields: ["priceBandPct"] } });
   });
 
-  it("shows the iframe while the frame shows a passkey prompt, then hides it", async () => {
+  it("shows the iframe while the frame shows a passkey prompt, then the agent approval panel until confirmAgent answers", async () => {
     const { h, client } = await connected({ passkeys: new MockPasskeys() });
     const prompts: unknown[] = [];
     client.on("promptChanged", (p) => prompts.push(p));
@@ -139,11 +139,19 @@ describe("KokoahSignerClient", () => {
     await waitFor(() => !client.iframe.hidden);
     expect(client.iframe.getAttribute("data-kokoah-signer-prompt")).toBe("passkey-create");
     await h.clickPrompt();
-    expect((await creating).storageMode).toBe("passkey");
+    const created = await creating;
+    expect(created.storageMode).toBe("passkey");
+    // While the wallet approves the key, the frame shows its address: the iframe stays up.
+    expect(client.iframe.hidden).toBe(false);
+    expect(client.iframe.getAttribute("data-kokoah-signer-prompt")).toBe("agent-approval");
+    h.hl.approve(USER, created.agentAddress, created.agentName, created.validUntil);
+    await client.confirmAgent({ timeoutMs: 1_000 });
     expect(client.iframe.hidden).toBe(true);
     expect(client.iframe.hasAttribute("data-kokoah-signer-prompt")).toBe(false);
     expect(prompts).toEqual([
       { visible: true, kind: "passkey-create" },
+      { visible: false, kind: null },
+      { visible: true, kind: "agent-approval" },
       { visible: false, kind: null },
     ]);
   });

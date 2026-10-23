@@ -390,6 +390,8 @@ export interface HarnessOptions {
   promptArmMs?: number;
   /** Hold-to-confirm time (default 0 here; test/prompt.test.ts covers the real one). */
   promptHoldMs?: number;
+  /** How long the agent approval panel stays without confirmAgent. */
+  agentApprovalTimeoutMs?: number;
 }
 
 export class FrameHarness {
@@ -451,6 +453,7 @@ export class FrameHarness {
       },
       ...(o.logger ? { logger: o.logger } : {}),
       ...(o.promptTimeoutMs !== undefined ? { promptTimeoutMs: o.promptTimeoutMs } : {}),
+      ...(o.agentApprovalTimeoutMs !== undefined ? { agentApprovalTimeoutMs: o.agentApprovalTimeoutMs } : {}),
       promptArmMs: o.promptArmMs ?? 0,
       promptHoldMs: o.promptHoldMs ?? 0,
       // jsdom can't make trusted events; test/prompt.test.ts covers that untrusted ones never confirm.
@@ -489,6 +492,32 @@ export class FrameHarness {
 
   events<E extends EventName>(name: E): Array<EventData[E]> {
     return this.parent.posted.filter((p) => p.message.kind === "event" && p.message.event === name).map((p) => (p.message as EventMessage<E>).data);
+  }
+
+  /**
+   * The `promptChanged` events of the frame's prompts, without the agent approval panel (`agent-approval`, shown after
+   * `createAgent` until `confirmAgent`; test/approval.test.ts covers it): the panel's own events are dropped, and its
+   * return after a prompt counts as that prompt closing.
+   */
+  promptEvents(): Array<EventData["promptChanged"]> {
+    const out: Array<EventData["promptChanged"]> = [];
+    let panel = false;
+    let prompt = false;
+    for (const e of this.events("promptChanged")) {
+      if (e.visible && e.kind === "agent-approval") {
+        if (prompt) out.push({ visible: false, kind: null });
+        prompt = false;
+        panel = true;
+      } else if (!e.visible) {
+        if (prompt || !panel) out.push(e);
+        else panel = false;
+        prompt = false;
+      } else {
+        prompt = true;
+        out.push(e);
+      }
+    }
+    return out;
   }
 
   /** hello + createAgent + HL approval + confirmAgent. Returns the agent address and its private key. */

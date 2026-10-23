@@ -281,3 +281,51 @@ body {
 .ks-prompt--fixed .ks-button:focus-visible {
   outline-color: #2b2420;
 }
+
+/*
+ * The agent approval notice (prompt.ts showNotice): the new key's address while the main wallet approves it. Always in
+ * the frame's own look, like the fixed prompts, so the parent's theme can't change what it shows; it fits the frame
+ * and the address wraps rather than being cut off.
+ */
+.ks-notice.ks-notice--fixed {
+  display: flex;
+  flex-direction: column;
+  max-height: 100%;
+  overflow-y: auto;
+  background: #fbf4ec;
+  color: #2b2420;
+  border: 2px solid #be3a57;
+  border-radius: 14px;
+  padding: 16px;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 15px;
+}
+.ks-notice--fixed .ks-notice-title {
+  margin: 0 0 0.4em;
+  color: #2b2420;
+  font-size: 17px;
+  font-weight: 600;
+}
+.ks-notice--fixed .ks-notice-body {
+  margin: 0 0 0.6em;
+  color: #4a403a;
+}
+.ks-notice--fixed .ks-notice-line {
+  margin: 0 0 0.4em;
+  color: #2b2420;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+.ks-notice--fixed .ks-notice-close {
+  align-self: flex-start;
+  margin-top: 0.4em;
+  background: #ffffff;
+  border-color: #d9cfc6;
+  border-radius: 12px;
+  color: #2b2420;
+  font-size: 15px;
+}
+.ks-notice--fixed .ks-notice-close:focus-visible {
+  outline-color: #2b2420;
+}
