@@ -5,8 +5,10 @@
  */
 import { MarketRegistry } from "@kokoah/shared/markets";
 import { afterEach, describe, expect, it } from "vitest";
-import { CONFIRM_ORDERS_ABOVE_USD, describeOrders } from "../src/frame/policy.js";
-import { cloid, FrameHarness, limitOrder, META0, subAccountEntry, USER, waitFor, type HarnessOptions } from "./helpers.js";
+import { ConfirmationNeededError, SigningCoordinator } from "../src/frame/nonces.js";
+import { CONFIRM_ORDERS_ABOVE_USD, CONFIRM_UNPROMPTED_ABOVE_USD, describeOrders } from "../src/frame/policy.js";
+import { MemorySignerStore } from "../src/frame/storage.js";
+import { cloid, FakeLocks, FrameHarness, limitOrder, META0, subAccountEntry, USER, waitFor, type HarnessOptions } from "./helpers.js";
 
 let h: FrameHarness;
 afterEach(() => h?.destroy());
@@ -144,6 +146,128 @@ describe("large orders", () => {
     await ready({ withUi: false });
     const e = await h.fail("signAndSubmit", { requestId: "n", intent: btc("0.3") });
     expect(codes(e)).toEqual(["ORDER_NOTIONAL_EXCEEDED"]);
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+  });
+});
+
+describe("many orders without a prompt", () => {
+  /** $24,000 each: under the per-action threshold, four of them stay under $100,000. */
+  const just = (id: string) => h.ok("signAndSubmit", { requestId: id, intent: btc("0.24") });
+
+  it("are announced in the handshake", async () => {
+    h = await FrameHarness.create();
+    const hello = await h.ok("hello", { protocolVersion: 1 });
+    expect(hello.capabilities.confirmsRecentOrders).toBe(true);
+    expect(hello.limits).toMatchObject({ confirmRecentOrdersAboveUsd: 100_000, recentOrdersWindowMs: 600_000 });
+    expect(CONFIRM_UNPROMPTED_ABOVE_USD).toBe(100_000);
+  });
+
+  it("need the user's confirmation once they would pass $100,000 in 10 minutes; then the total starts again", async () => {
+    await ready();
+    for (const id of ["a", "b", "c", "d"]) expect((await just(id)).status).toBe("ok");
+    expect(h.events("promptChanged")).toHaveLength(0);
+    const fifth = just("e");
+    await shown();
+    expect(orderPrompts()).toHaveLength(1);
+    const text = h.promptText();
+    expect(text).toContain("about $24,000 in all. Orders of about $96,000 went out without a confirmation in the last 10 minutes, so this one needs yours.");
+    expect(h.hl.exchangeCalls).toHaveLength(4);
+    await h.clickPrompt();
+    expect((await fifth).status).toBe("ok");
+    // Confirmed: the user is there, so the next ones go out again without a prompt, up to the total.
+    for (const id of ["f", "g", "h", "i"]) expect((await just(id)).status).toBe("ok");
+    expect(orderPrompts()).toHaveLength(1);
+    expect(h.hl.exchangeCalls).toHaveLength(9);
+  });
+
+  it("count reduce-only orders and every account, and forget orders older than 10 minutes", async () => {
+    const sub = "0x5ab0000000000000000000000000000000000001";
+    await ready();
+    h.hl.subAccounts[USER.toLowerCase()] = [subAccountEntry(sub)];
+    await just("a");
+    expect((await h.ok("signAndSubmit", { requestId: "b", intent: btc("0.24", { vaultAddress: sub }) })).status).toBe("ok");
+    expect((await h.ok("signAndSubmit", { requestId: "c", intent: btc("0.24", { side: "sell", reduceOnly: true }) })).status).toBe("ok");
+    h.clock.advance(5 * 60_000);
+    await just("d");
+    // $96,000 so far: the next one asks...
+    const asks = h.fail("signAndSubmit", { requestId: "e", intent: btc("0.05") });
+    await shown();
+    await h.clickPrompt("cancel");
+    expect((await asks).code).toBe("USER_CANCELLED");
+    expect(h.hl.exchangeCalls).toHaveLength(4);
+    // ...until the first three are more than 10 minutes old.
+    h.clock.advance(5 * 60_000 + 1);
+    expect((await h.ok("signAndSubmit", { requestId: "f", intent: btc("0.24") })).status).toBe("ok");
+    expect(orderPrompts()).toHaveLength(1);
+  });
+
+  it("are counted across tabs and reloads of the frame", async () => {
+    const locks = new FakeLocks();
+    await ready({ locks });
+    for (const id of ["a", "b", "c"]) await just(id);
+    const other = await FrameHarness.create({ idb: h.idb, locks, clock: h.clock, hl: h.hl });
+    try {
+      await other.ok("hello", { protocolVersion: 1 });
+      expect((await other.ok("signAndSubmit", { requestId: "d", intent: btc("0.24") })).status).toBe("ok");
+      const asks = other.fail("signAndSubmit", { requestId: "e", intent: btc("0.24") });
+      await waitFor(() => other.promptText().includes("$96,000"));
+      await other.clickPrompt("cancel");
+      expect((await asks).code).toBe("USER_CANCELLED");
+    } finally {
+      other.destroy();
+    }
+  });
+
+  it("are refused in a frame without a user interface once they would pass the total", async () => {
+    await ready({ withUi: false });
+    for (const id of ["a", "b", "c", "d"]) await just(id);
+    const e = await h.fail("signAndSubmit", { requestId: "e", intent: btc("0.24") });
+    expect(codes(e)).toEqual(["ORDER_NOTIONAL_EXCEEDED"]);
+    expect(e.details?.violations?.[0]?.message).toContain("$96,000 so far");
+    expect(h.hl.exchangeCalls).toHaveLength(4);
+  });
+
+  it("are checked again when the nonce is reserved, so another tab's orders in between can't slip past it", async () => {
+    const coordinator = new SigningCoordinator({ store: new MemorySignerStore(), locks: undefined, lockPrefix: "t" });
+    const key = { key: "account/testnet/0xabc", legacy: "0xagent" };
+    const order = (usd: number, confirmed = false) => coordinator.reserve(key, { now: 1_000_000, orders: 1, notionalUsd: usd, unprompted: { usd, confirmed, maxUsd: 100_000 } });
+    await order(60_000);
+    await expect(order(50_000)).rejects.toBeInstanceOf(ConfirmationNeededError);
+    expect((await coordinator.usage(key, 1_000_000)).unpromptedUsd).toBe(60_000);
+    await order(50_000, true);
+    expect((await coordinator.usage(key, 1_000_000)).unpromptedUsd).toBe(0);
+  });
+});
+
+describe("taking margin out of an isolated position", () => {
+  const out = (amountUsd: string, o: Record<string, unknown> = {}) => ({ kind: "updateIsolatedMargin", coin: "BTC", amountUsd, origin: "manual", ...o });
+
+  it("asks first, saying how much and that it moves the position toward liquidation", async () => {
+    await ready();
+    const pending = h.ok("signAndSubmit", { requestId: "m", intent: out("-250.5") });
+    await shown();
+    expect(h.events("promptChanged").at(-1)).toEqual({ visible: true, kind: "margin" });
+    expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Take margin out of this position?");
+    expect(h.promptText()).toContain("take $250.5 of margin out of the isolated BTC position. This moves the position closer to liquidation.");
+    expect(h.root?.querySelector(".ks-prompt")?.classList.contains("ks-prompt--fixed")).toBe(true);
+    expect(h.root?.querySelector(".ks-primary")?.classList.contains("ks-hold")).toBe(true);
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    await h.clickPrompt();
+    expect((await pending).status).toBe("ok");
+    expect(h.hl.exchangeCalls[0]!.body.action).toMatchObject({ type: "updateIsolatedMargin", asset: 0, ntli: -250_500_000 });
+  });
+
+  it("signs nothing when cancelled, adds margin without asking, and refuses without a user interface", async () => {
+    await ready();
+    const pending = h.fail("signAndSubmit", { requestId: "m", intent: out("-5") });
+    await shown();
+    await h.clickPrompt("cancel");
+    expect(await pending).toMatchObject({ code: "USER_CANCELLED", details: { prompt: "margin" } });
+    expect((await h.ok("signAndSubmit", { requestId: "add", intent: out("5") })).status).toBe("ok");
+    expect(h.events("promptChanged").filter((e) => e.visible)).toHaveLength(1);
+    h.destroy();
+    await ready({ withUi: false });
+    expect(codes(await h.fail("signAndSubmit", { requestId: "n", intent: out("-5") }))).toEqual(["ACTION_TYPE_NOT_ALLOWED"]);
     expect(h.hl.exchangeCalls).toHaveLength(0);
   });
 });

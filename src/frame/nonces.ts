@@ -10,8 +10,10 @@
  * - **Formula**: `@kokoah/shared` `MonotonicNonceManager`: `max(now + clockOffset, last + 1)`, where `last` is the
  *   persisted value and the clock offset comes from HL `exchangeStatus` server time.
  *
- * The same record tracks per-minute order counts, today's notional and the last few minutes of HLP deposits, so
- * reloading the frame or using another tab does not reset the rate limit or the HLP cap.
+ * The same record tracks per-minute order counts, today's notional, the last few minutes of HLP deposits and the last
+ * minutes of orders signed without a prompt, so reloading the frame or using another tab does not reset the rate
+ * limit, the HLP cap or the prompt. It is kept per master account ({@link UsageKey}), so a new key for the same
+ * account (one the parent made the frame create) doesn't reset them either.
  *
  * @module
  */
@@ -46,6 +48,30 @@ const MINUTE = 60_000;
  * a deposit by a few seconds (counted twice for a moment: stricter).
  */
 export const HLP_DEPOSIT_RECENT_MS = 5 * MINUTE;
+
+/** How long an order signed without the user's confirmation counts toward the prompt's rolling total. */
+export const UNPROMPTED_WINDOW_MS = 10 * MINUTE;
+
+/**
+ * Where usage is kept: `key` (the master account's record), and `legacy`, the agent's own record from before records
+ * were per account, read in its place until the account's exists. A plain string is one key with no legacy one.
+ */
+export type UsageKey = string | { key: string; legacy?: string };
+
+function keysOf(k: UsageKey): { key: string; legacy?: string } {
+  return typeof k === "string" ? { key: k } : k;
+}
+
+/**
+ * `reserve` for orders that would pass the rolling total of orders signed without a prompt, which another tab
+ * signed in between: nothing was reserved or signed (send the request again; it then asks).
+ */
+export class ConfirmationNeededError extends Error {
+  constructor(message = "Other orders were signed in the meantime; send this one again to confirm it in the signer window.") {
+    super(message);
+    this.name = "ConfirmationNeededError";
+  }
+}
 
 /** A limit the reservation found exceeded (checked again inside the storage transaction; see {@link SigningCoordinator.reserve}). */
 export class UsageLimitError extends Error {
@@ -83,6 +109,8 @@ export interface Usage {
   dailyNotionalUsedUsd: number;
   /** Notional signed today for the account asked about (the master when none was given). */
   accountDailyNotionalUsd: number;
+  /** Notional of the orders signed without a prompt in the last {@link UNPROMPTED_WINDOW_MS}, across every account. */
+  unpromptedUsd: number;
 }
 
 /** Which account a usage question or reservation is about. */
@@ -142,19 +170,25 @@ export class SigningCoordinator {
     return await this.withLocalMutex(name, fn);
   }
 
+  /** The persisted record (the legacy one while the account has none). */
+  private async read(k: UsageKey): Promise<UsageRecord | undefined> {
+    const { key, legacy } = keysOf(k);
+    return (await this.store.readUsage(key)) ?? (legacy !== undefined ? await this.store.readUsage(legacy) : undefined);
+  }
+
   /** Orders in the last minute and notional used today (corrected clock), from the persisted record. */
-  async usage(agent: string, now: number, account?: UsageAccount): Promise<Usage> {
-    return usageOf(await this.store.readUsage(agent), now, account);
+  async usage(agent: UsageKey, now: number, account?: UsageAccount): Promise<Usage> {
+    return usageOf(await this.read(agent), now, account);
   }
 
-  /** Whether this agent already signed `setReferrer` (persisted, so a reload or another tab doesn't reset it). */
-  async referrerSigned(agent: string): Promise<boolean> {
-    return typeof (await this.store.readUsage(agent))?.referrerSignedAt === "number";
+  /** Whether `setReferrer` was signed already (persisted, so a reload or another tab doesn't reset it). */
+  async referrerSigned(agent: UsageKey): Promise<boolean> {
+    return typeof (await this.read(agent))?.referrerSignedAt === "number";
   }
 
-  /** HLP deposits (USD) this agent signed for `master` in the last {@link HLP_DEPOSIT_RECENT_MS}, in any tab. */
-  async recentHlpDepositsUsd(agent: string, master: string, now: number): Promise<number> {
-    return recentHlpDepositsUsd(await this.store.readUsage(agent), master, now);
+  /** HLP deposits (USD) signed for `master` in the last {@link HLP_DEPOSIT_RECENT_MS}, in any tab. */
+  async recentHlpDepositsUsd(agent: UsageKey, master: string, now: number): Promise<number> {
+    return recentHlpDepositsUsd(await this.read(agent), master, now);
   }
 
   /**
@@ -164,10 +198,13 @@ export class SigningCoordinator {
    * `hlpDeposit`: this action is an HLP deposit of `usd` for `master`; it is recorded in the same transaction, which
    * fails with VAULT_DEPOSIT_LIMIT when the recent deposits are more than the `countedUsd` the caller's cap check counted
    * (another tab deposited in between; with Web Locks it can't).
+   * `unprompted`: the orders' notional in all and whether the user confirmed them in the frame's prompt: confirmed
+   * clears the rolling record of orders signed without a prompt; otherwise they join it, and the reservation fails with
+   * {@link ConfirmationNeededError} when that would pass `maxUsd` (another tab signed in between).
    * Throws if the nonce would fall outside HL's accepted window.
    */
   async reserve(
-    agent: string,
+    agent: UsageKey,
     params: {
       now: number;
       orders: number;
@@ -176,12 +213,17 @@ export class SigningCoordinator {
       referrer?: boolean;
       limits?: ReserveLimits;
       hlpDeposit?: { master: string; usd: number; countedUsd: number };
+      unprompted?: { usd: number; confirmed: boolean; maxUsd: number };
     },
   ): Promise<number> {
     const now = Math.floor(params.now);
+    const { key, legacy } = keysOf(agent);
+    // The agent's own record from before, standing in until the account's exists (its nonce, counters and referrer).
+    const before = legacy !== undefined ? await this.store.readUsage(legacy) : undefined;
     let already = false;
-    let exceeded: UsageLimitError | undefined;
-    const record = await this.store.updateUsage(agent, (prev) => {
+    let exceeded: UsageLimitError | ConfirmationNeededError | undefined;
+    const record = await this.store.updateUsage(key, (stored) => {
+      const prev = stored ?? before;
       if (params.referrer && typeof prev?.referrerSignedAt === "number") {
         already = true;
         // Unchanged: nothing is reserved.
@@ -189,9 +231,12 @@ export class SigningCoordinator {
       }
       // The limits again, in the same transaction that records this action: tabs without a shared lock (no Web Locks)
       // can't both pass on the same usage.
-      exceeded = (params.limits ? limitProblem(usageOf(prev, now, params.account), params) : undefined) ?? hlpDepositProblem(prev, now, params.hlpDeposit);
-      if (exceeded) return prev ?? { agent: agent.toLowerCase(), lastNonce: 0, orderTimes: [], day: utcDay(now), dayNotionalUsd: 0 };
-      const next = nextUsage(agent, prev, now, params.orders, params.notionalUsd, params.account, params.hlpDeposit);
+      exceeded =
+        (params.limits ? limitProblem(usageOf(prev, now, params.account), params) : undefined) ??
+        hlpDepositProblem(prev, now, params.hlpDeposit) ??
+        unpromptedProblem(prev, now, params.unprompted);
+      if (exceeded) return prev ?? { agent: key.toLowerCase(), lastNonce: 0, orderTimes: [], day: utcDay(now), dayNotionalUsd: 0 };
+      const next = nextUsage(key, prev, now, params.orders, params.notionalUsd, params.account, params.hlpDeposit, params.unprompted);
       if (params.referrer) next.referrerSignedAt = now;
       return next;
     });
@@ -233,7 +278,7 @@ export class SigningCoordinator {
 
 /** Usage counters of a record at `now`. Without `account`, the account figure is the master's. */
 export function usageOf(record: UsageRecord | undefined, now: number, account?: UsageAccount): Usage {
-  if (!record) return { ordersInLastMinute: 0, actionsInLastMinute: 0, dailyNotionalUsedUsd: 0, accountDailyNotionalUsd: 0 };
+  if (!record) return { ordersInLastMinute: 0, actionsInLastMinute: 0, dailyNotionalUsedUsd: 0, accountDailyNotionalUsd: 0, unpromptedUsd: 0 };
   const today = record.day === utcDay(now);
   const inLastMinute = (t: number) => t > now - MINUTE && t <= now + MINUTE;
   return {
@@ -241,7 +286,19 @@ export function usageOf(record: UsageRecord | undefined, now: number, account?: 
     actionsInLastMinute: (record.actionTimes ?? []).filter(inLastMinute).length,
     dailyNotionalUsedUsd: today ? record.dayNotionalUsd : 0,
     accountDailyNotionalUsd: today ? accountNotional(record, account) : 0,
+    unpromptedUsd: recentUnprompted(record, now).reduce((sum, o) => sum + o.usd, 0),
   };
+}
+
+/** The record's orders signed without a prompt in the last {@link UNPROMPTED_WINDOW_MS} before `now`. */
+function recentUnprompted(record: UsageRecord | undefined, now: number): Array<{ at: number; usd: number }> {
+  return (record?.unprompted ?? []).filter((o) => o.at > now - UNPROMPTED_WINDOW_MS && o.at <= now + MINUTE && Number.isFinite(o.usd) && o.usd > 0);
+}
+
+/** Unconfirmed orders that would pass the rolling total another tab's orders left (see `reserve`). */
+function unpromptedProblem(prev: UsageRecord | undefined, now: number, p: { usd: number; confirmed: boolean; maxUsd: number } | undefined): ConfirmationNeededError | undefined {
+  if (!p || p.confirmed || !(p.usd > 0)) return undefined;
+  return usageOf(prev, now).unpromptedUsd + p.usd > p.maxUsd ? new ConfirmationNeededError() : undefined;
 }
 
 function accountNotional(record: UsageRecord, account: UsageAccount | undefined): number {
@@ -286,7 +343,10 @@ function limitProblem(usage: Usage, p: { orders: number; notionalUsd: number; li
   return undefined;
 }
 
-/** Pure update of the usage record (runs inside the IndexedDB transaction). `hlpDeposit`: this action deposits into HLP. */
+/**
+ * Pure update of the usage record (runs inside the IndexedDB transaction). `hlpDeposit`: this action deposits into HLP.
+ * `unprompted`: its orders' notional, and whether the user confirmed them (which clears the record of unconfirmed ones).
+ */
 export function nextUsage(
   agent: string,
   prev: UsageRecord | undefined,
@@ -295,6 +355,7 @@ export function nextUsage(
   notionalUsd: number,
   account?: UsageAccount,
   hlpDeposit?: { master: string; usd: number },
+  unprompted?: { usd: number; confirmed: boolean },
 ): UsageRecord {
   const mgr = new MonotonicNonceManager({ now: () => now });
   const last = prev?.lastNonce;
@@ -315,6 +376,9 @@ export function nextUsage(
   const deposits = (prev?.hlpDeposits ?? []).filter((d) => d.at > now - HLP_DEPOSIT_RECENT_MS);
   if (hlpDeposit) deposits.push({ master: hlpDeposit.master.toLowerCase(), at: now, usd: hlpDeposit.usd });
   if (deposits.length > 0) record.hlpDeposits = deposits;
+  const unconfirmed = unprompted?.confirmed === true ? [] : recentUnprompted(prev, now);
+  if (unprompted !== undefined && !unprompted.confirmed && unprompted.usd > 0 && Number.isFinite(unprompted.usd)) unconfirmed.push({ at: now, usd: unprompted.usd });
+  if (unconfirmed.length > 0) record.unprompted = unconfirmed.slice(-10_000);
   if (account !== undefined || prev?.accountNotionalUsd !== undefined) {
     const byAccount: Record<string, number> = {};
     if (sameDay) {

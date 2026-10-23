@@ -301,7 +301,7 @@ describe("usage records per account", () => {
     const b = nextUsage("0xa", a, T0 + 1, 1, 30, sub);
     expect(b.dayNotionalUsd).toBe(130);
     expect(b.accountNotionalUsd).toEqual({ [USER.toLowerCase()]: 100, [SUB]: 30 });
-    expect(usageOf(b, T0 + 2, sub)).toEqual({ ordersInLastMinute: 2, actionsInLastMinute: 2, dailyNotionalUsedUsd: 130, accountDailyNotionalUsd: 30 });
+    expect(usageOf(b, T0 + 2, sub)).toEqual({ ordersInLastMinute: 2, actionsInLastMinute: 2, dailyNotionalUsedUsd: 130, accountDailyNotionalUsd: 30, unpromptedUsd: 0 });
     // A sub-account without limits of its own shares the master's counter; one with its own keeps its own.
     expect(usageOf(b, T0 + 2, { ...sub, separate: [] }).accountDailyNotionalUsd).toBe(130);
     expect(usageOf(b, T0 + 2, { ...master, separate: [] }).accountDailyNotionalUsd).toBe(130);

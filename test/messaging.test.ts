@@ -157,7 +157,7 @@ describe("hello and status", () => {
     await h.ok("hello", { protocolVersion: 1 });
     const s = await h.ok("getStatus");
     expect(s.policy).toEqual({
-      allowedActionTypes: ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop", "startFeeTrial"],
+      allowedActionTypes: ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop", "startFeeTrial", "vaultTransfer"],
       allowedCoins: "*",
       maxOrderNotionalUsd: 250_000,
       maxDailyNotionalUsd: 25_000_000,

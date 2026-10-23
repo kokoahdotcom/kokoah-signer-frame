@@ -69,6 +69,23 @@ export const BASELINE_LIMITS = Object.freeze({
   allowedOrigins: ["manual", "ai_ticket"] as Array<"manual" | "ai_ticket">,
 });
 
+/**
+ * Frame action types the shared policy has no place for: vault transfers are the one fund movement a trading key may
+ * make, checked on their own rules (`evaluateFrameAccountPolicy`); the shared policy hard-denies them everywhere else.
+ * They stay in the user's limits (`allowedActionTypes`) and are left out of the shared `Policy` built from them.
+ */
+export const FRAME_ONLY_ACTION_TYPES: readonly AllowedActionType[] = Object.freeze(["vaultTransfer"]);
+
+/** The shared policy's part of a list of frame action types. */
+function sharedActionTypes(types: readonly AllowedActionType[]): Policy["allowedActionTypes"] {
+  return types.filter((t) => !FRAME_ONLY_ACTION_TYPES.includes(t)) as Policy["allowedActionTypes"];
+}
+
+/** Whether limits (the master's) leave vault transfers on: without `allowedActionTypes`, every baseline type is. */
+export function vaultTransfersAllowed(limits: UserLimits | null): boolean {
+  return limits?.allowedActionTypes === undefined || limits.allowedActionTypes.includes("vaultTransfer");
+}
+
 /** The builder every order must carry. */
 export interface BuilderSetting {
   address: `0x${string}`;
@@ -88,7 +105,7 @@ export function createBaselinePolicy(builder: BuilderSetting, extras: BaselineEx
   return createManualTradingPolicy({
     builder: { b: builder.address.toLowerCase() as `0x${string}`, f: builder.feeTenthsBps },
     overrides: {
-      allowedActionTypes: [...BASELINE_LIMITS.allowedActionTypes],
+      allowedActionTypes: sharedActionTypes(BASELINE_LIMITS.allowedActionTypes),
       allowedCoins: "*",
       maxOrderNotionalUsd: BASELINE_LIMITS.maxOrderNotionalUsd,
       maxDailyNotionalUsd: BASELINE_LIMITS.maxDailyNotionalUsd,
@@ -133,11 +150,14 @@ export function applyUserLimits(baseline: Policy, limits: UserLimits, spot: { tr
     if (!limits.allowedCoins.every((c) => base.includes(c))) loosening.push("allowedCoins");
   }
   if (limits.requireStopLossForNewEntries === false && baseline.requireStopLossForNewEntries) loosening.push("requireStopLossForNewEntries");
-  if (limits.allowedActionTypes !== undefined && !limits.allowedActionTypes.every((t) => (baseline.allowedActionTypes as readonly string[]).includes(t))) {
+  if (limits.allowedActionTypes !== undefined && !limits.allowedActionTypes.every((t) => frameActionTypes(baseline).includes(t))) {
     loosening.push("allowedActionTypes");
   }
   if (loosening.length > 0) {
     return { ok: false, fields: loosening, message: `setLimits may only tighten the frame's baseline policy; these fields would loosen it: ${loosening.join(", ")}` };
+  }
+  if (limits.allowedActionTypes !== undefined && sharedActionTypes(limits.allowedActionTypes).length === 0) {
+    return { ok: false, fields: ["allowedActionTypes"], message: "allowedActionTypes must keep at least one action besides vaultTransfer" };
   }
   const cleaned: UserLimits = {};
   if (limits.maxOrderNotionalUsd !== undefined) cleaned.maxOrderNotionalUsd = limits.maxOrderNotionalUsd;
@@ -157,12 +177,18 @@ export function applyUserLimits(baseline: Policy, limits: UserLimits, spot: { tr
  * keeps the policy's value.
  */
 function withLimits(policy: Policy, limits: UserLimits, tradingCoins: readonly string[]): Policy {
-  const { spotTrading, ...policyLimits } = limits;
+  const { spotTrading, allowedActionTypes, ...policyLimits } = limits;
   return parsePolicy({
     ...policy,
     ...policyLimits,
+    ...(allowedActionTypes !== undefined ? { allowedActionTypes: sharedActionTypes(allowedActionTypes) } : {}),
     ...(spotTrading ? { allowedSpotCoins: [...new Set([...(policy.allowedSpotCoins ?? []), ...tradingCoins])], spotTrading: true } : {}),
   });
+}
+
+/** Every action type `baseline` allows, the frame's own ones included. */
+function frameActionTypes(baseline: Policy): readonly string[] {
+  return [...baseline.allowedActionTypes, ...FRAME_ONLY_ACTION_TYPES];
 }
 
 /** Most sub-accounts with their own limits a frame keeps (HL allows 50 per master). */
@@ -291,7 +317,7 @@ export function limitChanges(baseline: Policy, before: LimitsSet, after: LimitsS
     if (looser || tighter) add(field, label, show(from), show(to), looser);
   };
   set("allowedCoins", "Markets", "*");
-  set("allowedActionTypes", "Allowed actions", baseline.allowedActionTypes);
+  set("allowedActionTypes", "Allowed actions", frameActionTypes(baseline));
   const stopBefore = b.requireStopLossForNewEntries === true || baseline.requireStopLossForNewEntries;
   const stopAfter = a.requireStopLossForNewEntries === true || baseline.requireStopLossForNewEntries;
   add("requireStopLossForNewEntries", "Stop-loss on new positions", stopBefore ? "required" : "not required", stopAfter ? "required" : "not required", stopBefore && !stopAfter);
@@ -309,7 +335,7 @@ export function summarizeFramePolicy(
   const builder = policy.requiredBuilder;
   if (!builder) throw new Error("The frame policy always requires a builder");
   return {
-    allowedActionTypes: [...policy.allowedActionTypes] as AllowedActionType[],
+    allowedActionTypes: [...policy.allowedActionTypes, ...(vaultTransfersAllowed(userLimits) ? FRAME_ONLY_ACTION_TYPES : [])] as AllowedActionType[],
     allowedCoins: policy.allowedCoins === "*" ? "*" : [...policy.allowedCoins],
     maxOrderNotionalUsd: policy.maxOrderNotionalUsd,
     maxDailyNotionalUsd: policy.maxDailyNotionalUsd,
@@ -454,6 +480,14 @@ export function actionNotionalUsd(action: Record<string, unknown>, registry: Mar
  */
 export const CONFIRM_ORDERS_ABOVE_USD = 25_000;
 
+/**
+ * Orders the frame signed without a prompt count toward a rolling total over `UNPROMPTED_WINDOW_MS` (10 minutes,
+ * nonces.ts; counted as {@link describeOrders} counts them, across every account): orders that would take it above
+ * this need the same confirmation, so many orders just under {@link CONFIRM_ORDERS_ABOVE_USD} can't add up unseen. A
+ * confirmed prompt starts the total again.
+ */
+export const CONFIRM_UNPROMPTED_ABOVE_USD = 100_000;
+
 /** The orders of an action in plain words for the frame's prompt, and their notional in all. */
 export interface OrdersDescription {
   /** One line per order, e.g. `Buy 0.3 BTC at $100,000 (limit) · about $30,000`. */
@@ -463,7 +497,7 @@ export interface OrdersDescription {
 }
 
 /** Market names come from Hyperliquid (a HIP-3 deployer chooses its own): anything but printable ASCII shows as `?`. */
-function printable(x: string): string {
+export function printable(x: string): string {
   return x.replace(/[^\x20-\x7e]/g, "?");
 }
 
@@ -664,6 +698,8 @@ export interface FrameAccountPolicyInput {
    * from) and the frame's network. Missing facts deny.
    */
   vault?: { network: "mainnet" | "testnet"; hlpDepositedLast24hUsd?: number; heldEquityUsd?: number };
+  /** `vaultTransfer` only: whether the master's limits leave vault transfers on ({@link vaultTransfersAllowed}). */
+  vaultTransfersAllowed?: boolean;
 }
 
 /**
@@ -683,6 +719,7 @@ export function evaluateFrameAccountPolicy(input: FrameAccountPolicyInput): Fram
   if (wireAction.type === "vaultTransfer") {
     const kind = input.compiled.intent.kind;
     if (kind !== "hlpDeposit" && kind !== "vaultWithdraw") add({ code: "VAULT_ACTION_DENIED", message: "Vault transfers come only from an HLP deposit or a vault withdrawal." });
+    if (input.vaultTransfersAllowed !== true) add({ code: "ACTION_TYPE_NOT_ALLOWED", message: 'Vault deposits and withdrawals ("vaultTransfer") are not allowed by your limits.' });
     const window = input.policy.maxExpiresAfterWindowMs ?? BASELINE_LIMITS.maxExpiresAfterWindowMs;
     if (input.expiresAfter <= input.now) add({ code: "EXPIRES_AFTER_IN_PAST", message: "expiresAfter is already in the past." });
     else if (input.expiresAfter - input.now > window) add({ code: "EXPIRES_AFTER_TOO_FAR", message: `expiresAfter is more than ${window} ms in the future.` });

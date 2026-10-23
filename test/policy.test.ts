@@ -244,7 +244,7 @@ describe("setLimits", () => {
     expect(e.details?.fields).toEqual(["maxOrderNotionalUsd", "maxDailyNotionalUsd", "maxOrdersPerMinute", "priceBandPct"]);
     expect((await h.ok("getStatus")).policy.maxOrdersPerMinute).toBe(10);
     // Action types outside the baseline can't even be expressed.
-    expect((await h.fail("setLimits", { allowedActionTypes: ["order", "vaultTransfer"] })).code).toBe("INVALID_REQUEST");
+    expect((await h.fail("setLimits", { allowedActionTypes: ["order", "withdraw3"] })).code).toBe("INVALID_REQUEST");
   });
 
   it("refuses an account's limits while there is no key (no master to tell a sub-account from)", async () => {
