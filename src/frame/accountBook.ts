@@ -15,8 +15,8 @@ import type { AccountBook, AccountOrder, AccountPosition } from "@kokoah/shared/
 /** Most orders an action names outside the books read that are looked up one by one. */
 export const MAX_ORDER_LOOKUPS = 10;
 
-/** An order as the frame reads it: also whether a trigger executes at market, and its limit price. */
-export type BookOrder = AccountOrder & { isMarket?: boolean; limitPrice?: number };
+/** An order as the frame reads it: also whether a trigger executes at market, and its limit price (always set). */
+export type BookOrder = AccountOrder & { isMarket: boolean; limitPrice: number | undefined };
 
 /** The book as the frame reads it, with the orders it named that can't be a stop-loss (`notStops`). */
 export type FrameAccountBook = AccountBook & { orders: BookOrder[]; notStops?: Array<number | string> };
@@ -36,8 +36,14 @@ const TRIGGER_TYPES: Readonly<Record<string, { tpsl: "tp" | "sl"; isMarket: bool
   "Take Profit Market": { tpsl: "tp", isMarket: true },
   "Take Profit Limit": { tpsl: "tp", isMarket: false },
 };
-/** `orderStatus` statuses of an order still on the book (a triggered limit may rest); every other one is closed. */
-const OPEN_STATUSES: ReadonlySet<string> = new Set(["open", "triggered"]);
+/**
+ * Whether an `orderStatus` status is final (the order is off the book): `filled`, `canceled`, `rejected`,
+ * `scheduledCancel`, and the `…Canceled` / `…Rejected` family. Any other status, a new one included, counts as open,
+ * so an order the frame can't place is never taken for a closed one.
+ */
+export function isFinalOrderStatus(status: string): boolean {
+  return status === "filled" || status === "canceled" || status === "rejected" || status === "scheduledCancel" || /^[a-z][A-Za-z]*(Canceled|Rejected)$/.test(status);
+}
 
 const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
 
@@ -65,7 +71,8 @@ function order(o: unknown): BookOrder {
     isBuy: o.side === "B",
     size: num(o.sz, "order size"),
     isTrigger: o.isTrigger,
-    ...(trigger !== null ? { triggerPrice: num(o.triggerPx, "trigger price"), tpsl: trigger.tpsl, isMarket: trigger.isMarket } : {}),
+    ...(trigger !== null ? { triggerPrice: num(o.triggerPx, "trigger price"), tpsl: trigger.tpsl } : {}),
+    isMarket: trigger?.isMarket ?? false,
     limitPrice: num(o.limitPx, "limit price"),
     reduceOnly: o.reduceOnly,
     positionTpsl: o.isPositionTpsl,
@@ -91,7 +98,7 @@ function orderState(r: unknown, ref: number | string): { open: boolean; mayBeSto
   const parsed = parseCoin(o.coin);
   // A name the frame can't read might be a perp's.
   const perp = parsed === null || parsed.kind === "perp" || parsed.kind === "hip3";
-  return { open: OPEN_STATUSES.has(r.order.status), mayBeStop: perp && o.isTrigger && o.tpsl === "sl" && (o.reduceOnly || o.positionTpsl) };
+  return { open: !isFinalOrderStatus(r.order.status), mayBeStop: perp && o.isTrigger && o.tpsl === "sl" && (o.reduceOnly || o.positionTpsl) };
 }
 
 /** Reads the book of `account` for `intent` (see the module notes) with `info` (the frame's own `POST /info`). */

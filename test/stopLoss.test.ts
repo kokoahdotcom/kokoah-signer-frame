@@ -131,6 +131,15 @@ describe("readAccountBook", () => {
     expect(book.notStops).toHaveLength(MAX_ORDER_LOOKUPS);
   });
 
+  it("takes only a final status for closed: an unknown one is open", async () => {
+    const said = (status: string) => ({ status: "order", order: { order: openOrder({ oid: 6 }), status, statusTimestamp: 0 } });
+    const one = { ...intent, cancels: [{ coin: "BTC", oid: 6 }] };
+    for (const [status, closed] of [["marginCanceled", true], ["tickRejected", true], ["filled", true], ["triggered", false], ["somethingNew", false]] as const) {
+      const book = await readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [], orderStatus: said(status) }), ACCOUNT, one);
+      expect(book.notStops, status).toEqual(closed ? [6] : undefined);
+    }
+  });
+
   it("fails closed on anything it can't read or trust", async () => {
     for (const answers of [
       { clearinghouseState: state, frontendOpenOrders: [openOrder({ orderType: "Trailing Stop" })] },
