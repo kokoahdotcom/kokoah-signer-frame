@@ -42,7 +42,7 @@
   "dependencies": {
     "@kokoah/shared": "link:../kokoah-shared",
     "valibot": "1.5.0",
-    "viem": "2.56.9"
+    "viem": "2.57.4"
   },
   "devDependencies": {
     "@types/node": "24.13.6",
