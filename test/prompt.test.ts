@@ -142,6 +142,7 @@ describe("prompt arming", () => {
       expect(primary.disabled).toBe(true);
       primary.click();
       vi.advanceTimersByTime(799);
+      // The frame forgot the pointer: these moves are the first it sees again, and count from 800 ms on.
       move(primary, 12);
       move(primary, 13);
       primary.click();
@@ -149,8 +150,11 @@ describe("prompt arming", () => {
       vi.advanceTimersByTime(1);
       expect(primary.disabled).toBe(false);
       primary.click();
-      expect(action).not.toHaveBeenCalled();
       move(primary, 14);
+      primary.click();
+      expect(action).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(799);
+      move(primary, 15);
       primary.click();
       await expect(result).resolves.toBe("ok");
     });
@@ -654,6 +658,38 @@ describe("prompt arming", () => {
       touch.primary.dispatchEvent(new PointerEvent("pointerdown", { ...at(10, 20, "touch"), button: 0 }));
       touch.primary.click();
       await expect(tapResult).resolves.toBe("ok");
+    });
+  });
+  describe("the pointer leaving the frame", () => {
+    it("forgets where the pointer was once it leaves, so the next entry waits the delay again", async () => {
+      const { ui, primary } = setup();
+      const action = vi.fn(async () => "ok");
+      const result = ui.run(REQ, action, () => ({ retry: false }));
+      move(primary, 9);
+      vi.advanceTimersByTime(800);
+      // Out of the frame's document; the parent moves the frame so the button meets the pointer, which comes back.
+      document.dispatchEvent(new PointerEvent("pointerout", { ...at(10), relatedTarget: null }));
+      primary.dispatchEvent(new PointerEvent("pointerover", { ...at(300), clientX: 20 }));
+      move(primary, 301);
+      primary.click();
+      expect(action).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(800);
+      move(primary, 302);
+      primary.click();
+      await expect(result).resolves.toBe("ok");
+    });
+
+    it("starts over when a mouse's move on screen and in the frame differ by much more than the zoom explains", () => {
+      const { ui, primary } = setup();
+      void ui.run(REQ, async () => "ok", () => ({ retry: false })).catch(() => {});
+      move(primary, 9);
+      vi.advanceTimersByTime(800);
+      // 20 px on screen, 20 in the frame: the zoom is 1.
+      primary.dispatchEvent(new PointerEvent("pointermove", { ...at(29), clientX: 29 }));
+      expect(primary.disabled).toBe(false);
+      // 20 px on screen but 50 in the frame, the same way: the frame moved against the pointer.
+      primary.dispatchEvent(new PointerEvent("pointermove", { ...at(49), clientX: 79 }));
+      expect(primary.disabled).toBe(true);
     });
   });
 });
