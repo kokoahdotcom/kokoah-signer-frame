@@ -94,6 +94,8 @@ export const PROMPT_ARM_MS = 800;
 export const PROMPT_HOLD_MS = 800;
 
 const HOLD_HINT = "Press and hold the button to confirm.";
+const TOO_SMALL = "This window is too small to show the whole prompt. Make it larger to confirm.";
+const SCROLL_HINT = "Scroll to the end of the text above to confirm.";
 const KEY_HINT = "Press and hold Enter or Space to confirm.";
 const CODE_HINT = "Type the code shown above first.";
 const CODE_MISS = "That is not the code shown. A new code is shown: type it to confirm.";
@@ -107,6 +109,18 @@ export const PROMPT_CODE_ATTEMPTS = 3;
  * it, give or take rounding. A parent that clips part of it (the order lines) leaves it disarmed.
  */
 export const PROMPT_FULL_INTERSECTION = 0.995;
+
+/**
+ * Least size (CSS px) of the frame's window for a prompt to arm. Smaller, the parent leaves room for little more than
+ * the title and the buttons, and the prompt's text would need scrolling.
+ */
+export const PROMPT_MIN_WIDTH = 280;
+export const PROMPT_MIN_HEIGHT = 300;
+/**
+ * Lines of the prompt's text that must be in view at once when it doesn't fit whole (a small phone): the user then
+ * scrolls it to its end before the prompt arms, so every line has been shown.
+ */
+export const PROMPT_MIN_BODY_LINES = 5;
 
 type VisibilityEntry = IntersectionObserverEntry & { isVisible?: boolean };
 
@@ -143,6 +157,13 @@ function randomDigits(doc: Document, count: number): string {
  *   browser), a fixed-style prompt also shows a random code the user types first: a parent that hides the prompt under
  *   a decoy can't know it. A wrong code shows a new one; after {@link PROMPT_CODE_ATTEMPTS} wrong ones the prompt gives
  *   up (USER_CANCELLED). Where it can tell, the prompt must be wholly in view and unobscured;
+ * - every browser: the prompt arms, and confirms, only in a window of at least {@link PROMPT_MIN_WIDTH} ×
+ *   {@link PROMPT_MIN_HEIGHT}, while its text is shown whole (no part of it scrolled out of view), or, where it can't
+ *   be (a small phone), once the user scrolled it to its end with at least {@link PROMPT_MIN_BODY_LINES} lines in view;
+ *   a parent that makes the frame too small leaves it disarmed, saying so;
+ * - the prompt moving on screen under the pointer (the parent moves the frame: the pointer's place in the frame changes
+ *   while its place on the screen doesn't) starts over, and a mouse pointer the frame sees for the first time in a
+ *   prompt (it may have arrived by the frame moving under it) counts only after `armMs` there;
  * - the parent moving the frame's document to a fragment (`#ks-body`) scrolls it back and starts over.
  */
 export class PromptUi {
@@ -164,6 +185,12 @@ export class PromptUi {
   private lastPointer: { x: number; y: number } | null = null;
   /** The armed primary button got focus from the user's own Tab or Shift+Tab inside the frame. */
   private keyboardFocus = false;
+  /** The last trusted pointer event in the frame during this prompt: where it was on screen and in the frame. */
+  private framePointer: { sx: number; sy: number; cx: number; cy: number } | null = null;
+  /** A mouse pointer counts on the button only from this time (ms since the epoch). */
+  private pointerReadyAt = 0;
+  /** The user scrolled the prompt's text to its end during this prompt. */
+  private bodyRead = false;
   /** A trusted Tab keydown whose focus move hasn't landed yet. */
   private tabbing = false;
   private holdTimer: ReturnType<typeof setTimeout> | undefined;
@@ -245,6 +272,7 @@ export class PromptUi {
     this.status.setAttribute("aria-live", "polite");
     this.panel.append(this.title, this.body, this.codeBox, actions, keyHint, this.status);
     this.codeInput.addEventListener("input", (ev) => this.onCode(ev));
+    this.body.addEventListener("scroll", () => this.onBodyScroll());
 
     // The notice: a region, not a dialog (it asks for nothing and never takes focus), always in the frame's own look.
     this.noticePanel = el(doc, "section", "ks-notice ks-notice--fixed");
@@ -265,6 +293,8 @@ export class PromptUi {
     root.append(this.idle, this.panel, this.noticePanel);
 
     const button = this.primary;
+    // Every pointer event in the frame: did the prompt move under the pointer? (Runs before the button's own.)
+    for (const type of ["pointerover", "pointermove", "pointerdown"] as const) doc.addEventListener(type, (ev) => this.onFramePointer(ev), true);
     button.addEventListener("pointerover", (ev) => this.onPointer(ev, false));
     button.addEventListener("pointermove", (ev) => this.onPointer(ev, true));
     button.addEventListener("pointerdown", (ev) => this.onPress(ev));
@@ -367,6 +397,11 @@ export class PromptUi {
       const timer = setTimeout(() => finish(() => reject(new PromptError("USER_TIMEOUT", "The user did not respond in time.", req.kind))), req.timeoutMs);
       this.confirm = () => {
         if (settled || running || !this.armed || (this.code !== null && !this.codeOk)) return;
+        // Shown whole at the moment it is confirmed, too.
+        if (!this.fits()) {
+          this.rearm();
+          return;
+        }
         running = true;
         this.setBusy(true, req.hold ? "Confirmed." : "Waiting for your passkey…");
         let p: Promise<T>;
@@ -407,6 +442,9 @@ export class PromptUi {
     this.primary.textContent = req.actionLabel;
     this.secondary.textContent = req.cancelLabel;
     this.codeMisses = 0;
+    this.framePointer = null;
+    this.pointerReadyAt = 0;
+    this.bodyRead = false;
     this.newCode(req.fixedStyle === true && !this.tracksVisibility());
     this.setBusy(false, this.restingStatus());
     this.idle.hidden = true;
@@ -473,17 +511,51 @@ export class PromptUi {
   }
 
   /**
+   * Why the prompt can't arm now, or null: the window is below the least size, or the prompt's text doesn't fit whole
+   * and wasn't scrolled to its end (or too little of it is in view to read it that way).
+   */
+  private unfit(): string | null {
+    const win = this.panel.ownerDocument.defaultView;
+    if (win && (win.innerWidth < PROMPT_MIN_WIDTH || win.innerHeight < PROMPT_MIN_HEIGHT)) return TOO_SMALL;
+    const b = this.body;
+    if (b.scrollHeight <= b.clientHeight + 1) return null;
+    const style = win?.getComputedStyle(b);
+    const line = Number.parseFloat(style?.lineHeight ?? "") || (Number.parseFloat(style?.fontSize ?? "") || 15) * 1.45;
+    if (b.clientHeight < PROMPT_MIN_BODY_LINES * line - 1) return TOO_SMALL;
+    return this.bodyRead ? null : SCROLL_HINT;
+  }
+
+  private fits(): boolean {
+    return this.unfit() === null;
+  }
+
+  /** The user scrolled the prompt's text: once at its end, a prompt that couldn't arm for it arms. */
+  private onBodyScroll(): void {
+    const b = this.body;
+    if (this.active === null || this.bodyRead || b.scrollTop + b.clientHeight < b.scrollHeight - 2) return;
+    this.bodyRead = true;
+    if (!this.armed) this.rearm();
+  }
+
+  /**
    * Enables the primary button once the prompt has been shown for `armMs` (and its code typed, when it asks for one).
    * Where the browser reports occlusion (IntersectionObserver v2, `isVisible`), that time counts only while the whole
    * prompt is in view ({@link PROMPT_FULL_INTERSECTION}), visible and unobscured; clipping, covering, fading or hiding
-   * it disables the button again and restarts the wait. Either way, the pointer must then move over the button again,
-   * or the keyboard bring focus to it again.
+   * it disables the button again and restarts the wait. Either way, the prompt's text must be shown whole in a window
+   * large enough for it ({@link PromptUi.fits}; resizing the frame arms it again), and the pointer must then move over
+   * the button again, or the keyboard bring focus to it again.
    */
   private arm(): void {
     this.disarm();
     const start = () => {
       clearTimeout(this.armTimer);
       this.armTimer = setTimeout(() => {
+        const why = this.unfit();
+        if (why !== null) {
+          this.status.textContent = why;
+          return;
+        }
+        if (this.status.textContent === TOO_SMALL || this.status.textContent === SCROLL_HINT) this.status.textContent = this.restingStatus();
         this.armed = true;
         if (this.panel.getAttribute("aria-busy") !== "true" && (this.code === null || this.codeOk)) this.primary.disabled = false;
       }, this.armMs);
@@ -526,12 +598,33 @@ export class PromptUi {
     }
   }
 
+  /**
+   * Any trusted pointer event in the frame while a prompt is open. Between two of them the pointer's place in the frame
+   * and on the screen change together; when its place in the frame changes while its place on the screen doesn't (or
+   * moves the other way), the frame moved under it: the prompt starts over. The first one the frame sees in a prompt
+   * gives no such baseline, so a mouse pointer then counts only after `armMs`.
+   */
+  private onFramePointer(ev: PointerEvent): void {
+    if (this.active === null || !this.isTrusted(ev)) return;
+    const now = { sx: ev.screenX, sy: ev.screenY, cx: ev.clientX, cy: ev.clientY };
+    const last = this.framePointer;
+    this.framePointer = now;
+    // At least 8 CSS px in the frame: at the lowest browser zoom (25%) a real move of that much still moves 2 screen px.
+    const shifted = (screen: number, frame: number) => Math.abs(frame) >= 8 && (Math.abs(screen) < 1 || Math.sign(screen) !== Math.sign(frame));
+    if (last === null) {
+      if (ev.pointerType === "mouse") this.pointerReadyAt = Date.now() + this.armMs;
+    } else if (shifted(now.sx - last.sx, now.cx - last.cx) || shifted(now.sy - last.sy, now.cy - last.cy)) {
+      this.rearm();
+      this.pointerReadyAt = Date.now() + this.armMs;
+    }
+  }
+
   /** Where the user's pointer is on the primary button; a move there while it is armed lets it confirm. */
   private onPointer(ev: PointerEvent, moved: boolean): void {
     if (this.active === null || !this.isTrusted(ev)) return;
     const at = { x: ev.screenX, y: ev.screenY };
     const last = this.lastPointer;
-    if (moved && this.armed && last !== null && (at.x !== last.x || at.y !== last.y)) this.pointerSeen = true;
+    if (moved && this.armed && last !== null && (at.x !== last.x || at.y !== last.y) && Date.now() >= this.pointerReadyAt) this.pointerSeen = true;
     this.lastPointer = at;
   }
 
@@ -567,6 +660,10 @@ export class PromptUi {
   private startHold(by: "pointer" | "key"): void {
     const present = by === "pointer" ? this.pointerSeen : this.keyboardFocus;
     if (!this.armed || !present || this.holdTimer !== undefined || this.panel.getAttribute("aria-busy") === "true") return;
+    if (!this.fits()) {
+      this.rearm();
+      return;
+    }
     this.holdBy = by;
     this.primary.classList.add("ks-holding");
     this.status.textContent = "Keep holding…";

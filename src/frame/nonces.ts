@@ -61,8 +61,12 @@ export interface UnpromptedOrders {
   usd: number;
   /** The user confirmed this action in the frame's prompt: it isn't counted. */
   confirmed: boolean;
-  /** That prompt showed the total of unconfirmed orders, so the user saw it: the record of them starts again. */
-  clears: boolean;
+  /**
+   * That prompt showed the total of unconfirmed orders in this window (ms: {@link UNPROMPTED_WINDOW_MS} or
+   * {@link UNPROMPTED_DAY_MS}), so the user saw it: the orders in that window leave the record, and older ones stay
+   * counted in the longer window. `false`: it showed none.
+   */
+  clears: number | false;
   /** Most unconfirmed notional in {@link UNPROMPTED_WINDOW_MS}, and in {@link UNPROMPTED_DAY_MS}. */
   maxUsd: number;
   maxDayUsd: number;
@@ -219,7 +223,7 @@ export class SigningCoordinator {
    * `unprompted`: the orders' notional in all and whether the user confirmed them in the frame's prompt: unconfirmed ones
    * join the rolling record of orders signed without a prompt, and the reservation fails with
    * {@link ConfirmationNeededError} when that would pass `maxUsd` or `maxDayUsd` (another tab signed in between); a
-   * confirmation whose prompt showed that record (`clears`) starts it again.
+   * confirmation whose prompt showed that record's total for a window (`clears`) starts that window again.
    * Throws if the nonce would fall outside HL's accepted window.
    */
   async reserve(
@@ -371,8 +375,8 @@ function limitProblem(usage: Usage, p: { orders: number; notionalUsd: number; li
 
 /**
  * Pure update of the usage record (runs inside the IndexedDB transaction). `hlpDeposit`: this action deposits into HLP.
- * `unprompted`: its orders' notional, whether the user confirmed them (then they aren't recorded), and whether that
- * prompt showed the unconfirmed ones (which clears their record).
+ * `unprompted`: its orders' notional, whether the user confirmed them (then they aren't recorded), and the window whose
+ * unconfirmed total that prompt showed (which clears the orders in that window only).
  */
 export function nextUsage(
   agent: string,
@@ -403,7 +407,9 @@ export function nextUsage(
   const deposits = (prev?.hlpDeposits ?? []).filter((d) => d.at > now - HLP_DEPOSIT_RECENT_MS);
   if (hlpDeposit) deposits.push({ master: hlpDeposit.master.toLowerCase(), at: now, usd: hlpDeposit.usd });
   if (deposits.length > 0) record.hlpDeposits = deposits;
-  const unconfirmed = unprompted?.confirmed === true && unprompted.clears ? [] : recentUnprompted(prev, now, UNPROMPTED_DAY_MS);
+  // A confirmed prompt that showed one window's total clears the orders in that window; older ones stay in the day's.
+  const shownMs = unprompted?.confirmed === true && typeof unprompted.clears === "number" && unprompted.clears > 0 ? unprompted.clears : 0;
+  const unconfirmed = recentUnprompted(prev, now, UNPROMPTED_DAY_MS).filter((o) => !(shownMs > 0 && o.at > now - shownMs));
   if (unprompted !== undefined && !unprompted.confirmed && unprompted.usd > 0 && Number.isFinite(unprompted.usd)) {
     // Summed per minute, so a day of orders is at most 1,440 entries.
     const last = unconfirmed.at(-1);

@@ -148,11 +148,16 @@ corner, not centred over the page). It asks for nothing and takes no focus.
 
 **How the prompt resists a hostile page.** Its primary button works only after the prompt has been shown for 800 ms
 (where the browser reports occlusion, IntersectionObserver v2, shown whole, wholly in view and unobscured; covering,
-fading or clipping part of it starts over). The prompt always fits the frame (its order lines scroll inside it). Where
+fading or clipping part of it starts over). On every browser (2026-10-30) it arms, and confirms, only in a frame of at
+least 280 × 300 CSS px and while its text is shown whole; where the text doesn't fit (a small phone), the user scrolls
+it to its end first, with at least five lines in view; a smaller frame leaves it disarmed, saying so. Give the iframe
+room (the frame's own text is short). Where
 the browser can't report occlusion (Firefox, Safari, every iOS browser), the fixed-style prompts (`limits`,
 `vault-deposit`, `vault-withdraw`, `order`, `margin`, `key-remove` and removing passkey protection) also show a random 3-digit code
 the user types before the button works; a wrong code shows a new one, and after three wrong ones the prompt ends with
-`USER_CANCELLED` (2026-10-23). Moving the frame to a fragment (`#…`) scrolls it back and starts over. Then a click counts only after the user's own pointer moved over the button inside the frame (a touch
+`USER_CANCELLED` (2026-10-23). Moving the frame to a fragment (`#…`) scrolls it back and starts over, and so does
+moving the iframe under the user's pointer (2026-10-30); a mouse pointer the frame first sees while a prompt is open
+counts only after 800 ms there. Then a click counts only after the user's own pointer moved over the button inside the frame (a touch
 press on it, for pointers that can't hover); events a script dispatches and a pointer that was already resting where
 the button appeared don't count, and leaving the button needs new movement. From the keyboard, any prompt confirms
 only when the user moved focus to the button with Tab or Shift+Tab inside the frame (not focus moved by a script or
@@ -619,7 +624,9 @@ Sizes and prices must already be valid for the market (shared `formatSize`, `che
 reduce-only orders included (a $10,000 entry with a take-profit and a stop-loss counts about $30,000), the frame signs
 them only after the user confirms its own prompt (`promptChanged` kind `order`, fixed styling, press and hold). The
 prompt lists each order as it will be signed, for example `Buy 0.3 BTC at $100,000 (limit) · about $30,000` or
-`Sell 0.3 BTC at market, down to $99,010 · reduce-only · about $30,000`, with the total and the sub-account if any.
+`Sell 0.3 BTC at market, down to $99,010 · reduce-only · about $30,000`, with the sub-account if any; its title gives
+the first order's side, size and market and the total (`Confirm: Buy 0.3 BTC + 2 more, $93,000`) and its button the
+same order (`Buy 0.3 BTC + 2`), so they show even when the parent leaves the prompt little room (2026-10-30).
 - It asks only about orders its rules allow (checked first) and doesn't hold up other requests meanwhile (a smaller
   order or a cancel signs at once; a second large order while one is asked about is `PROMPT_BUSY`).
 - After the user confirms, it reads prices, dexes and leverage again and checks everything again under the agent lock:
@@ -656,10 +663,12 @@ baseline) and can never go beyond the frame's baseline: a value above it rejects
 
 Limits are kept **per account**. Without `account` (or with the key's master) the call sets the master's limits. With a
 sub-account's address it sets that sub-account's own limits, which apply **on top of the master's**:
-`{ "account": "0x…sub", "maxOrderNotionalUsd": 1000 }`. Each field set replaces the master's value for that
-sub-account (still within the baseline); each field left out keeps the master's value, whenever the master's limits
-are set or changed. So a sub-account that sets only `maxLeverage` keeps the master's notional limits, stop-loss rule
-and daily counter. `{ "account": "0x…sub" }` alone removes them, so the sub-account uses the master's limits again. A
+`{ "account": "0x…sub", "maxOrderNotionalUsd": 1000 }`. Each field set is, for that sub-account, the **stricter** of its
+value and the master's (2026-10-30: the lower number, the coins and action types both allow, spot trading only when
+both have it), so a sub-account's limits never escape a later tightening of the master's, and a sub-account can't be
+looser than the master; each field left out keeps the master's value, whenever the master's limits are set or
+changed. So a sub-account that sets only `maxLeverage` keeps the master's notional limits, stop-loss rule and daily
+counter. `{ "account": "0x…sub" }` alone removes them, so the sub-account uses the master's limits again. A
 sub-account without its own limits always uses the master's. At most 64 sub-accounts can have their own limits.
 Setting limits for an address grants nothing: `vaultAddress` is still checked on HL at signing.
 
@@ -841,6 +850,7 @@ The baseline is built into the frame and can't be loosened:
 | Rate | **60 orders per minute** per agent (TP/SL legs count; cancels don't). Persisted, so a reload doesn't reset it |
 | Notional | $250,000 per order, $25,000,000 per UTC day per key across every account (reduce-only orders exempt) |
 | Large orders | More than $25,000 of orders in one action (reduce-only included) only after the user confirms the frame's own prompt (`signAndSubmit`, "Large orders") |
+| Stop-losses (with `requireStopLossForNewEntries`) | An entry's attached stop must cover it, sit on the losing side and be within **25%** of the entry. The frame reads the account's positions and resting orders on HL itself (`clearinghouseState`, `frontendOpenOrders`, and `orderStatus` for an order an action names that isn't among them) before a cancel, a modify or an entry, and refuses (`STOP_LOSS_REQUIRED`) one that would take stop-loss cover away from a position or, with `@kokoah/shared` from 2026-10-30, leave the position an entry adds to partly covered; setting a `scheduleCancel` is refused too (clearing one is allowed). Unreadable: `MARKET_DATA_UNAVAILABLE` (retryable) (2026-10-30) |
 | `expiresAfter` | Required; the frame uses now + 15 s (window ≤ 30 s) |
 | Origins | `manual`, `ai_ticket` |
 
