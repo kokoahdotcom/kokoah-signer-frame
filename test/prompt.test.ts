@@ -171,6 +171,7 @@ describe("prompt arming", () => {
       const result = ui.run(HOLD, action, () => ({ retry: false }));
       expect(primary.classList.contains("ks-hold")).toBe(true);
       expect(status.textContent).toBe("Press and hold the button to confirm.");
+      move(primary, 9);
       vi.advanceTimersByTime(800);
       // A click is not enough.
       pointerOnto(primary);
@@ -500,6 +501,8 @@ describe("prompt arming", () => {
     const { ui, primary } = setup();
     const action = vi.fn(async () => "ok");
     const result = ui.run(REQ, action, () => ({ retry: false }));
+    // The pointer is in the frame from the start (a mouse first seen later waits the arming time there; see below).
+    move(primary, 9);
     vi.advanceTimersByTime(800);
     expect(primary.disabled).toBe(false);
     document.documentElement.scrollTop = 120;
@@ -511,5 +514,146 @@ describe("prompt arming", () => {
     move(primary, 11);
     primary.click();
     await expect(result).resolves.toBe("ok");
+  });
+
+  describe("the prompt's text shown whole", () => {
+    /** Makes the prompt's text `scroll` px tall in a box of `client` px (jsdom lays nothing out). */
+    const size = (root: HTMLElement, scroll: number, client: number) => {
+      const body = root.querySelector<HTMLElement>(".ks-body")!;
+      Object.defineProperty(body, "scrollHeight", { configurable: true, get: () => scroll });
+      Object.defineProperty(body, "clientHeight", { configurable: true, get: () => client });
+      return body;
+    };
+    afterEach(() => {
+      // jsdom's window is 1024 × 768.
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: 1024 });
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: 768 });
+    });
+
+    it("doesn't arm while part of the text is scrolled out of view, until the user scrolls it to its end", async () => {
+      const { root, ui, primary, status } = setup();
+      const body = size(root, 500, 150);
+      const action = vi.fn(async () => "ok");
+      const result = ui.run(HOLD, action, () => ({ retry: false }));
+      move(primary, 9);
+      vi.advanceTimersByTime(5_000);
+      expect(primary.disabled).toBe(true);
+      expect(status.textContent).toBe("Scroll to the end of the text above to confirm.");
+      // Halfway is not the end.
+      body.scrollTop = 200;
+      body.dispatchEvent(new Event("scroll"));
+      vi.advanceTimersByTime(800);
+      expect(primary.disabled).toBe(true);
+      body.scrollTop = 350;
+      body.dispatchEvent(new Event("scroll"));
+      vi.advanceTimersByTime(799);
+      expect(primary.disabled).toBe(true);
+      vi.advanceTimersByTime(1);
+      expect(primary.disabled).toBe(false);
+      expect(status.textContent).toBe("Press and hold the button to confirm.");
+      move(primary, 10);
+      move(primary, 11);
+      primary.dispatchEvent(new PointerEvent("pointerdown", { ...at(11), button: 0 }));
+      vi.advanceTimersByTime(800);
+      await expect(result).resolves.toBe("ok");
+    });
+
+    it("arms at once when the text fits, and never in a frame too small to show it", () => {
+      const fits = setup();
+      size(fits.root, 200, 200);
+      void fits.ui.run(REQ, async () => "ok", () => ({ retry: false })).catch(() => {});
+      vi.advanceTimersByTime(800);
+      expect(fits.primary.disabled).toBe(false);
+      document.body.replaceChildren();
+
+      // Two lines in view: scrolling through them doesn't count.
+      const tiny = setup();
+      const body = size(tiny.root, 500, 44);
+      void tiny.ui.run(REQ, async () => "ok", () => ({ retry: false })).catch(() => {});
+      body.scrollTop = 456;
+      body.dispatchEvent(new Event("scroll"));
+      vi.advanceTimersByTime(5_000);
+      expect(tiny.primary.disabled).toBe(true);
+      expect(tiny.status.textContent).toBe("This window is too small to show the whole prompt. Make it larger to confirm.");
+      document.body.replaceChildren();
+
+      // A window under 280 × 300, whatever its text.
+      const narrow = setup();
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: 200 });
+      void narrow.ui.run(REQ, async () => "ok", () => ({ retry: false })).catch(() => {});
+      vi.advanceTimersByTime(5_000);
+      expect(narrow.primary.disabled).toBe(true);
+      expect(narrow.status.textContent).toContain("too small");
+      // Made larger (the frame is resized): it arms.
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: 400 });
+      window.dispatchEvent(new Event("resize"));
+      vi.advanceTimersByTime(800);
+      expect(narrow.primary.disabled).toBe(false);
+    });
+
+    it("checks again when it is confirmed", async () => {
+      const { root, ui, primary } = setup();
+      size(root, 200, 200);
+      const action = vi.fn(async () => "ok");
+      void ui.run(REQ, action, () => ({ retry: false })).catch(() => {});
+      move(primary, 9);
+      vi.advanceTimersByTime(800);
+      move(primary, 10);
+      size(root, 500, 200);
+      primary.click();
+      expect(action).not.toHaveBeenCalled();
+      expect(primary.disabled).toBe(true);
+    });
+  });
+
+  describe("the prompt moving under the pointer", () => {
+    it("starts over when the frame moves under the pointer", async () => {
+      const { ui, primary } = setup();
+      const action = vi.fn(async () => "ok");
+      const result = ui.run(REQ, action, () => ({ retry: false }));
+      move(primary, 9);
+      vi.advanceTimersByTime(800);
+      move(primary, 10);
+      // A small difference between the two (rounding at a low zoom) is no move.
+      primary.dispatchEvent(new PointerEvent("pointermove", { ...at(10), clientX: 13 }));
+      expect(primary.disabled).toBe(false);
+      // The pointer stays put on the screen while its place in the frame jumps: the frame moved.
+      primary.dispatchEvent(new PointerEvent("pointermove", { ...at(10), clientX: 60 }));
+      expect(primary.disabled).toBe(true);
+      primary.click();
+      expect(action).not.toHaveBeenCalled();
+      // Its movement counts again only once the delay passed again.
+      vi.advanceTimersByTime(799);
+      primary.dispatchEvent(new PointerEvent("pointermove", { ...at(11), clientX: 61 }));
+      primary.click();
+      expect(action).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      primary.dispatchEvent(new PointerEvent("pointermove", { ...at(12), clientX: 62 }));
+      primary.click();
+      await expect(result).resolves.toBe("ok");
+    });
+
+    it("counts a mouse it sees for the first time only after the delay, but a touch's press at once", async () => {
+      const { ui, primary } = setup();
+      const action = vi.fn(async () => "ok");
+      const result = ui.run(REQ, action, () => ({ retry: false }));
+      vi.advanceTimersByTime(800);
+      // First seen once armed: it may have arrived by the frame moving under it.
+      pointerOnto(primary);
+      primary.click();
+      expect(action).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(800);
+      move(primary, 15);
+      primary.click();
+      await expect(result).resolves.toBe("ok");
+
+      const touch = setup();
+      const tapped = vi.fn(async () => "ok");
+      const tapResult = touch.ui.run(REQ, tapped, () => ({ retry: false }));
+      vi.advanceTimersByTime(800);
+      touch.primary.dispatchEvent(new PointerEvent("pointerdown", { ...at(10, 20, "touch"), button: 0 }));
+      touch.primary.click();
+      await expect(tapResult).resolves.toBe("ok");
+    });
   });
 });

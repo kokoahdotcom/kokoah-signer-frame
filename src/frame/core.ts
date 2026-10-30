@@ -84,6 +84,7 @@ import { errorName, HlHttp, type FetchLike } from "./hl.js";
 import { RegionGate } from "./eligibility.js";
 import { silentLogger, type Logger } from "./log.js";
 import { MarketData, MarketDataError, type MarketSnapshot } from "./market-data.js";
+import { type FrameAccountBook, readAccountBook } from "./accountBook.js";
 import { classifyMessage } from "./messages.js";
 import {
   ConfirmationNeededError,
@@ -1703,6 +1704,13 @@ export class FrameCore {
     };
     let leverageByCoin = needsLeverage(stored) ? await this.accountLeverage(account, coins, snapshot) : undefined;
 
+    // 4a. Where the account's limits require a stop-loss: its positions and resting orders, read from HL by the frame
+    // itself right before each check, so a cancel or modify can't take a stop-loss away from a position and an entry
+    // can't leave the position it adds to partly covered (shared stopCoverage.ts).
+    const touchesStops =
+      intent.kind === "cancel" || intent.kind === "modify" || (intent.kind === "order" && !intent.reduceOnly && snapshot.registry.get(intent.coin)?.kind !== "spot");
+    const bookFor = async (accountPolicy: Policy) => (touchesStops && accountPolicy.requireStopLossForNewEntries ? await this.accountBook(account, intent) : undefined);
+
     const agent = key.meta.agentAddress;
     const usageKey = this.usageKey(key);
     const generation = key.generation;
@@ -1715,6 +1723,7 @@ export class FrameCore {
       // Sub-accounts without a daily limit of their own share the master's daily limit and counter.
       const usageAccount = { account, master, separate: separateDailyAccounts(limits.accounts) };
       const usage = await this.coordinator.usage(usageKey, now, usageAccount);
+      const accountBook = await bookFor(accountPolicy);
       const decision = evaluateFramePolicy({
         compiled,
         expiresAfter,
@@ -1731,6 +1740,7 @@ export class FrameCore {
         network: this.config.network.name,
         verifiedSpotCoins: snapshot.verifiedSpotCoins,
         spotDayVolumes: snapshot.spotDayVolumes,
+        ...(accountBook !== undefined ? { accountBook } : {}),
       });
       if (!decision.allowed) {
         this.metrics.policyDenials++;
@@ -1797,8 +1807,15 @@ export class FrameCore {
             maxAgentDailyNotionalUsd: BASELINE_LIMITS.maxDailyNotionalUsd,
           },
           // Checked again in the record's own transaction: another tab may have signed orders since the check above. A
-          // confirmation whose prompt showed the unconfirmed total starts it again; one that didn't leaves it.
-          unprompted: { usd: orders.totalUsd, confirmed, clears: confirmed && addsUp !== undefined, maxUsd: CONFIRM_UNPROMPTED_ABOVE_USD, maxDayUsd: CONFIRM_UNPROMPTED_DAY_ABOVE_USD },
+          // confirmation whose prompt showed the unconfirmed total of a window starts that window again (the orders in
+          // it); one that didn't leaves it, and older orders stay counted in the 24 hours.
+          unprompted: {
+            usd: orders.totalUsd,
+            confirmed,
+            clears: confirmed && addsUp !== undefined ? addsUp.windowMs : false,
+            maxUsd: CONFIRM_UNPROMPTED_ABOVE_USD,
+            maxDayUsd: CONFIRM_UNPROMPTED_DAY_ABOVE_USD,
+          },
         });
       } catch (e) {
         if (e instanceof UsageLimitError) {
@@ -2129,12 +2146,17 @@ export class FrameCore {
     const sub = subAccount?.toLowerCase();
     const whose = sub === undefined ? "" : ` for sub-account ${sub.slice(0, 6)}…${sub.slice(-4)}`;
     const why = recent === undefined ? "" : ` Orders of about ${dollars(recent.usd)} went out without a confirmation in the last ${window}, so ${one ? "this one needs" : "these need"} yours.`;
+    // Side, size and market of the first order, and the total, in the title and on the button too, which always show
+    // whole: a parent that leaves the prompt little room can't hide what is confirmed.
+    const first = orders.heads[0] ?? "";
+    const more = orders.lines.length - 1;
+    const change = orders.changes ? "Change: " : "";
     await this.prompt(
       "order",
       {
-        title: one ? "Confirm this order" : `Confirm these ${orders.lines.length} orders`,
-        body: `The Kokoah app asks to send ${one ? "this order" : "these orders"}${whose} to Hyperliquid, about ${total} in all.${why} Confirm only if you placed ${one ? "it" : "them"}.\n\n${orders.lines.join("\n")}`,
-        actionLabel: one ? "Send order" : `Send ${orders.lines.length} orders`,
+        title: `Confirm${orders.changes ? " change" : ""}: ${first}${more > 0 ? ` + ${more} more` : ""}, ${total}`,
+        body: `The Kokoah app asks to send ${one ? "this order" : "these orders"}${whose} to Hyperliquid.${why} Confirm only if you placed ${one ? "it" : "them"}.\n\n${orders.lines.join("\n")}`,
+        actionLabel: `${change}${first}${more > 0 ? ` + ${more}` : ""}`,
         fixedStyle: true,
         hold: true,
       },
@@ -2212,6 +2234,17 @@ export class FrameCore {
       if (lev !== undefined) leverage[coin] = lev;
     }
     return leverage;
+  }
+
+  /** The account's book for the stop-loss check (accountBook.ts); unreadable: nothing is signed (retryable). */
+  private async accountBook(account: Hex, intent: ActionIntent): Promise<FrameAccountBook> {
+    try {
+      return await readAccountBook((body) => this.hl.info(body), account, intent);
+    } catch {
+      throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Could not read your positions and orders from Hyperliquid to check your stop-losses; nothing was signed. Try again shortly.", {
+        retryable: true,
+      });
+    }
   }
 
   /** An HL `/info` read by the frame itself; a failed read signs nothing (`MARKET_DATA_UNAVAILABLE`, retryable). */
