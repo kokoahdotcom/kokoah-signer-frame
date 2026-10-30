@@ -1757,16 +1757,17 @@ export class FrameCore {
     // to confirm something the rules refuse; after the prompt (up to two minutes) the prices, dexes and leverage are read
     // again for the check under the lock.
     const orders = describeOrders(action, snapshot.registry, snapshot.markPrices, compiled.marketOrder !== undefined);
-    const recent = orders.totalUsd > 0 ? await this.coordinator.usage(usageKey, this.correctedNow()) : undefined;
+    const countedAt = this.correctedNow();
+    const recent = orders.totalUsd > 0 ? await this.coordinator.usage(usageKey, countedAt) : undefined;
     const large = orders.totalUsd > CONFIRM_ORDERS_ABOVE_USD;
     // The total the prompt shows: the 10 minutes' when they pass their limit, else the day's when it does.
     const addsUp =
       recent === undefined
         ? undefined
         : recent.unpromptedUsd + orders.totalUsd > CONFIRM_UNPROMPTED_ABOVE_USD
-          ? { usd: recent.unpromptedUsd, windowMs: UNPROMPTED_WINDOW_MS }
+          ? { usd: recent.unpromptedUsd, windowMs: UNPROMPTED_WINDOW_MS, at: countedAt }
           : recent.unpromptedDayUsd + orders.totalUsd > CONFIRM_UNPROMPTED_DAY_ABOVE_USD
-            ? { usd: recent.unpromptedDayUsd, windowMs: UNPROMPTED_DAY_MS }
+            ? { usd: recent.unpromptedDayUsd, windowMs: UNPROMPTED_DAY_MS, at: countedAt }
             : undefined;
     const marginOut = intent.kind === "updateIsolatedMargin" && Number(intent.amountUsd) < 0 ? { coin: intent.coin, usd: -Number(intent.amountUsd) } : undefined;
     let confirmed = false;
@@ -1812,7 +1813,7 @@ export class FrameCore {
           unprompted: {
             usd: orders.totalUsd,
             confirmed,
-            clears: confirmed && addsUp !== undefined ? addsUp.windowMs : false,
+            clears: confirmed && addsUp !== undefined ? { windowMs: addsUp.windowMs, at: addsUp.at } : false,
             maxUsd: CONFIRM_UNPROMPTED_ABOVE_USD,
             maxDayUsd: CONFIRM_UNPROMPTED_DAY_ABOVE_USD,
           },

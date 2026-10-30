@@ -286,11 +286,15 @@ describe("many orders without a prompt", () => {
     record = nextUsage("account/testnet/0xabc", record, t0 - 2 * minute, 1, 60_000, undefined, undefined, { usd: 60_000, confirmed: false, clears: false });
     expect(usageOf(record, t0)).toMatchObject({ unpromptedUsd: 60_000, unpromptedDayUsd: 110_000 });
     // The prompt showed the 10 minutes' total: those orders leave the record, the older ones stay in the day's.
-    const tenMinutes = nextUsage("account/testnet/0xabc", record, t0, 1, 30_000, undefined, undefined, { usd: 30_000, confirmed: true, clears: UNPROMPTED_WINDOW_MS });
+    const tenMinutes = nextUsage("account/testnet/0xabc", record, t0, 1, 30_000, undefined, undefined, { usd: 30_000, confirmed: true, clears: { windowMs: UNPROMPTED_WINDOW_MS, at: t0 } });
     expect(usageOf(tenMinutes, t0)).toMatchObject({ unpromptedUsd: 0, unpromptedDayUsd: 50_000 });
     // The day's total shown: all of it starts again; a prompt that showed none clears nothing.
-    expect(usageOf(nextUsage("account/testnet/0xabc", record, t0, 1, 30_000, undefined, undefined, { usd: 30_000, confirmed: true, clears: UNPROMPTED_DAY_MS }), t0)).toMatchObject({ unpromptedUsd: 0, unpromptedDayUsd: 0 });
+    expect(usageOf(nextUsage("account/testnet/0xabc", record, t0, 1, 30_000, undefined, undefined, { usd: 30_000, confirmed: true, clears: { windowMs: UNPROMPTED_DAY_MS, at: t0 } }), t0)).toMatchObject({ unpromptedUsd: 0, unpromptedDayUsd: 0 });
     expect(usageOf(nextUsage("account/testnet/0xabc", record, t0, 1, 30_000, undefined, undefined, { usd: 30_000, confirmed: true, clears: false }), t0)).toMatchObject({ unpromptedUsd: 60_000, unpromptedDayUsd: 110_000 });
+    // Orders another tab signed while the prompt was open (after it counted the total) weren't shown: they stay.
+    const meanwhile = nextUsage("account/testnet/0xabc", record, t0 + minute, 1, 20_000, undefined, undefined, { usd: 20_000, confirmed: false, clears: false });
+    const confirmedLater = nextUsage("account/testnet/0xabc", meanwhile, t0 + 2 * minute, 1, 30_000, undefined, undefined, { usd: 30_000, confirmed: true, clears: { windowMs: UNPROMPTED_WINDOW_MS, at: t0 } });
+    expect(usageOf(confirmedLater, t0 + 2 * minute)).toMatchObject({ unpromptedUsd: 20_000, unpromptedDayUsd: 70_000 });
   });
 
   it("are refused in a frame without a user interface once they would pass the total", async () => {
@@ -305,7 +309,7 @@ describe("many orders without a prompt", () => {
   it("are checked again when the nonce is reserved, so another tab's orders in between can't slip past it", async () => {
     const coordinator = new SigningCoordinator({ store: new MemorySignerStore(), locks: undefined, lockPrefix: "t" });
     const key = { key: "account/testnet/0xabc", legacy: "0xagent" };
-    const order = (usd: number, confirmed = false, clears: number | false = confirmed ? UNPROMPTED_WINDOW_MS : false) =>
+    const order = (usd: number, confirmed = false, clears: false | { windowMs: number; at: number } = confirmed ? { windowMs: UNPROMPTED_WINDOW_MS, at: 1_000_000 } : false) =>
       coordinator.reserve(key, { now: 1_000_000, orders: 1, notionalUsd: usd, unprompted: { usd, confirmed, clears, maxUsd: 100_000, maxDayUsd: 250_000 } });
     await order(60_000);
     await expect(order(50_000)).rejects.toBeInstanceOf(ConfirmationNeededError);

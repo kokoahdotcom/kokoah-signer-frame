@@ -162,8 +162,9 @@ function randomDigits(doc: Document, count: number): string {
  *   be (a small phone), once the user scrolled it to its end with at least {@link PROMPT_MIN_BODY_LINES} lines in view;
  *   a parent that makes the frame too small leaves it disarmed, saying so;
  * - the prompt moving on screen under the pointer (the parent moves the frame: the pointer's place in the frame changes
- *   while its place on the screen doesn't) starts over, and a mouse pointer the frame sees for the first time in a
- *   prompt (it may have arrived by the frame moving under it) counts only after `armMs` there;
+ *   while its place on the screen doesn't, moves the other way, or by a clearly different amount than a mouse's moves
+ *   have so far) starts over, and a mouse pointer the frame sees for the first time in a prompt, or again after it
+ *   left the frame (it may have arrived by the frame moving under it), counts only after `armMs` there;
  * - the parent moving the frame's document to a fragment (`#ks-body`) scrolls it back and starts over.
  */
 export class PromptUi {
@@ -185,8 +186,12 @@ export class PromptUi {
   private lastPointer: { x: number; y: number } | null = null;
   /** The armed primary button got focus from the user's own Tab or Shift+Tab inside the frame. */
   private keyboardFocus = false;
-  /** The last trusted pointer event in the frame during this prompt: where it was on screen and in the frame. */
+  /**
+   * The last trusted pointer event in the frame during this prompt, where it was on screen and in the frame, while the
+   * pointer stays in the frame; and how far a mouse moves on screen per CSS px in the frame (the zoom), once measured.
+   */
   private framePointer: { sx: number; sy: number; cx: number; cy: number } | null = null;
+  private screenPerFramePx: number | null = null;
   /** A mouse pointer counts on the button only from this time (ms since the epoch). */
   private pointerReadyAt = 0;
   /** The user scrolled the prompt's text to its end during this prompt. */
@@ -295,6 +300,13 @@ export class PromptUi {
     const button = this.primary;
     // Every pointer event in the frame: did the prompt move under the pointer? (Runs before the button's own.)
     for (const type of ["pointerover", "pointermove", "pointerdown"] as const) doc.addEventListener(type, (ev) => this.onFramePointer(ev), true);
+    // The pointer left the frame's document: where it comes back says nothing about where it was.
+    for (const type of ["pointerout", "mouseout"] as const) {
+      doc.addEventListener(type, (ev) => {
+        if ((ev as MouseEvent).relatedTarget === null) this.forgetFramePointer();
+      }, true);
+    }
+    doc.documentElement.addEventListener("pointerleave", () => this.forgetFramePointer());
     button.addEventListener("pointerover", (ev) => this.onPointer(ev, false));
     button.addEventListener("pointermove", (ev) => this.onPointer(ev, true));
     button.addEventListener("pointerdown", (ev) => this.onPress(ev));
@@ -322,9 +334,18 @@ export class PromptUi {
     });
     // Moved out of view, resized by the parent, or the user went elsewhere: shown and seen again before it works.
     const win = doc.defaultView;
-    win?.addEventListener("resize", () => this.rearm());
-    win?.addEventListener("blur", () => this.rearm());
-    doc.addEventListener("visibilitychange", () => this.rearm());
+    win?.addEventListener("resize", () => {
+      this.forgetFramePointer();
+      this.rearm();
+    });
+    win?.addEventListener("blur", () => {
+      this.forgetFramePointer();
+      this.rearm();
+    });
+    doc.addEventListener("visibilitychange", () => {
+      this.forgetFramePointer();
+      this.rearm();
+    });
     // The parent can move the frame's document to a fragment (`#ks-body`) to scroll part of the prompt out of view.
     win?.addEventListener("hashchange", () => {
       this.scrollToTop();
@@ -442,7 +463,7 @@ export class PromptUi {
     this.primary.textContent = req.actionLabel;
     this.secondary.textContent = req.cancelLabel;
     this.codeMisses = 0;
-    this.framePointer = null;
+    this.forgetFramePointer();
     this.pointerReadyAt = 0;
     this.bodyRead = false;
     this.newCode(req.fixedStyle === true && !this.tracksVisibility());
@@ -609,14 +630,36 @@ export class PromptUi {
     const now = { sx: ev.screenX, sy: ev.screenY, cx: ev.clientX, cy: ev.clientY };
     const last = this.framePointer;
     this.framePointer = now;
-    // At least 8 CSS px in the frame: at the lowest browser zoom (25%) a real move of that much still moves 2 screen px.
-    const shifted = (screen: number, frame: number) => Math.abs(frame) >= 8 && (Math.abs(screen) < 1 || Math.sign(screen) !== Math.sign(frame));
     if (last === null) {
       if (ev.pointerType === "mouse") this.pointerReadyAt = Date.now() + this.armMs;
-    } else if (shifted(now.sx - last.sx, now.cx - last.cx) || shifted(now.sy - last.sy, now.cy - last.cy)) {
+      return;
+    }
+    // At least 8 CSS px in the frame: at the lowest browser zoom (25%) a real move of that much still moves 2 screen px.
+    const shifted = (screen: number, frame: number) => Math.abs(frame) >= 8 && (Math.abs(screen) < 1 || Math.sign(screen) !== Math.sign(frame));
+    // A mouse moves on screen by a fixed multiple of what it moves in the frame (the zoom). Measured on clear moves
+    // (16 CSS px and 8 screen px, so rounding stays small), a move off that multiple by more than 40% means the frame
+    // moved too. Not for touch and pens, where pinch zoom changes it.
+    const offScale = (screen: number, frame: number): boolean => {
+      if (ev.pointerType !== "mouse" || Math.abs(frame) < 16 || Math.abs(screen) < 8) return false;
+      const ratio = screen / frame;
+      if (this.screenPerFramePx === null) {
+        if (ratio > 0) this.screenPerFramePx = ratio;
+        return false;
+      }
+      return Math.abs(ratio - this.screenPerFramePx) > 0.4 * this.screenPerFramePx;
+    };
+    const dx = [now.sx - last.sx, now.cx - last.cx] as const;
+    const dy = [now.sy - last.sy, now.cy - last.cy] as const;
+    if (shifted(...dx) || shifted(...dy) || offScale(...dx) || offScale(...dy)) {
       this.rearm();
       this.pointerReadyAt = Date.now() + this.armMs;
     }
+  }
+
+  /** The frame no longer knows where the pointer is: its next event counts as the first. */
+  private forgetFramePointer(): void {
+    this.framePointer = null;
+    this.screenPerFramePx = null;
   }
 
   /** Where the user's pointer is on the primary button; a move there while it is armed lets it confirm. */

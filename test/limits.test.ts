@@ -349,6 +349,11 @@ describe("sub-account limits", () => {
     expect(h.promptText()).toContain("Trading per day: $1,000 shared with the main account → $500 of its own, on top of the main account's");
     await h.clickPrompt("cancel");
     expect((await own.answer).ok).toBe(false);
+    // A higher number of its own is shown as what applies: the main account's $1,000.
+    const higher = await asking(h, { account: SUB2, maxDailyNotionalUsd: 5_000 });
+    expect(h.promptText()).toContain("Trading per day: $1,000 shared with the main account → $1,000 of its own, on top of the main account's");
+    await h.clickPrompt("cancel");
+    expect((await higher.answer).ok).toBe(false);
     expect((await h.ok("getStatus")).policy.accountLimits).toEqual({ [SUB]: { maxOrderNotionalUsd: 100 } });
   });
 
