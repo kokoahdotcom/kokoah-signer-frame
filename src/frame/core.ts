@@ -1797,8 +1797,15 @@ export class FrameCore {
             maxAgentDailyNotionalUsd: BASELINE_LIMITS.maxDailyNotionalUsd,
           },
           // Checked again in the record's own transaction: another tab may have signed orders since the check above. A
-          // confirmation whose prompt showed the unconfirmed total starts it again; one that didn't leaves it.
-          unprompted: { usd: orders.totalUsd, confirmed, clears: confirmed && addsUp !== undefined, maxUsd: CONFIRM_UNPROMPTED_ABOVE_USD, maxDayUsd: CONFIRM_UNPROMPTED_DAY_ABOVE_USD },
+          // confirmation whose prompt showed the unconfirmed total of a window starts that window again (the orders in
+          // it); one that didn't leaves it, and older orders stay counted in the 24 hours.
+          unprompted: {
+            usd: orders.totalUsd,
+            confirmed,
+            clears: confirmed && addsUp !== undefined ? addsUp.windowMs : false,
+            maxUsd: CONFIRM_UNPROMPTED_ABOVE_USD,
+            maxDayUsd: CONFIRM_UNPROMPTED_DAY_ABOVE_USD,
+          },
         });
       } catch (e) {
         if (e instanceof UsageLimitError) {
