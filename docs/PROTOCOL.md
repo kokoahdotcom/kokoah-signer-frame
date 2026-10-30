@@ -156,8 +156,8 @@ the browser can't report occlusion (Firefox, Safari, every iOS browser), the fix
 `vault-deposit`, `vault-withdraw`, `order`, `margin`, `key-remove` and removing passkey protection) also show a random 3-digit code
 the user types before the button works; a wrong code shows a new one, and after three wrong ones the prompt ends with
 `USER_CANCELLED` (2026-10-23). Moving the frame to a fragment (`#…`) scrolls it back and starts over, and so does
-moving the iframe under the user's pointer (2026-10-30); a mouse pointer the frame first sees while a prompt is open
-counts only after 800 ms there. Then a click counts only after the user's own pointer moved over the button inside the frame (a touch
+moving the iframe under the user's pointer (2026-10-30); a mouse pointer the frame first sees while a prompt is open,
+or sees again after it left the frame, counts only after 800 ms there. Then a click counts only after the user's own pointer moved over the button inside the frame (a touch
 press on it, for pointers that can't hover); events a script dispatches and a pointer that was already resting where
 the button appeared don't count, and leaving the button needs new movement. From the keyboard, any prompt confirms
 only when the user moved focus to the button with Tab or Shift+Tab inside the frame (not focus moved by a script or
