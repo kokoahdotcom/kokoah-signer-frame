@@ -18,8 +18,10 @@
  * notional counted against the daily limit, and the agent-wide baseline daily cap across all accounts.
  *
  * Personal limits (`setLimits`) are kept per account: the master's, and optionally one set per sub-account, applied on
- * top of the master's (a field the sub-account leaves out keeps the master's value; without limits of its own it uses
- * the master's). Orders per minute are counted per agent across accounts. Daily notional is counted per agent for the
+ * top of the master's: each field is the stricter of the two (the lower number, the markets and actions both allow, a
+ * stop-loss when either requires one), so a sub-account's limits set earlier never escape a later tightening of the
+ * master's; a field it leaves out keeps the master's value, and without limits of its own it uses the master's.
+ * Orders per minute are counted per agent across accounts. Daily notional is counted per agent for the
  * baseline cap, and for personal limits once for the master and every sub-account without a daily limit of its own
  * (they share the master's), and separately for each sub-account that sets `maxDailyNotionalUsd`. The frame stores
  * them itself (`core.ts`); {@link limitChanges} tells a tightening, applied silently, from a loosening, which needs the
@@ -196,16 +198,20 @@ export const MAX_ACCOUNT_LIMITS = 64;
 
 /**
  * A sub-account's own limits, set with `setLimits({ account, … })` and checked against the baseline. They apply on top
- * of the master's: a field left out keeps the master's value (see {@link policyForAccount}).
+ * of the master's, field by field the stricter of the two (see {@link policyForAccount}).
  */
 export interface AccountLimits {
   limits: UserLimits;
 }
 
+const NUMBER_LIMITS = ["maxOrderNotionalUsd", "maxDailyNotionalUsd", "maxLeverage", "maxOrdersPerMinute", "priceBandPct"] as const;
+
 /**
- * The policy for an account: the master's, with a sub-account's own limits on top. A field the sub-account sets
- * replaces the master's value for that sub-account; every other field (and a sub-account without limits of its own)
- * keeps the master's, so a sub-account that sets only `maxLeverage` still has the master's notional and stop-loss rules.
+ * The policy for an account: the master's, with a sub-account's own limits on top. Each field the sub-account sets is
+ * the stricter of its value and the master's: the lower number, the markets and action types both allow (none when
+ * they share none), spot trading only when both have it; the stop-loss requirement and every other field are the
+ * master's when the sub-account doesn't add them. So a sub-account that sets only `maxLeverage` still has the master's
+ * notional and stop-loss rules, and limits a sub-account set earlier never escape a later tightening of the master's.
  * `tradingCoins`: the verified spot pairs `spotTrading` adds (see {@link applyUserLimits}).
  */
 export function policyForAccount(
@@ -215,13 +221,36 @@ export function policyForAccount(
   tradingCoins: readonly string[] = [],
 ): Policy {
   const own = subAccount === undefined ? undefined : accountLimits.get(subAccount.toLowerCase());
-  return own === undefined ? masterPolicy : withLimits(masterPolicy, own.limits, tradingCoins);
+  if (own === undefined) return masterPolicy;
+  const { allowedCoins, allowedActionTypes, spotTrading, ...rest } = own.limits;
+  const numbers: UserLimits = { ...rest };
+  for (const field of NUMBER_LIMITS) if (rest[field] !== undefined) numbers[field] = Math.min(rest[field], masterPolicy[field]);
+  const policy = withLimits(masterPolicy, { ...numbers, ...(spotTrading === true && masterPolicy.spotTrading === true ? { spotTrading } : {}) }, tradingCoins);
+  // The lists are narrowed after the schema check: one that keeps nothing (an empty list) allows nothing.
+  return {
+    ...policy,
+    ...(allowedCoins !== undefined ? { allowedCoins: masterPolicy.allowedCoins === "*" ? [...allowedCoins] : allowedCoins.filter((c) => masterPolicy.allowedCoins.includes(c)) } : {}),
+    ...(allowedActionTypes !== undefined ? { allowedActionTypes: sharedActionTypes(allowedActionTypes).filter((t) => masterPolicy.allowedActionTypes.includes(t)) } : {}),
+  };
 }
 
-/** The limits in force for an account: the master's, with a sub-account's own fields on top (see {@link policyForAccount}). */
+/** The limits in force for an account: the master's, with a sub-account's own fields on top, each the stricter of the two (see {@link policyForAccount}). */
 export function limitsForAccount(masterLimits: UserLimits | null, accountLimits: ReadonlyMap<string, AccountLimits>, subAccount: string | undefined): UserLimits | null {
   const own = subAccount === undefined ? undefined : accountLimits.get(subAccount.toLowerCase());
-  return own === undefined ? masterLimits : { ...masterLimits, ...own.limits };
+  if (own === undefined) return masterLimits;
+  const out: UserLimits = { ...masterLimits, ...own.limits };
+  for (const field of NUMBER_LIMITS) {
+    const a = own.limits[field];
+    const b = masterLimits?.[field];
+    if (a !== undefined && b !== undefined) out[field] = Math.min(a, b);
+  }
+  for (const field of ["allowedCoins", "allowedActionTypes"] as const) {
+    const a = own.limits[field] as readonly string[] | undefined;
+    const b = masterLimits?.[field] as readonly string[] | undefined;
+    if (a !== undefined && b !== undefined) (out as Record<string, unknown>)[field] = a.filter((x) => b.includes(x));
+  }
+  if (own.limits.spotTrading === true && masterLimits?.spotTrading !== true) delete out.spotTrading;
+  return out;
 }
 
 /**
