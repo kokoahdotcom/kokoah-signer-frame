@@ -338,7 +338,8 @@ export function limitChanges(baseline: Policy, before: LimitsSet, after: LimitsS
   const ownDailyAfter = sub === undefined ? undefined : after.accounts.get(sub)?.limits.maxDailyNotionalUsd;
   const sharedDaily = after.master?.maxDailyNotionalUsd;
   if (ownDailyBefore === undefined && ownDailyAfter !== undefined && sharedDaily !== undefined) {
-    add("maxDailyNotionalUsd", "Trading per day", `${usd(sharedDaily)} shared with the main account`, `${usd(ownDailyAfter)} of its own, on top of the main account's`, true);
+    // What is enforced: the stricter of its own and the master's (limitsForAccount).
+    add("maxDailyNotionalUsd", "Trading per day", `${usd(sharedDaily)} shared with the main account`, `${usd(a.maxDailyNotionalUsd ?? ownDailyAfter)} of its own, on top of the main account's`, true);
   } else number("maxDailyNotionalUsd", "Trading per day", usd);
   number("maxLeverage", "Leverage", (n) => `up to ${n}x`);
   number("maxOrdersPerMinute", "Orders per minute", String);
