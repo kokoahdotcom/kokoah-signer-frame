@@ -48,7 +48,7 @@ import type { AccountIntent, CompiledAccountAction, CompiledAction } from "@koko
 import type { ActionIntent } from "@kokoah/shared/intents";
 import type { MarketRegistry } from "@kokoah/shared/markets";
 import { vaultTransferProblems } from "@kokoah/shared/vaults";
-import { createManualTradingPolicy, evaluatePolicy, parsePolicy, type Policy, type PolicyViolation, spotOrderVolumeProblem } from "@kokoah/shared/policy";
+import { type AccountBook, createManualTradingPolicy, evaluatePolicy, parsePolicy, type Policy, type PolicyViolation, spotOrderVolumeProblem } from "@kokoah/shared/policy";
 import * as v from "valibot";
 import { BASELINE_ACTION_TYPES, EXPIRES_AFTER_MS, type AllowedActionType, type PolicySummary, type UserLimits } from "../protocol/index.js";
 import { PARAMS_SCHEMAS } from "./messages.js";
@@ -66,6 +66,11 @@ export const BASELINE_LIMITS = Object.freeze({
   maxActionsPerMinute: 120,
   priceBandPct: 5,
   requireStopLossForNewEntries: false,
+  /**
+   * Where the user's limits require a stop-loss: it must be within this % of the entry, on the losing side (as for the
+   * servers' keys), so a token stop half the price away doesn't count.
+   */
+  maxStopLossDistancePct: 25,
   /** `expiresAfter` is mandatory and at most this far ahead (the frame itself uses 15 s). */
   maxExpiresAfterWindowMs: 30_000,
   allowedOrigins: ["manual", "ai_ticket"] as Array<"manual" | "ai_ticket">,
@@ -113,6 +118,7 @@ export function createBaselinePolicy(builder: BuilderSetting, extras: BaselineEx
       maxDailyNotionalUsd: BASELINE_LIMITS.maxDailyNotionalUsd,
       maxLeverage: BASELINE_LIMITS.maxLeverage,
       requireStopLossForNewEntries: BASELINE_LIMITS.requireStopLossForNewEntries,
+      maxStopLossDistancePct: BASELINE_LIMITS.maxStopLossDistancePct,
       maxOrdersPerMinute: BASELINE_LIMITS.maxOrdersPerMinute,
       priceBandPct: BASELINE_LIMITS.priceBandPct,
       allowedVaultAddresses: [],
@@ -607,6 +613,13 @@ export interface FramePolicyInput {
   verifiedSpotCoins?: readonly string[];
   /** 24 h notional volume (USD) by spot coin, from the frame's own `spotMetaAndAssetCtxs` read. */
   spotDayVolumes?: Readonly<Record<string, number>>;
+  /**
+   * The account's positions and resting orders on the markets the action touches, as the frame read them from HL
+   * itself (never from the parent). Where the policy requires a stop-loss, cancels and modifies may not take stop-loss
+   * cover away from a position, and entries must leave the whole position covered (shared `stopCoverage.ts`): without
+   * the book they are refused.
+   */
+  accountBook?: AccountBook;
 }
 
 /** Decision of {@link evaluateFramePolicy}. */
@@ -698,6 +711,9 @@ export function evaluateFramePolicy(input: FramePolicyInput): FramePolicyDecisio
     registry: input.registry,
     expiresAfter: input.expiresAfter,
     ...(input.leverageByCoin !== undefined ? { leverageByCoin: input.leverageByCoin } : {}),
+    // Stops required: the stop-losses stay in place after an order is placed, read from HL by the frame itself.
+    requireStopCoverage: true,
+    ...(input.accountBook !== undefined ? { accountBook: input.accountBook } : {}),
   };
   const compiledDecision = evaluatePolicy({ kind: "compiled", compiled: input.compiled, expiresAfter: input.expiresAfter }, context);
   for (const v of compiledDecision.violations) add(v);

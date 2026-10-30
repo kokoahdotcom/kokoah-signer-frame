@@ -163,6 +163,14 @@ export class MockHl {
   ledger: unknown = [];
   /** HL `userVaultEquities` answer (vault withdrawals). */
   vaultEquities: unknown = [];
+  /**
+   * `clearinghouseState` positions and `frontendOpenOrders` per account (lowercase), as HL sends them; the dex is in the
+   * coin name (`xyz:SP500`). Default: none.
+   */
+  positions: Record<string, Array<{ coin: string; szi: string; entryPx: string }>> = {};
+  openOrders: Record<string, Array<Record<string, unknown>>> = {};
+  /** `orderStatus` answers by oid or lowercase cloid; default: an order in `openOrders` is open, any other unknown. */
+  orderStatuses: Record<string, unknown> = {};
   infoCalls: Array<Record<string, unknown>> = [];
   exchangeCalls: ExchangeCall[] = [];
   infoFailure: ((body: Record<string, unknown>) => boolean) | null = null;
@@ -231,6 +239,22 @@ export class MockHl {
         return this.ledger;
       case "userVaultEquities":
         return this.vaultEquities;
+      case "clearinghouseState": {
+        const onDex = (coin: string) => (body.dex === undefined ? !coin.includes(":") : coin.startsWith(`${String(body.dex)}:`));
+        const positions = (this.positions[String(body.user).toLowerCase()] ?? []).filter((p) => onDex(p.coin));
+        return { assetPositions: positions.map((position) => ({ type: "oneWay", position: { ...position, leverage: { type: "cross", value: 3 } } })), marginSummary: { accountValue: "10000.0" }, time: 0 };
+      }
+      case "frontendOpenOrders": {
+        const onDex = (coin: string) => (body.dex === undefined ? !coin.includes(":") : coin.startsWith(`${String(body.dex)}:`));
+        return (this.openOrders[String(body.user).toLowerCase()] ?? []).filter((o) => onDex(String(o.coin)));
+      }
+      case "orderStatus": {
+        const ref = body.oid;
+        const key = String(ref).toLowerCase();
+        if (key in this.orderStatuses) return this.orderStatuses[key];
+        const o = (this.openOrders[String(body.user).toLowerCase()] ?? []).find((x) => (typeof ref === "number" ? x.oid === ref : String(x.cloid ?? "").toLowerCase() === key));
+        return o ? { status: "order", order: { order: o, status: "open", statusTimestamp: 0 } } : { status: "unknownOid" };
+      }
       case "activeAssetData": {
         const lev = this.leverageByUser[String(body.user).toLowerCase()]?.[String(body.coin)] ?? this.leverage[String(body.coin)] ?? 10;
         return { user: body.user, coin: body.coin, leverage: { type: "cross", value: lev }, maxTradeSzs: ["1", "1"], availableToTrade: ["1", "1"], markPx: this.mark[String(body.coin)] };
@@ -619,4 +643,27 @@ export function subAccountEntry(address: string, master: string = USER, name = "
 
 export function limitOrder(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return { kind: "order", coin: "ETH", side: "buy", orderType: "limit", size: "0.1", price: "2000", origin: "manual", cloid: cloid(), ...overrides };
+}
+
+/** One entry of HL's `frontendOpenOrders` answer: a reduce-only stop-loss on BTC by default. */
+export function openOrder(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    coin: "BTC",
+    side: "A",
+    limitPx: "85500.0",
+    sz: "0.1",
+    oid: 77,
+    timestamp: 0,
+    triggerCondition: "Price below 95000",
+    isTrigger: true,
+    triggerPx: "95000.0",
+    children: [],
+    isPositionTpsl: false,
+    reduceOnly: true,
+    orderType: "Stop Market",
+    origSz: "0.1",
+    tif: null,
+    cloid: null,
+    ...over,
+  };
 }
