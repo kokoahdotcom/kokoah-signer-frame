@@ -534,6 +534,10 @@ export const CONFIRM_UNPROMPTED_DAY_ABOVE_USD = 250_000;
 export interface OrdersDescription {
   /** One line per order, e.g. `Buy 0.3 BTC at $100,000 (limit) · about $30,000`. */
   lines: string[];
+  /** Side, size and market of each order, e.g. `Buy 0.3 BTC`, for the prompt's title and button. */
+  heads: string[];
+  /** The action changes open orders (a modify) rather than placing new ones. */
+  changes: boolean;
   /** Every order's size × max(limit price, trigger price, mark), reduce-only orders included. */
   totalUsd: number;
 }
@@ -552,6 +556,7 @@ const plain = (x: unknown): string => Number(x).toLocaleString("en-US", { maximu
  */
 export function describeOrders(action: Record<string, unknown>, registry: MarketRegistry, markPrices: Readonly<Record<string, number>>, marketOrder = false): OrdersDescription {
   const lines: string[] = [];
+  const heads: string[] = [];
   let totalUsd = 0;
   for (const [i, o] of wireOrders(action).entries()) {
     const market = typeof o.a === "number" ? registry.getByAssetId(o.a) : undefined;
@@ -571,9 +576,11 @@ export function describeOrders(action: Record<string, unknown>, registry: Market
     const notional = orderNotionalUsd(o, registry, markPrices);
     totalUsd += notional;
     const change = action.type === "order" ? "" : "Change an open order to: ";
-    lines.push(`${change}${isBuy ? "Buy" : "Sell"} ${plain(o.s)} ${name} ${how}${o.r === true ? " · reduce-only" : ""} · about ${usd(notional)}`);
+    const head = `${isBuy ? "Buy" : "Sell"} ${plain(o.s)} ${name}`;
+    heads.push(head);
+    lines.push(`${change}${head} ${how}${o.r === true ? " · reduce-only" : ""} · about ${usd(notional)}`);
   }
-  return { lines, totalUsd };
+  return { lines, heads, totalUsd, changes: action.type !== "order" };
 }
 
 /** Inputs of {@link evaluateFramePolicy}. */

@@ -65,7 +65,8 @@ body {
 
 /*
  * The prompt always fits the frame (its order lines scroll inside it), so it can be wholly in view: where the browser
- * reports it, the prompt arms only then, and a parent that clips part of it leaves it disarmed (prompt.ts).
+ * reports it, the prompt arms only then, and a parent that clips part of it leaves it disarmed. On every browser it
+ * arms only while its text is shown whole, or once the user scrolled the text to its end (prompt.ts).
  */
 .ks-prompt {
   display: flex;

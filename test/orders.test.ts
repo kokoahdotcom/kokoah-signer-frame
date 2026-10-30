@@ -48,9 +48,11 @@ describe("large orders", () => {
     const pending = h.ok("signAndSubmit", { requestId: "big", intent: btc("0.3") });
     await shown();
     expect(orderPrompts()).toHaveLength(1);
-    expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Confirm this order");
+    // Side, size, market and total in the title and on the button, which always show whole.
+    expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Confirm: Buy 0.3 BTC, $30,000");
+    expect(h.root?.querySelector(".ks-primary")?.textContent).toBe("Buy 0.3 BTC");
     const text = h.promptText();
-    expect(text).toContain("to Hyperliquid, about $30,000 in all");
+    expect(text).toContain("The Kokoah app asks to send this order to Hyperliquid. Confirm only if you placed it.");
     expect(text).toContain("Buy 0.3 BTC at $100,000 (limit) · about $30,000");
     expect(h.root?.querySelector(".ks-prompt")?.classList.contains("ks-prompt--fixed")).toBe(true);
     expect(h.root?.querySelector(".ks-primary")?.classList.contains("ks-hold")).toBe(true);
@@ -68,9 +70,9 @@ describe("large orders", () => {
     const bracket = btc("0.1", { takeProfit: { triggerPrice: "110000" }, stopLoss: { triggerPrice: "95000" } });
     const pending = h.ok("signAndSubmit", { requestId: "br", intent: bracket });
     await shown();
-    expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Confirm these 3 orders");
+    expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Confirm: Buy 0.1 BTC + 2 more, $31,000");
+    expect(h.root?.querySelector(".ks-primary")?.textContent).toBe("Buy 0.1 BTC + 2");
     const text = h.promptText();
-    expect(text).toContain("about $31,000 in all");
     expect(text).toContain("Buy 0.1 BTC at $100,000 (limit) · about $10,000");
     expect(text).toContain("Sell 0.1 BTC take-profit at $110,000, then at market (down to $99,000) · reduce-only · about $11,000");
     expect(text).toContain("Sell 0.1 BTC stop-loss at $95,000, then at market (down to $85,500) · reduce-only · about $10,000");
@@ -172,7 +174,8 @@ describe("many orders without a prompt", () => {
     await shown();
     expect(orderPrompts()).toHaveLength(1);
     const text = h.promptText();
-    expect(text).toContain("about $24,000 in all. Orders of about $96,000 went out without a confirmation in the last 10 minutes, so this one needs yours.");
+    expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Confirm: Buy 0.24 BTC, $24,000");
+    expect(text).toContain("to Hyperliquid. Orders of about $96,000 went out without a confirmation in the last 10 minutes, so this one needs yours.");
     expect(h.hl.exchangeCalls).toHaveLength(4);
     await h.clickPrompt();
     expect((await fifth).status).toBe("ok");
@@ -353,11 +356,11 @@ describe("describeOrders", () => {
 
   it("describes modifies, post-only and IOC limits, and counts at the highest of limit, trigger and mark", () => {
     const modify = { type: "modify", oid: 7, order: { a: 1, b: false, p: "1900", s: "20", r: false, t: { limit: { tif: "Alo" } } } };
-    expect(describeOrders(modify, registry, marks)).toEqual({ lines: ["Change an open order to: Sell 20 ETH at $1,900 (post-only limit) · about $40,000"], totalUsd: 40_000 });
+    expect(describeOrders(modify, registry, marks)).toEqual({ lines: ["Change an open order to: Sell 20 ETH at $1,900 (post-only limit) · about $40,000"], heads: ["Sell 20 ETH"], totalUsd: 40_000, changes: true });
     const ioc = { type: "order", orders: [{ a: 1, b: true, p: "2050", s: "1", r: false, t: { limit: { tif: "Ioc" } } }], grouping: "na" };
     expect(describeOrders(ioc, registry, marks).lines).toEqual(["Buy 1 ETH at $2,050 (limit, fill now or cancel) · about $2,050"]);
     const stopLimit = { type: "order", orders: [{ a: 1, b: false, p: "1700", s: "1", r: true, t: { trigger: { isMarket: false, triggerPx: "1750", tpsl: "sl" } } }], grouping: "na" };
-    expect(describeOrders(stopLimit, registry, marks)).toEqual({ lines: ["Sell 1 ETH stop-loss at $1,750, then limit $1,700 · reduce-only · about $2,000"], totalUsd: 2_000 });
-    expect(describeOrders({ type: "cancel", cancels: [{ a: 1, o: 7 }] }, registry, marks)).toEqual({ lines: [], totalUsd: 0 });
+    expect(describeOrders(stopLimit, registry, marks)).toEqual({ lines: ["Sell 1 ETH stop-loss at $1,750, then limit $1,700 · reduce-only · about $2,000"], heads: ["Sell 1 ETH"], totalUsd: 2_000, changes: false });
+    expect(describeOrders({ type: "cancel", cancels: [{ a: 1, o: 7 }] }, registry, marks)).toEqual({ lines: [], heads: [], totalUsd: 0, changes: true });
   });
 });

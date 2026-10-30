@@ -2146,12 +2146,17 @@ export class FrameCore {
     const sub = subAccount?.toLowerCase();
     const whose = sub === undefined ? "" : ` for sub-account ${sub.slice(0, 6)}…${sub.slice(-4)}`;
     const why = recent === undefined ? "" : ` Orders of about ${dollars(recent.usd)} went out without a confirmation in the last ${window}, so ${one ? "this one needs" : "these need"} yours.`;
+    // Side, size and market of the first order, and the total, in the title and on the button too, which always show
+    // whole: a parent that leaves the prompt little room can't hide what is confirmed.
+    const first = orders.heads[0] ?? "";
+    const more = orders.lines.length - 1;
+    const change = orders.changes ? "Change: " : "";
     await this.prompt(
       "order",
       {
-        title: one ? "Confirm this order" : `Confirm these ${orders.lines.length} orders`,
-        body: `The Kokoah app asks to send ${one ? "this order" : "these orders"}${whose} to Hyperliquid, about ${total} in all.${why} Confirm only if you placed ${one ? "it" : "them"}.\n\n${orders.lines.join("\n")}`,
-        actionLabel: one ? "Send order" : `Send ${orders.lines.length} orders`,
+        title: `Confirm${orders.changes ? " change" : ""}: ${first}${more > 0 ? ` + ${more} more` : ""}, ${total}`,
+        body: `The Kokoah app asks to send ${one ? "this order" : "these orders"}${whose} to Hyperliquid.${why} Confirm only if you placed ${one ? "it" : "them"}.\n\n${orders.lines.join("\n")}`,
+        actionLabel: `${change}${first}${more > 0 ? ` + ${more}` : ""}`,
         fixedStyle: true,
         hold: true,
       },
