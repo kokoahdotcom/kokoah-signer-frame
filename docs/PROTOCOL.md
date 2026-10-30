@@ -656,10 +656,12 @@ baseline) and can never go beyond the frame's baseline: a value above it rejects
 
 Limits are kept **per account**. Without `account` (or with the key's master) the call sets the master's limits. With a
 sub-account's address it sets that sub-account's own limits, which apply **on top of the master's**:
-`{ "account": "0x…sub", "maxOrderNotionalUsd": 1000 }`. Each field set replaces the master's value for that
-sub-account (still within the baseline); each field left out keeps the master's value, whenever the master's limits
-are set or changed. So a sub-account that sets only `maxLeverage` keeps the master's notional limits, stop-loss rule
-and daily counter. `{ "account": "0x…sub" }` alone removes them, so the sub-account uses the master's limits again. A
+`{ "account": "0x…sub", "maxOrderNotionalUsd": 1000 }`. Each field set is, for that sub-account, the **stricter** of its
+value and the master's (2026-10-30: the lower number, the coins and action types both allow, spot trading only when
+both have it), so a sub-account's limits never escape a later tightening of the master's, and a sub-account can't be
+looser than the master; each field left out keeps the master's value, whenever the master's limits are set or
+changed. So a sub-account that sets only `maxLeverage` keeps the master's notional limits, stop-loss rule and daily
+counter. `{ "account": "0x…sub" }` alone removes them, so the sub-account uses the master's limits again. A
 sub-account without its own limits always uses the master's. At most 64 sub-accounts can have their own limits.
 Setting limits for an address grants nothing: `vaultAddress` is still checked on HL at signing.
 

@@ -10,6 +10,7 @@ type Signature = Parameters<typeof recoverL1Signer>[0]["signature"];
 import { TESTNET } from "@kokoah/shared/network";
 import { afterEach, describe, expect, it } from "vitest";
 import { nextUsage, usageOf } from "../src/frame/nonces.js";
+import type { AllowedActionType } from "../src/protocol/index.js";
 import { applyUserLimits, BASELINE_LIMITS, createBaselinePolicy, evaluateFramePolicy, limitsForAccount, policyForAccount, separateDailyAccounts } from "../src/frame/policy.js";
 import { BUILDER, FrameHarness, limitOrder, META0, subAccountEntry, T0, USER } from "./helpers.js";
 
@@ -86,6 +87,21 @@ describe("frame policy: vaultAddress", () => {
     expect(limitsForAccount(null, map, SUB2)).toEqual({ maxLeverage: 3 });
     expect(limitsForAccount(masterLimits, map, OTHER)).toBe(masterLimits);
     expect(limitsForAccount(null, map, OTHER)).toBeNull();
+  });
+
+  it("never lets a sub-account's own limits, set earlier, escape a later tightening of the master's", () => {
+    const map = new Map([[SUB, { limits: { maxOrderNotionalUsd: 1_000, maxLeverage: 20, allowedCoins: ["BTC", "ETH"], allowedActionTypes: ["order", "cancel", "modify"] as AllowedActionType[] } }]]);
+    const loose = applyUserLimits(baseline, {});
+    const tight = applyUserLimits(baseline, { maxOrderNotionalUsd: 500, maxLeverage: 5, allowedCoins: ["ETH", "SOL"], allowedActionTypes: ["order", "cancel"] });
+    if (!loose.ok || !tight.ok) throw new Error("master limits");
+    expect(policyForAccount(loose.policy, map, SUB)).toMatchObject({ maxOrderNotionalUsd: 1_000, maxLeverage: 20, allowedCoins: ["BTC", "ETH"] });
+    expect(policyForAccount(tight.policy, map, SUB)).toMatchObject({ maxOrderNotionalUsd: 500, maxLeverage: 5, allowedCoins: ["ETH"], allowedActionTypes: ["order", "cancel"] });
+    expect(limitsForAccount(tight.limits, map, SUB)).toMatchObject({ maxOrderNotionalUsd: 500, maxLeverage: 5, allowedCoins: ["ETH"], allowedActionTypes: ["order", "cancel"] });
+    // Markets they share none of: nothing is allowed.
+    const apart = applyUserLimits(baseline, { allowedCoins: ["SOL"] });
+    if (!apart.ok) throw new Error("master limits");
+    expect(policyForAccount(apart.policy, map, SUB).allowedCoins).toEqual([]);
+    expect(codes(evalFor(SUB, { ownedSubAccount: SUB, policy: policyForAccount(apart.policy, map, SUB) }))).toContain("COIN_NOT_ALLOWED");
   });
 
   it("gives a sub-account a daily counter of its own only when its own limits set a daily limit", () => {
@@ -265,12 +281,15 @@ describe("limits per account", () => {
     expect(violationCodes(await h.fail("signAndSubmit", { requestId: "a", intent: limitOrder({ vaultAddress: SUB, size: "0.3" }) }))).toEqual(
       expect.arrayContaining(["ORDER_NOTIONAL_EXCEEDED", "STOP_LOSS_REQUIRED"]),
     );
-    // A field it sets replaces the master's value for it (still within the baseline; looser: the user confirms).
-    await h.loosen({ account: SUB, maxLeverage: 20, maxOrderNotionalUsd: 1_000 });
-    expect(violationCodes(await h.fail("signAndSubmit", { requestId: "b", intent: limitOrder({ vaultAddress: SUB, size: "0.3" }) }))).toEqual(["STOP_LOSS_REQUIRED"]);
-    expect((await h.ok("signAndSubmit", { requestId: "c", intent: limitOrder({ vaultAddress: SUB, size: "0.3", stopLoss: { triggerPrice: "1900" } }) })).status).toBe("ok");
+    // A field it sets is the stricter of its value and the master's: a higher number of its own changes nothing (no
+    // prompt), the master's $500 still holds for it.
+    await h.ok("setLimits", { account: SUB, maxLeverage: 20, maxOrderNotionalUsd: 1_000 });
+    expect(violationCodes(await h.fail("signAndSubmit", { requestId: "b", intent: limitOrder({ vaultAddress: SUB, size: "0.3", stopLoss: { triggerPrice: "1900" } }) }))).toEqual([
+      "ORDER_NOTIONAL_EXCEEDED",
+    ]);
+    expect((await h.ok("signAndSubmit", { requestId: "c", intent: limitOrder({ vaultAddress: SUB, size: "0.2", stopLoss: { triggerPrice: "1900" } }) })).status).toBe("ok");
     // The master's leverage cap reaches a sub-account whose own limits don't set one.
-    await h.loosen({ account: SUB2, maxOrderNotionalUsd: 1_000 });
+    await h.ok("setLimits", { account: SUB2, maxOrderNotionalUsd: 1_000 });
     await h.loosen({ maxLeverage: 5 });
     h.hl.leverageByUser[SUB2] = { ETH: 10 };
     expect(violationCodes(await h.fail("signAndSubmit", { requestId: "d", intent: limitOrder({ vaultAddress: SUB2 }) }))).toContain("LEVERAGE_EXCEEDED");
