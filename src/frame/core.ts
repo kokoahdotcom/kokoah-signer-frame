@@ -84,6 +84,7 @@ import { errorName, HlHttp, type FetchLike } from "./hl.js";
 import { RegionGate } from "./eligibility.js";
 import { silentLogger, type Logger } from "./log.js";
 import { MarketData, MarketDataError, type MarketSnapshot } from "./market-data.js";
+import { type FrameAccountBook, readAccountBook } from "./accountBook.js";
 import { classifyMessage } from "./messages.js";
 import {
   ConfirmationNeededError,
@@ -1703,6 +1704,13 @@ export class FrameCore {
     };
     let leverageByCoin = needsLeverage(stored) ? await this.accountLeverage(account, coins, snapshot) : undefined;
 
+    // 4a. Where the account's limits require a stop-loss: its positions and resting orders, read from HL by the frame
+    // itself right before each check, so a cancel or modify can't take a stop-loss away from a position and an entry
+    // can't leave the position it adds to partly covered (shared stopCoverage.ts).
+    const touchesStops =
+      intent.kind === "cancel" || intent.kind === "modify" || (intent.kind === "order" && !intent.reduceOnly && snapshot.registry.get(intent.coin)?.kind !== "spot");
+    const bookFor = async (accountPolicy: Policy) => (touchesStops && accountPolicy.requireStopLossForNewEntries ? await this.accountBook(account, intent) : undefined);
+
     const agent = key.meta.agentAddress;
     const usageKey = this.usageKey(key);
     const generation = key.generation;
@@ -1715,6 +1723,7 @@ export class FrameCore {
       // Sub-accounts without a daily limit of their own share the master's daily limit and counter.
       const usageAccount = { account, master, separate: separateDailyAccounts(limits.accounts) };
       const usage = await this.coordinator.usage(usageKey, now, usageAccount);
+      const accountBook = await bookFor(accountPolicy);
       const decision = evaluateFramePolicy({
         compiled,
         expiresAfter,
@@ -1731,6 +1740,7 @@ export class FrameCore {
         network: this.config.network.name,
         verifiedSpotCoins: snapshot.verifiedSpotCoins,
         spotDayVolumes: snapshot.spotDayVolumes,
+        ...(accountBook !== undefined ? { accountBook } : {}),
       });
       if (!decision.allowed) {
         this.metrics.policyDenials++;
@@ -2219,6 +2229,17 @@ export class FrameCore {
       if (lev !== undefined) leverage[coin] = lev;
     }
     return leverage;
+  }
+
+  /** The account's book for the stop-loss check (accountBook.ts); unreadable: nothing is signed (retryable). */
+  private async accountBook(account: Hex, intent: ActionIntent): Promise<FrameAccountBook> {
+    try {
+      return await readAccountBook((body) => this.hl.info(body), account, intent);
+    } catch {
+      throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Could not read your positions and orders from Hyperliquid to check your stop-losses; nothing was signed. Try again shortly.", {
+        retryable: true,
+      });
+    }
   }
 
   /** An HL `/info` read by the frame itself; a failed read signs nothing (`MARKET_DATA_UNAVAILABLE`, retryable). */

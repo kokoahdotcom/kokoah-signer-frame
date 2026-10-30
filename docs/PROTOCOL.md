@@ -843,6 +843,7 @@ The baseline is built into the frame and can't be loosened:
 | Rate | **60 orders per minute** per agent (TP/SL legs count; cancels don't). Persisted, so a reload doesn't reset it |
 | Notional | $250,000 per order, $25,000,000 per UTC day per key across every account (reduce-only orders exempt) |
 | Large orders | More than $25,000 of orders in one action (reduce-only included) only after the user confirms the frame's own prompt (`signAndSubmit`, "Large orders") |
+| Stop-losses (with `requireStopLossForNewEntries`) | An entry's attached stop must cover it, sit on the losing side and be within **25%** of the entry. The frame reads the account's positions and resting orders on HL itself (`clearinghouseState`, `frontendOpenOrders`, and `orderStatus` for an order an action names that isn't among them) before a cancel, a modify or an entry, and refuses (`STOP_LOSS_REQUIRED`) one that would take stop-loss cover away from a position or, with `@kokoah/shared` from 2026-10-30, leave the position an entry adds to partly covered; setting a `scheduleCancel` is refused too (clearing one is allowed). Unreadable: `MARKET_DATA_UNAVAILABLE` (retryable) (2026-10-30) |
 | `expiresAfter` | Required; the frame uses now + 15 s (window ≤ 30 s) |
 | Origins | `manual`, `ai_ticket` |
 
