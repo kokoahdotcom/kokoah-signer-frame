@@ -62,11 +62,12 @@ export interface UnpromptedOrders {
   /** The user confirmed this action in the frame's prompt: it isn't counted. */
   confirmed: boolean;
   /**
-   * That prompt showed the total of unconfirmed orders in this window (ms: {@link UNPROMPTED_WINDOW_MS} or
-   * {@link UNPROMPTED_DAY_MS}), so the user saw it: the orders in that window leave the record, and older ones stay
-   * counted in the longer window. `false`: it showed none.
+   * That prompt showed the total of unconfirmed orders in the window of `windowMs` ({@link UNPROMPTED_WINDOW_MS} or
+   * {@link UNPROMPTED_DAY_MS}) up to `at` (when it computed the total), so the user saw them: those orders leave the
+   * record. Older ones stay counted in the longer window, and so do orders another tab signed after `at`, which the
+   * prompt didn't show. `false`: it showed none.
    */
-  clears: number | false;
+  clears: false | { windowMs: number; at: number };
   /** Most unconfirmed notional in {@link UNPROMPTED_WINDOW_MS}, and in {@link UNPROMPTED_DAY_MS}. */
   maxUsd: number;
   maxDayUsd: number;
@@ -407,9 +408,11 @@ export function nextUsage(
   const deposits = (prev?.hlpDeposits ?? []).filter((d) => d.at > now - HLP_DEPOSIT_RECENT_MS);
   if (hlpDeposit) deposits.push({ master: hlpDeposit.master.toLowerCase(), at: now, usd: hlpDeposit.usd });
   if (deposits.length > 0) record.hlpDeposits = deposits;
-  // A confirmed prompt that showed one window's total clears the orders in that window; older ones stay in the day's.
-  const shownMs = unprompted?.confirmed === true && typeof unprompted.clears === "number" && unprompted.clears > 0 ? unprompted.clears : 0;
-  const unconfirmed = recentUnprompted(prev, now, UNPROMPTED_DAY_MS).filter((o) => !(shownMs > 0 && o.at > now - shownMs));
+  // A confirmed prompt that showed one window's total clears the orders it counted (up to when it counted them); older
+  // ones stay in the day's, and later ones (another tab's, while the prompt was open) stay too.
+  const shown = unprompted?.confirmed === true && unprompted.clears !== false ? unprompted.clears : null;
+  const seen = (o: { at: number }) => shown !== null && o.at > shown.at - shown.windowMs && o.at <= shown.at;
+  const unconfirmed = recentUnprompted(prev, now, UNPROMPTED_DAY_MS).filter((o) => !seen(o));
   if (unprompted !== undefined && !unprompted.confirmed && unprompted.usd > 0 && Number.isFinite(unprompted.usd)) {
     // Summed per minute, so a day of orders is at most 1,440 entries.
     const last = unconfirmed.at(-1);
