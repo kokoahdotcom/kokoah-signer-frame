@@ -355,7 +355,9 @@ async function main(): Promise<number> {
     };
     /**
      * Clicks the frame's primary button with real input, as a user does (the frame ignores clicks a script dispatches,
-     * and a pointer that didn't move over the button): once it is armed, moves the mouse onto it, presses, releases.
+     * and a pointer that didn't move over the button): once it is armed, moves the mouse onto it, presses, releases. A
+     * mouse the frame sees for the first time in a prompt counts only after the arming delay there, so it waits that
+     * long after the first move.
      */
     const clickPrimary = async (frameSession: string) => {
       await waitUntil("document.querySelector('.ks-primary')?.disabled === false", frameSession);
@@ -363,13 +365,15 @@ async function main(): Promise<number> {
       const b = await evaluate<{ x: number; y: number }>("(() => { const r = document.querySelector('.ks-primary').getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()", frameSession);
       const x = f.x + b.x;
       const y = f.y + b.y;
+      await c.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: x - 9, y }, page);
+      await new Promise((r) => setTimeout(r, 900));
       for (const dx of [-6, -3, 0]) await c.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: x + dx, y }, page);
       await c.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 }, page);
       await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 }, page);
     };
     /**
      * Confirms the frame's prompt from the keyboard, as a keyboard user does: a click on its title gives the frame focus,
-     * Tab moves to the primary button (inside the frame, so it counts), then Enter is held past the hold time.
+     * Tab moves past Cancel to the primary button (inside the frame, so it counts), then Enter is held past the hold time.
      */
     const confirmWithKeyboard = async (frameSession: string) => {
       await waitUntil("document.querySelector('.ks-primary')?.disabled === false", frameSession);
@@ -378,8 +382,10 @@ async function main(): Promise<number> {
       await c.send("Input.dispatchMouseEvent", { type: "mousePressed", x: f.x + t.x, y: f.y + t.y, button: "left", clickCount: 1 }, page);
       await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: f.x + t.x, y: f.y + t.y, button: "left", clickCount: 1 }, page);
       const tab = { key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 };
-      await c.send("Input.dispatchKeyEvent", { type: "keyDown", ...tab }, page);
-      await c.send("Input.dispatchKeyEvent", { type: "keyUp", ...tab }, page);
+      for (let i = 0; i < 3 && !(await evaluate<boolean>("document.activeElement?.classList.contains('ks-primary') ?? false", frameSession)); i++) {
+        await c.send("Input.dispatchKeyEvent", { type: "keyDown", ...tab }, page);
+        await c.send("Input.dispatchKeyEvent", { type: "keyUp", ...tab }, page);
+      }
       const focused = await evaluate<string>("document.activeElement?.className + ' / ' + document.querySelector('.ks-status')?.textContent", frameSession);
       const enter = { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 };
       await c.send("Input.dispatchKeyEvent", { type: "keyDown", ...enter, text: "\r" }, page);
