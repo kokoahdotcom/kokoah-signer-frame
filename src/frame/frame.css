@@ -1,6 +1,9 @@
 /*
  * Kokoah signer frame styles. The parent can theme the frame with setTheme, which sets the --ks-* custom properties
  * below on the root element (validated values only). No inline styles anywhere: the CSP has style-src 'self'.
+ *
+ * The frame is the dialog itself: the parent sizes the iframe to what it shows (`promptSize`, prompt.ts) and draws its
+ * outer edge, shadow and backdrop; inside, a themed prompt has no box of its own.
  */
 :root {
   --ks-bg: #0f1115;
@@ -9,12 +12,12 @@
   --ks-accent: #3ecf8e;
   --ks-accent-fg: #0b0d10;
   --ks-danger: #ff6b6b;
-  --ks-border: #2a2f38;
+  --ks-border: #3a414d;
   --ks-focus: #7cc4ff;
   --ks-radius: 10px;
   --ks-font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --ks-font-size: 15px;
-  --ks-padding: 16px;
+  --ks-padding: 24px;
   color-scheme: dark;
 }
 
@@ -26,7 +29,7 @@
     --ks-accent: #0f8a5f;
     --ks-accent-fg: #ffffff;
     --ks-danger: #b3261e;
-    --ks-border: #d9dde3;
+    --ks-border: #c9ced6;
     --ks-focus: #1463ff;
     color-scheme: light;
   }
@@ -46,13 +49,25 @@ body {
   font-family: var(--ks-font);
   font-size: var(--ks-font-size);
   line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+/* The root's margins (the fixed look) stay inside the body instead of collapsing through it. */
+body {
+  display: flow-root;
 }
 
 [hidden] {
   display: none !important;
 }
 
+/* What the frame shows sits in the middle when the frame is taller than it (the least frame height a prompt arms in). */
 .ks-root {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
   height: 100%;
   padding: var(--ks-padding);
 }
@@ -64,41 +79,68 @@ body {
 }
 
 /*
- * The prompt always fits the frame (its order lines scroll inside it), so it can be wholly in view: where the browser
+ * The prompt always fits the frame (its text scrolls inside it), so it can be wholly in view: where the browser
  * reports it, the prompt arms only then, and a parent that clips part of it leaves it disarmed. On every browser it
  * arms only while its text is shown whole, or once the user scrolled the text to its end (prompt.ts).
  */
 .ks-prompt {
   display: flex;
   flex-direction: column;
+  min-height: 0;
   max-height: 100%;
-  border: 1px solid var(--ks-border);
-  border-radius: var(--ks-radius);
-  padding: var(--ks-padding);
 }
 .ks-prompt > * {
   flex-shrink: 0;
 }
 
+/* A small lock (or key) above the title; the fixed-style prompts show a caution sign instead. */
+.ks-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  margin-bottom: 16px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--ks-accent) 16%, transparent);
+  color: var(--ks-accent);
+}
+.ks-icon svg {
+  width: 20px;
+  height: 20px;
+}
+
 .ks-title {
-  margin: 0 0 0.4em;
-  font-size: 1.1em;
+  margin: 0;
+  font-size: calc(1em + 4px);
   font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
 }
 
 .ks-body {
   flex-shrink: 1;
   min-height: 3em;
   overflow-y: auto;
-  margin: 0 0 1em;
+  overscroll-behavior: contain;
+  margin: 6px 0 0;
   color: var(--ks-muted);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
   /* One change per line in the limits prompt. */
   white-space: pre-line;
+  /* A soft shadow at an edge the text scrolls past (only when it scrolls; drawn under the text, never over it). */
+  background:
+    linear-gradient(var(--ks-bg) 30%, transparent) top / 100% 24px no-repeat local,
+    linear-gradient(transparent, var(--ks-bg) 70%) bottom / 100% 24px no-repeat local,
+    radial-gradient(farthest-side at 50% 0, color-mix(in srgb, var(--ks-fg) 14%, transparent), transparent) top / 100% 8px no-repeat scroll,
+    radial-gradient(farthest-side at 50% 100%, color-mix(in srgb, var(--ks-fg) 14%, transparent), transparent) bottom / 100% 8px no-repeat scroll;
 }
 
 /* The code a fixed-style prompt asks for where the browser can't tell whether the prompt is seen. */
 .ks-code {
-  margin: 0 0 1em;
+  margin: 16px 0 0;
 }
 .ks-code-label {
   display: block;
@@ -115,35 +157,66 @@ body {
   padding: 0.4em 0.6em;
   border: 1px solid var(--ks-border);
   border-radius: var(--ks-radius);
+  background: transparent;
+  color: inherit;
   font: inherit;
   font-size: 1.2em;
   letter-spacing: 0.15em;
 }
 .ks-code-input:focus-visible {
-  outline: 3px solid var(--ks-focus);
+  outline: 2px solid var(--ks-focus);
   outline-offset: 2px;
 }
 
+/*
+ * The status line (how to confirm, "Waiting for your passkey…", why the prompt can't arm yet) sits just above the
+ * buttons. It keeps one line of room when empty, so a hint appearing doesn't resize the frame (a resize starts the
+ * prompt over).
+ */
+.ks-status {
+  min-height: 1.5em;
+  margin: 16px 0 0;
+  color: var(--ks-muted);
+  font-size: 0.87em;
+  line-height: 1.5;
+}
+
+/* Cancel, then the action on the right; in a narrow frame the action is on top and both take the whole width. */
 .ks-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.6em;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+@media (max-width: 379px) {
+  .ks-actions {
+    flex-direction: column-reverse;
+  }
+  .ks-actions > .ks-button {
+    width: 100%;
+  }
 }
 
 .ks-button {
   min-height: 44px;
   min-width: 44px;
-  padding: 0.6em 1.1em;
+  padding: 0.55em 1.1em;
   border-radius: var(--ks-radius);
   border: 1px solid var(--ks-border);
   font: inherit;
+  font-weight: 500;
+  line-height: 1.3;
   cursor: pointer;
+  transition:
+    background-color 100ms ease,
+    opacity 150ms ease;
 }
 
 .ks-primary {
   background: var(--ks-accent);
   color: var(--ks-accent-fg);
-  border-color: var(--ks-accent);
+  border-color: transparent;
   font-weight: 600;
 }
 
@@ -152,13 +225,22 @@ body {
   color: var(--ks-fg);
 }
 
+@media (hover: hover) {
+  .ks-primary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--ks-accent) 88%, var(--ks-fg));
+  }
+  .ks-secondary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--ks-fg) 6%, transparent);
+  }
+}
+
 .ks-button:focus-visible {
-  outline: 3px solid var(--ks-focus);
+  outline: 2px solid var(--ks-focus);
   outline-offset: 2px;
 }
 
 .ks-button:disabled {
-  opacity: 0.6;
+  opacity: 0.55;
   cursor: progress;
 }
 
@@ -205,13 +287,6 @@ body {
   border: 0;
 }
 
-.ks-status {
-  min-height: 1.4em;
-  margin: 0.8em 0 0;
-  color: var(--ks-muted);
-  font-size: 0.9em;
-}
-
 .ks-fatal {
   margin: 0;
   color: var(--ks-danger);
@@ -228,28 +303,55 @@ body {
  * A prompt that weakens the key's protection (passkey → device, looser limits, an HLP deposit) ignores the parent's
  * theme: literal Kokoah brand colors and sizes, so the parent's --ks-* values can't hide or disguise it. The look is
  * deliberately the signer frame's own (warm cream card, crimson caution accent), never the embedding app's — so a
- * loosening prompt can't be restyled to blend into the page or look routine.
+ * loosening prompt can't be restyled to blend into the page or look routine. The agent approval notice (prompt.ts
+ * showNotice) always has it too. While one of them is shown the whole frame is that card (prompt.ts sets
+ * `ks-fixed-look` on the root element): cream to its edges, the crimson edge just inside them.
  */
-.ks-prompt.ks-prompt--fixed {
+html.ks-fixed-look,
+html.ks-fixed-look body {
   background: #fbf4ec;
   color: #2b2420;
+}
+.ks-fixed-look .ks-root {
+  height: calc(100% - 12px);
+  margin: 6px;
+  padding: 16px;
   border: 2px solid #be3a57;
   border-radius: 14px;
-  padding: 16px;
+  background: #fbf4ec;
+}
+.ks-prompt.ks-prompt--fixed,
+.ks-notice.ks-notice--fixed,
+.ks-fixed-look .ks-root {
+  color: #2b2420;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   font-size: 15px;
+  line-height: 1.45;
+}
+.ks-prompt.ks-prompt--fixed,
+.ks-notice.ks-notice--fixed {
+  background: #fbf4ec;
+}
+.ks-prompt--fixed .ks-icon {
+  background: #f6dfe2;
+  color: #be3a57;
 }
 .ks-prompt--fixed .ks-title {
   color: #2b2420;
-  font-size: 17px;
+  font-size: 18px;
 }
 .ks-prompt--fixed .ks-body {
   color: #4a403a;
   font-size: 15px;
+  background:
+    linear-gradient(#fbf4ec 30%, transparent) top / 100% 24px no-repeat local,
+    linear-gradient(transparent, #fbf4ec 70%) bottom / 100% 24px no-repeat local,
+    radial-gradient(farthest-side at 50% 0, rgba(43, 36, 32, 0.16), transparent) top / 100% 8px no-repeat scroll,
+    radial-gradient(farthest-side at 50% 100%, rgba(43, 36, 32, 0.16), transparent) bottom / 100% 8px no-repeat scroll;
 }
 .ks-prompt--fixed .ks-status {
   color: #6f635b;
-  font-size: 15px;
+  font-size: 14px;
 }
 .ks-prompt--fixed .ks-button {
   border-radius: 12px;
@@ -264,6 +366,14 @@ body {
   background: #ffffff;
   border-color: #d9cfc6;
   color: #2b2420;
+}
+@media (hover: hover) {
+  .ks-prompt--fixed .ks-primary:hover:not(:disabled) {
+    background: #a8304b;
+  }
+  .ks-prompt--fixed .ks-secondary:hover:not(:disabled) {
+    background: #f6efe8;
+  }
 }
 .ks-prompt--fixed .ks-code-label,
 .ks-prompt--fixed .ks-code-value {
@@ -284,28 +394,22 @@ body {
 }
 
 /*
- * The agent approval notice (prompt.ts showNotice): the new key's address while the main wallet approves it. Always in
- * the frame's own look, like the fixed prompts, so the parent's theme can't change what it shows; it fits the frame
- * and the address wraps rather than being cut off.
+ * The agent approval notice: the new key's address while the main wallet approves it. It fits the frame and the
+ * address wraps rather than being cut off.
  */
 .ks-notice.ks-notice--fixed {
   display: flex;
   flex-direction: column;
+  min-height: 0;
   max-height: 100%;
   overflow-y: auto;
-  background: #fbf4ec;
-  color: #2b2420;
-  border: 2px solid #be3a57;
-  border-radius: 14px;
-  padding: 16px;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  font-size: 15px;
 }
 .ks-notice--fixed .ks-notice-title {
   margin: 0 0 0.4em;
   color: #2b2420;
   font-size: 17px;
   font-weight: 600;
+  line-height: 1.3;
 }
 .ks-notice--fixed .ks-notice-body {
   margin: 0 0 0.6em;
@@ -320,12 +424,17 @@ body {
 }
 .ks-notice--fixed .ks-notice-close {
   align-self: flex-start;
-  margin-top: 0.4em;
+  margin-top: 0.2em;
   background: #ffffff;
   border-color: #d9cfc6;
   border-radius: 12px;
   color: #2b2420;
   font-size: 15px;
+}
+@media (hover: hover) {
+  .ks-notice--fixed .ks-notice-close:hover:not(:disabled) {
+    background: #f6efe8;
+  }
 }
 .ks-notice--fixed .ks-notice-close:focus-visible {
   outline-color: #2b2420;

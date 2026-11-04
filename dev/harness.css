@@ -10,5 +10,5 @@ h2 { font-size: 15px; margin: 18px 0 6px; }
 button { min-height: 32px; padding: 4px 10px; }
 textarea { width: 100%; font: 12px/1.4 ui-monospace, monospace; box-sizing: border-box; }
 pre#log { background: #0f1115; color: #d7dae0; padding: 10px; min-height: 300px; max-height: 60vh; overflow: auto; font-size: 12px; white-space: pre-wrap; }
-iframe[data-kokoah-signer] { width: 100%; height: 230px; border: 2px solid #3ecf8e; border-radius: 8px; background: #0f1115; }
+iframe[data-kokoah-signer] { width: 100%; height: var(--kokoah-signer-height, 300px); border: 2px solid #3ecf8e; border-radius: 8px; background: #0f1115; }
 iframe[data-kokoah-signer][data-kokoah-signer-prompt] { border-color: #ff9f1c; box-shadow: 0 0 0 4px rgba(255, 159, 28, 0.3); }

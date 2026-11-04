@@ -11,6 +11,7 @@
  * const signer = new KokoahSignerClient({ frameUrl: import.meta.env.VITE_SIGNER_FRAME_URL });
  * signer.on("statusChanged", (s) => …);           // subscribe before hello: some events follow it immediately
  * signer.on("promptChanged", ({ visible }) => …);  // show the iframe while visible (passkeys, deposits, looser limits, large orders)
+ * signer.on("promptSize", ({ height }) => …);     // the prompt's natural height (the client sets --kokoah-signer-height on the iframe)
  * signer.on("reconnected", (hello) => { void signer.setLimits(limits); });  // the frame reloaded: re-apply (a no-op when stored)
  * const hello = await signer.hello();          // check hello.network and hello.builder against public-config
  * const r = await signer.signAndSubmit({ requestId: crypto.randomUUID(), intent });
@@ -20,6 +21,8 @@
  */
 import {
   isFrameToParentMessage,
+  PROMPT_SIZE_MAX_PX,
+  PROMPT_SIZE_MIN_PX,
   PROTOCOL_NAME,
   PROTOCOL_VERSION,
   type ConfirmAgentParams,
@@ -116,8 +119,12 @@ export interface KokoahSignerClientOptions {
   /** How long `hello()` keeps trying to reach the frame (ms). Default 15 000. */
   helloTimeoutMs?: number;
   /**
-   * Unhide the iframe while the frame shows a prompt (`promptChanged.visible`) and hide it again afterwards.
-   * Default true. Style `iframe[data-kokoah-signer]` (size, position, modal backdrop) in the app.
+   * Unhide the iframe while the frame shows a prompt (`promptChanged.visible`) and hide it again afterwards, and set
+   * the custom property `--kokoah-signer-height` on it to the prompt's natural height (`promptSize`, e.g. `312px`)
+   * until it closes; an iframe that was hidden stays invisible (`visibility: hidden`, at most
+   * {@link PROMPT_SIZE_WAIT_MS}) until that height is known. Default true. Style `iframe[data-kokoah-signer]` (size,
+   * position, modal backdrop) in the app, for example `height: min(var(--kokoah-signer-height, 620px), calc(100dvh -
+   * 24px))` with no border of its own (a border takes from the frame's room).
    */
   autoShowOnPrompt?: boolean;
   /** Accessible title of the iframe. Default "Kokoah signer". */
@@ -144,6 +151,14 @@ type Listener<E extends ClientEventName> = (data: ClientEventData[E]) => void;
 
 const INTERACTIVE_TIMEOUT_MS = 300_000;
 const HELLO_ATTEMPT_MS = 1_500;
+/** The custom property the client sets on the iframe to the frame's `promptSize.height` (see `autoShowOnPrompt`). */
+export const PROMPT_HEIGHT_PROPERTY = "--kokoah-signer-height";
+/**
+ * How long an iframe that was hidden stays invisible when a prompt opens (laid out, `visibility: hidden`) until the
+ * frame reports the prompt's height, which it can measure only once the iframe is laid out: so the prompt never shows
+ * at another size first. A frame that reports none (older frames) is shown after this.
+ */
+export const PROMPT_SIZE_WAIT_MS = 150;
 
 /** Client for the Kokoah signer frame. One instance per app. */
 export class KokoahSignerClient {
@@ -165,6 +180,9 @@ export class KokoahSignerClient {
   private reconnectPending = false;
   /** The frame shows a prompt (`promptChanged.visible`): requests may be waiting for the user. */
   private promptOpen = false;
+  /** The open prompt's height is known (`promptSize`); while not, after it opened, the iframe waits invisible. */
+  private promptSized = false;
+  private sizeWait: ReturnType<typeof setTimeout> | undefined;
   private readyWaiters: Array<() => void> = [];
   private loaded = false;
   private destroyed = false;
@@ -376,6 +394,7 @@ export class KokoahSignerClient {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    clearTimeout(this.sizeWait);
     this.win.removeEventListener("message", this.onMessage);
     for (const [id, p] of this.pending) {
       clearTimeout(p.timer);
@@ -401,6 +420,8 @@ export class KokoahSignerClient {
     this.helloPromise = null;
     this.reconnectPending = true;
     this.promptOpen = false;
+    this.promptSized = false;
+    this.endSizeWait();
     for (const [id, p] of this.pending) {
       clearTimeout(p.timer);
       this.pending.delete(id);
@@ -414,6 +435,24 @@ export class KokoahSignerClient {
     }
     // Failures surface on the next request, which retries the handshake (and still emits `reconnected`).
     this.hello().catch(() => {});
+  }
+
+  /**
+   * The iframe was just shown for a prompt whose height isn't known yet: it stays laid out but invisible until the
+   * frame reports it (it can't measure while the iframe is hidden), at most {@link PROMPT_SIZE_WAIT_MS}. The frame's
+   * prompt doesn't arm while it isn't visible.
+   */
+  private startSizeWait(): void {
+    clearTimeout(this.sizeWait);
+    this.iframe.style.setProperty("visibility", "hidden");
+    this.sizeWait = setTimeout(() => this.endSizeWait(), PROMPT_SIZE_WAIT_MS);
+  }
+
+  private endSizeWait(): void {
+    if (this.sizeWait === undefined) return;
+    clearTimeout(this.sizeWait);
+    this.sizeWait = undefined;
+    this.iframe.style.removeProperty("visibility");
   }
 
   private dispatch<E extends ClientEventName>(event: E, data: ClientEventData[E]): void {
@@ -540,9 +579,25 @@ export class KokoahSignerClient {
         for (const [id, p] of this.pending) this.startTimer(id, p);
       }
       if (this.options.autoShowOnPrompt) {
+        const appearing = data.visible && this.iframe.hidden;
         this.iframe.hidden = !data.visible;
         if (data.kind) this.iframe.setAttribute("data-kokoah-signer-prompt", data.kind);
         else this.iframe.removeAttribute("data-kokoah-signer-prompt");
+        if (!data.visible) {
+          this.promptSized = false;
+          this.endSizeWait();
+          this.iframe.style.removeProperty(PROMPT_HEIGHT_PROPERTY);
+        } else if (appearing && !this.promptSized) this.startSizeWait();
+      }
+    }
+    if (msg.event === "promptSize") {
+      const { height } = msg.data as EventData["promptSize"];
+      if (typeof height !== "number" || !Number.isInteger(height) || height < PROMPT_SIZE_MIN_PX || height > PROMPT_SIZE_MAX_PX) return;
+      if (this.options.autoShowOnPrompt) {
+        // Through the CSSOM, which a page whose CSP forbids style attributes still allows.
+        this.iframe.style.setProperty(PROMPT_HEIGHT_PROPERTY, `${height}px`);
+        this.promptSized = true;
+        this.endSizeWait();
       }
     }
     this.dispatch(msg.event, msg.data);

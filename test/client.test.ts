@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { KokoahSignerClient, SignerRequestError } from "../src/client/index.js";
-import { PROTOCOL_NAME, PROTOCOL_VERSION } from "../src/protocol/index.js";
+import { KokoahSignerClient, PROMPT_SIZE_WAIT_MS, SignerRequestError } from "../src/client/index.js";
+import { PROMPT_SIZE_MAX_PX, PROMPT_SIZE_MIN_PX, PROTOCOL_NAME, PROTOCOL_VERSION } from "../src/protocol/index.js";
 import { DAY, FRAME_ORIGIN, FrameHarness, limitOrder, MockPasskeys, testConfig, USER, waitFor, type HarnessOptions } from "./helpers.js";
 
 const FRAME_URL = `${FRAME_ORIGIN}/`;
@@ -154,6 +154,89 @@ describe("KokoahSignerClient", () => {
       { visible: true, kind: "agent-approval" },
       { visible: false, kind: null },
     ]);
+  });
+
+  it("sizes the iframe to the prompt's natural height (promptSize) while it is shown, and forgets it after", async () => {
+    // jsdom lays nothing out: the frame's prompt and panel are 400 px tall.
+    const box = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const height = /ks-prompt|ks-notice/.test(this.className) ? 400 : 0;
+      return { x: 0, y: 0, top: 0, left: 0, right: 300, bottom: height, width: 300, height, toJSON: () => ({}) };
+    });
+    cleanups.push(() => box.mockRestore());
+    const { h, client } = await connected({ passkeys: new MockPasskeys() });
+    const seen: string[] = [];
+    client.on("promptSize", ({ height }) => seen.push(`size ${height}`));
+    client.on("promptChanged", ({ visible }) => seen.push(`visible ${visible}`));
+    const creating = client.createAgent({ userAddress: USER, validForDays: 30, storageMode: "passkey" });
+    await waitFor(() => !client.iframe.hidden);
+    // Sized before it is shown, so it never appears at another size first.
+    expect(seen).toEqual(["size 400", "visible true"]);
+    expect(client.iframe.style.getPropertyValue("--kokoah-signer-height")).toBe("400px");
+    await h.clickPrompt();
+    const created = await creating;
+    // The agent approval panel that follows reports its own.
+    expect(client.iframe.style.getPropertyValue("--kokoah-signer-height")).toBe("400px");
+    h.hl.approve(USER, created.agentAddress, created.agentName, created.validUntil);
+    await client.confirmAgent({ timeoutMs: 1_000 });
+    expect(client.iframe.hidden).toBe(true);
+    expect(client.iframe.style.getPropertyValue("--kokoah-signer-height")).toBe("");
+    expect(seen).toEqual(["size 400", "visible true", "visible false", "size 400", "visible true", "visible false"]);
+  });
+
+  it("ignores a promptSize outside the protocol's bounds or not a whole number of px", async () => {
+    const { client, frameWindow } = await connected();
+    await client.hello();
+    const seen: number[] = [];
+    client.on("promptSize", ({ height }) => seen.push(height));
+    const send = (height: unknown) =>
+      window.dispatchEvent(
+        new MessageEvent("message", { data: { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, kind: "event", event: "promptSize", data: { height } }, origin: FRAME_ORIGIN, source: frameWindow }),
+      );
+    for (const bad of [299, 2001, 320.5, "400", Number.NaN, null]) send(bad);
+    expect(seen).toEqual([]);
+    expect(client.iframe.style.getPropertyValue("--kokoah-signer-height")).toBe("");
+    send(PROMPT_SIZE_MIN_PX);
+    send(PROMPT_SIZE_MAX_PX);
+    expect(seen).toEqual([300, 2000]);
+    expect(client.iframe.style.getPropertyValue("--kokoah-signer-height")).toBe("2000px");
+  });
+
+  it("keeps a newly shown iframe invisible until the prompt's height is known, and a frame that sends none only a moment", async () => {
+    const { client, frameWindow } = await connected();
+    await client.hello();
+    const event = (name: string, data: unknown) =>
+      window.dispatchEvent(new MessageEvent("message", { data: { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, kind: "event", event: name, data }, origin: FRAME_ORIGIN, source: frameWindow }));
+    const visibility = () => client.iframe.style.getPropertyValue("visibility");
+    event("promptChanged", { visible: true, kind: "passkey-unlock" });
+    // Laid out (so the frame can measure it), not yet seen.
+    expect(client.iframe.hidden).toBe(false);
+    expect(visibility()).toBe("hidden");
+    event("promptSize", { height: 320 });
+    expect(visibility()).toBe("");
+    expect(client.iframe.style.getPropertyValue("--kokoah-signer-height")).toBe("320px");
+    // Already shown: the next panel's size arrives with it, nothing waits.
+    event("promptChanged", { visible: true, kind: "agent-approval" });
+    expect(visibility()).toBe("");
+    event("promptChanged", { visible: false, kind: null });
+    expect(client.iframe.hidden).toBe(true);
+    // An older frame reports no size: shown after PROMPT_SIZE_WAIT_MS anyway.
+    event("promptChanged", { visible: true, kind: "order" });
+    expect(visibility()).toBe("hidden");
+    await new Promise((r) => setTimeout(r, PROMPT_SIZE_WAIT_MS + 30));
+    expect(visibility()).toBe("");
+    expect(client.iframe.hidden).toBe(false);
+  });
+
+  it("leaves the iframe's size to the app without autoShowOnPrompt, and still tells the app", async () => {
+    const { client, frameWindow } = await connected({ clientOptions: { autoShowOnPrompt: false } });
+    await client.hello();
+    const seen: number[] = [];
+    client.on("promptSize", ({ height }) => seen.push(height));
+    window.dispatchEvent(
+      new MessageEvent("message", { data: { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, kind: "event", event: "promptSize", data: { height: 360 } }, origin: FRAME_ORIGIN, source: frameWindow }),
+    );
+    expect(seen).toEqual([360]);
+    expect(client.iframe.style.getPropertyValue("--kokoah-signer-height")).toBe("");
   });
 
   describe("while the frame asks the user about a signAndSubmit", () => {
