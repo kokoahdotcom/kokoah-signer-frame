@@ -172,10 +172,11 @@ These aren't in this repo's power; they are for the kokoah-infra owners.
 4. **Events.**
    - `statusChanged`: key state for the banners in §B6.1.
    - `keyExpiringSoon` / `keyExpired`: renew banner. They fire once per key per frame load; `hello.status` and `getStatus()` carry the same state (`expiringSoon`, `expired`, `expiresAt`), so drive the banner from the status.
-   - `promptChanged`: while `visible`, the iframe **must be shown and clickable**. The client unhides it and sets `data-kokoah-signer-prompt`; style it as a modal:
+   - `promptChanged`: while `visible`, the iframe **must be shown and clickable**. The client unhides it and sets `data-kokoah-signer-prompt`; style it as a modal, as tall as the prompt (`promptSize`, below):
      ```css
-     iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min(420px, 92vw); height: min(480px, 92vh); border: 0; border-radius: 12px; z-index: 1000; box-shadow: 0 10px 40px rgb(0 0 0 / 0.5); }
+     iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min(400px, 92vw); height: min(var(--kokoah-signer-height, 480px), 92dvh); border: 0; border-radius: 12px; z-index: 1000; box-shadow: 0 10px 40px rgb(0 0 0 / 0.5); }
      ```
+   - `promptSize` (2026-11-04): the natural height of what the frame shows (CSS px, 300 to 2,000). The client sets it on the iframe as `--kokoah-signer-height` until the prompt closes; cap it to the screen (a taller prompt's text scrolls inside the frame) and give the iframe no border or padding of its own. See [PROTOCOL "Sizing the prompt"](docs/PROTOCOL.md#3-the-client).
    - `reconnected` (client-side, payload: the new `HelloResult`): the frame reloaded and the client re-ran `hello` with the same params. The new frame has forgotten the theme, remembered `requestId`s and an unlocked passkey key; it keeps the user limits it stores. Re-check `network`/`builder`, re-apply `setLimits` (a no-op when unchanged) and `setTheme` in the listener (requests the listener starts synchronously go out before requests that waited for the reconnect), and refresh the status from `hello.status`:
      ```ts
      signer.on("reconnected", (hello) => { checkHello(hello); void signer.setLimits(limits); void signer.setTheme(theme); setSignerStatus(hello.status); });

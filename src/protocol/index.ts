@@ -86,8 +86,15 @@ export const METHODS = [
 export type MethodName = (typeof METHODS)[number];
 
 /** Every event name. */
-export const EVENTS = ["ready", "statusChanged", "keyExpiringSoon", "keyExpired", "promptChanged"] as const;
+export const EVENTS = ["ready", "statusChanged", "keyExpiringSoon", "keyExpired", "promptChanged", "promptSize"] as const;
 export type EventName = (typeof EVENTS)[number];
+
+/**
+ * Bounds of `promptSize.height` (CSS px). The least is the least frame height a prompt arms in (280 × 300, see
+ * docs/PROTOCOL.md), so a parent that sizes the frame to the reported height never leaves the prompt disarmed.
+ */
+export const PROMPT_SIZE_MIN_PX = 300;
+export const PROMPT_SIZE_MAX_PX = 2_000;
 
 /** Theme variables the parent may set with `setTheme` (CSS custom properties on the frame's root element). */
 export const THEME_VARIABLES = [
@@ -697,6 +704,16 @@ export interface EventData {
     visible: boolean;
     kind: "passkey-create" | "passkey-unlock" | "vault-deposit" | "vault-withdraw" | "limits" | "order" | "margin" | "key-remove" | "agent-approval" | null;
   };
+  /**
+   * The natural height of what the frame shows (a prompt or the agent approval panel) at the frame's current width:
+   * CSS px, an integer from {@link PROMPT_SIZE_MIN_PX} to {@link PROMPT_SIZE_MAX_PX}, at which it fits whole without
+   * scrolling. Sent with `promptChanged {visible: true}` (just before it, or, when the iframe was hidden, as soon as it
+   * is laid out) and again whenever that height changes (another frame width, a longer status line); within one
+   * prompt at one width it never shrinks. Size the iframe to it, capped to the
+   * screen (a taller prompt's text scrolls inside the frame). With `autoShowOnPrompt` the client sets it on the iframe
+   * as `--kokoah-signer-height` (CSS px) until the prompt closes. Absent in older frames (2026-11-04).
+   */
+  promptSize: { height: number };
 }
 
 // ---------------------------------------------------------------------------------------------

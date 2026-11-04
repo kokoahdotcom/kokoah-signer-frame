@@ -320,6 +320,7 @@ export class FrameCore {
     this.ui =
       deps.document && root
         ? new PromptUi(deps.document, root, (visible, kind) => this.emit("promptChanged", { visible, kind }), {
+            onSize: (height) => this.emit("promptSize", { height }),
             ...(deps.promptArmMs !== undefined ? { armMs: deps.promptArmMs } : {}),
             ...(deps.promptHoldMs !== undefined ? { holdMs: deps.promptHoldMs } : {}),
             ...(deps.promptIsTrusted ? { isTrusted: deps.promptIsTrusted } : {}),

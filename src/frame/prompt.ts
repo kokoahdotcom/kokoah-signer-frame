@@ -10,7 +10,7 @@
  *
  * @module
  */
-import { THEME_VARIABLES, type SetThemeParams, type ThemeVariable } from "../protocol/index.js";
+import { PROMPT_SIZE_MAX_PX, PROMPT_SIZE_MIN_PX, THEME_VARIABLES, type SetThemeParams, type ThemeVariable } from "../protocol/index.js";
 
 /**
  * `vault-deposit`: the user confirms an HLP deposit inside the frame before the trading key signs it, `vault-withdraw`
@@ -83,6 +83,38 @@ function el<K extends keyof HTMLElementTagNameMap>(doc: Document, tag: K, classN
   return e;
 }
 
+/** The prompt's icons (Lucide's `lock`, `key-round` and `triangle-alert`, ISC license): 24 × 24 strokes. */
+const ICONS = {
+  lock: [
+    ["rect", { width: "18", height: "11", x: "3", y: "11", rx: "2", ry: "2" }],
+    ["path", { d: "M7 11V7a5 5 0 0 1 10 0v4" }],
+  ],
+  key: [
+    ["path", { d: "M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z" }],
+    ["circle", { cx: "16.5", cy: "7.5", r: ".5", fill: "currentColor" }],
+  ],
+  alert: [
+    ["path", { d: "m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" }],
+    ["path", { d: "M12 9v4" }],
+    ["path", { d: "M12 17h.01" }],
+  ],
+} as const satisfies Record<string, ReadonlyArray<readonly [string, Readonly<Record<string, string>>]>>;
+
+/** An icon as SVG built with DOM calls (no HTML parsing), drawn in the text colour and hidden from screen readers. */
+function icon(doc: Document, name: keyof typeof ICONS): SVGSVGElement {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = doc.createElementNS(ns, "svg");
+  for (const [k, v] of Object.entries({ viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true", focusable: "false" })) {
+    svg.setAttribute(k, v);
+  }
+  for (const [tag, attrs] of ICONS[name]) {
+    const shape = doc.createElementNS(ns, tag);
+    for (const [k, v] of Object.entries(attrs)) shape.setAttribute(k, v);
+    svg.append(shape);
+  }
+  return svg;
+}
+
 /**
  * How long the prompt must have been shown, and seen whole and unobscured where the browser can tell, before its
  * primary button works. The parent page learns the moment a prompt opens (`promptChanged`, so it can make room for
@@ -112,10 +144,11 @@ export const PROMPT_FULL_INTERSECTION = 0.995;
 
 /**
  * Least size (CSS px) of the frame's window for a prompt to arm. Smaller, the parent leaves room for little more than
- * the title and the buttons, and the prompt's text would need scrolling.
+ * the title and the buttons, and the prompt's text would need scrolling. The height the frame reports for a prompt
+ * (`promptSize`) is never less.
  */
 export const PROMPT_MIN_WIDTH = 280;
-export const PROMPT_MIN_HEIGHT = 300;
+export const PROMPT_MIN_HEIGHT = PROMPT_SIZE_MIN_PX;
 /**
  * Lines of the prompt's text that must be in view at once when it doesn't fit whole (a small phone): the user then
  * scrolls it to its end before the prompt arms, so every line has been shown.
@@ -124,7 +157,14 @@ export const PROMPT_MIN_BODY_LINES = 5;
 
 type VisibilityEntry = IntersectionObserverEntry & { isVisible?: boolean };
 
-/** Timing of the prompt and, for tests (jsdom can't make trusted events), which input events count as the user's. */
+/** How often, and how many times, a prompt that isn't laid out yet is measured again (see `measureUntilKnown`). */
+const SIZE_RETRY_MS = 16;
+const SIZE_TRIES = 20;
+
+/**
+ * Timing of the prompt, where its size goes and, for tests (jsdom can't make trusted events), which input events count
+ * as the user's.
+ */
 export interface PromptUiOptions {
   armMs?: number;
   holdMs?: number;
@@ -132,6 +172,12 @@ export interface PromptUiOptions {
   isTrusted?: (ev: Event) => boolean;
   /** Test seam: the confirmation code's digits (default `crypto.getRandomValues`). */
   randomDigits?: (count: number) => string;
+  /**
+   * The natural height of the shown prompt or notice (the `promptSize` event, see {@link PromptUi.measure}): called
+   * before `onChange` reports it shown (or, while the frame isn't laid out, as soon as it is), and again when that
+   * height changes.
+   */
+  onSize?: (height: number) => void;
 }
 
 function randomDigits(doc: Document, count: number): string {
@@ -169,6 +215,15 @@ function randomDigits(doc: Document, count: number): string {
  */
 export class PromptUi {
   private readonly onChange: (visible: boolean, kind: PromptKind | null) => void;
+  private readonly onSize: ((height: number) => void) | null;
+  /**
+   * The last height reported for what is shown (null: none yet since it was shown), and the least height to report at
+   * the window width `sizeWidth` (the largest so far there): within one prompt the reported height never shrinks.
+   */
+  private sizeSent: number | null = null;
+  private sizeFloor = 0;
+  private sizeWidth = -1;
+  private sizeRetry: ReturnType<typeof setTimeout> | undefined;
   private readonly armMs: number;
   private readonly holdMs: number;
   private readonly isTrusted: (ev: Event) => boolean;
@@ -204,9 +259,11 @@ export class PromptUi {
   /** The open prompt's: whether it confirms by holding, and what confirming does. */
   private hold = false;
   private confirm: (() => void) | null = null;
+  private readonly root: HTMLElement;
   private readonly idle: HTMLElement;
   private readonly idleText: HTMLElement;
   private readonly panel: HTMLElement;
+  private readonly icon: HTMLElement;
   private readonly title: HTMLElement;
   private readonly body: HTMLElement;
   private readonly codeBox: HTMLElement;
@@ -226,10 +283,12 @@ export class PromptUi {
 
   constructor(doc: Document, root: HTMLElement, onChange: (visible: boolean, kind: PromptKind | null) => void, options: PromptUiOptions = {}) {
     this.onChange = onChange;
+    this.onSize = options.onSize ?? null;
     this.armMs = options.armMs ?? PROMPT_ARM_MS;
     this.holdMs = options.holdMs ?? PROMPT_HOLD_MS;
     this.isTrusted = options.isTrusted ?? ((ev) => ev.isTrusted);
     this.digits = options.randomDigits ?? ((count) => randomDigits(doc, count));
+    this.root = root;
     this.idle = el(doc, "section", "ks-idle");
     this.idle.setAttribute("aria-label", "Kokoah signer status");
     this.idleText = el(doc, "p", "ks-idle-text", "Kokoah signer");
@@ -239,6 +298,7 @@ export class PromptUi {
     this.panel.setAttribute("role", "dialog");
     this.panel.setAttribute("aria-modal", "true");
     this.panel.hidden = true;
+    this.icon = el(doc, "div", "ks-icon");
     this.title = el(doc, "h1", "ks-title");
     this.title.id = "ks-title";
     this.body = el(doc, "p", "ks-body");
@@ -271,11 +331,12 @@ export class PromptUi {
     this.primary.setAttribute("aria-describedby", "ks-key-hint");
     this.secondary = el(doc, "button", "ks-button ks-secondary");
     this.secondary.type = "button";
-    actions.append(this.primary, this.secondary);
+    // Cancel, then the action: on the right of it, or on top in a narrow frame (frame.css).
+    actions.append(this.secondary, this.primary);
     this.status = el(doc, "p", "ks-status");
     this.status.setAttribute("role", "status");
     this.status.setAttribute("aria-live", "polite");
-    this.panel.append(this.title, this.body, this.codeBox, actions, keyHint, this.status);
+    this.panel.append(this.icon, this.title, this.body, this.codeBox, this.status, actions, keyHint);
     this.codeInput.addEventListener("input", (ev) => this.onCode(ev));
     this.body.addEventListener("scroll", () => this.onBodyScroll());
 
@@ -337,7 +398,14 @@ export class PromptUi {
     win?.addEventListener("resize", () => {
       this.forgetFramePointer();
       this.rearm();
+      this.measure();
     });
+    // What is shown changed size (a status line that wraps, another width): the parent learns its new height.
+    const Observer = (win as (Window & typeof globalThis) | null)?.ResizeObserver;
+    if (this.onSize && Observer) {
+      const observer = new Observer(() => this.measure());
+      for (const e of [this.panel, this.body, this.noticePanel]) observer.observe(e);
+    }
     win?.addEventListener("blur", () => {
       this.forgetFramePointer();
       this.rearm();
@@ -370,7 +438,7 @@ export class PromptUi {
     if (this.active === null) {
       this.idle.hidden = true;
       this.noticePanel.hidden = false;
-      this.onChange(true, req.kind);
+      this.shown(true, req.kind);
     }
     return () => this.endNotice(entry);
   }
@@ -384,8 +452,69 @@ export class PromptUi {
     this.noticePanel.hidden = true;
     if (this.active === null) {
       this.idle.hidden = false;
-      this.onChange(false, null);
+      this.shown(false, null);
     }
+  }
+
+  /**
+   * A prompt or the notice was just shown (`kind`), or neither is any more: the frame's whole look follows (a fixed-style
+   * prompt and the notice make the frame their card, frame.css `ks-fixed-look`), the parent learns its height, then
+   * that it is shown.
+   */
+  private shown(fixedLook: boolean, kind: PromptKind | null): void {
+    this.root.ownerDocument.documentElement.classList.toggle("ks-fixed-look", fixedLook);
+    this.sizeSent = null;
+    this.sizeFloor = 0;
+    this.sizeWidth = -1;
+    clearTimeout(this.sizeRetry);
+    if (kind === null) {
+      this.onChange(false, null);
+      return;
+    }
+    this.measureUntilKnown(SIZE_TRIES);
+    this.onChange(true, kind);
+  }
+
+  /**
+   * Measures now and, while the frame isn't laid out yet (the parent unhides the iframe only once it learns a prompt
+   * opened, and a browser renders an iframe it doesn't show only lazily), again shortly, a few times.
+   */
+  private measureUntilKnown(tries: number): void {
+    if (!this.onSize) return;
+    this.measure();
+    if (this.sizeSent !== null || tries <= 1) return;
+    this.sizeRetry = setTimeout(() => this.measureUntilKnown(tries - 1), SIZE_RETRY_MS);
+  }
+
+  /**
+   * Reports the natural height of the shown prompt or notice (`onSize`): the root's margin, border and padding and the
+   * panel, with any text scrolled out of view counted whole, so the parent can size the frame to show it all. Clamped
+   * to {@link PROMPT_SIZE_MIN_PX} (the least height a prompt arms in) and {@link PROMPT_SIZE_MAX_PX}. While one is
+   * shown at one window width the height never shrinks, so a status line that wraps once doesn't make the frame resize
+   * (and the prompt start over) each time it changes. Nothing is reported while the frame isn't laid out (a hidden
+   * iframe): it is measured again once it is shown.
+   */
+  private measure(): void {
+    const panel = this.active !== null ? this.panel : this.notice !== null ? this.noticePanel : null;
+    const win = this.root.ownerDocument.defaultView;
+    if (!this.onSize || !panel || panel.hidden || !win) return;
+    const box = panel.getBoundingClientRect();
+    if (box.height <= 0 || win.innerWidth <= 0) return;
+    const s = win.getComputedStyle(this.root);
+    const px = (v: string) => Number.parseFloat(v) || 0;
+    const around = px(s.marginTop) + px(s.borderTopWidth) + px(s.paddingTop) + px(s.paddingBottom) + px(s.borderBottomWidth) + px(s.marginBottom);
+    const scroller = panel === this.panel ? this.body : panel;
+    const unseen = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    if (win.innerWidth !== this.sizeWidth) {
+      this.sizeWidth = win.innerWidth;
+      this.sizeFloor = 0;
+    }
+    const natural = Math.ceil(around + box.height + unseen - 0.01);
+    const height = Math.min(PROMPT_SIZE_MAX_PX, Math.max(PROMPT_SIZE_MIN_PX, this.sizeFloor, natural));
+    this.sizeFloor = height;
+    if (height === this.sizeSent) return;
+    this.sizeSent = height;
+    this.onSize(height);
   }
 
   /** Updates the idle status line (network, key state). */
@@ -458,6 +587,7 @@ export class PromptUi {
     this.hold = req.hold === true;
     this.panel.classList.toggle("ks-prompt--fixed", req.fixedStyle === true);
     this.primary.classList.toggle("ks-hold", this.hold);
+    this.icon.replaceChildren(icon(this.panel.ownerDocument, req.fixedStyle === true ? "alert" : req.kind === "passkey-create" ? "key" : "lock"));
     this.title.textContent = req.title;
     this.body.textContent = req.body;
     this.primary.textContent = req.actionLabel;
@@ -472,7 +602,7 @@ export class PromptUi {
     this.noticePanel.hidden = true;
     this.panel.hidden = false;
     this.scrollToTop();
-    this.onChange(true, req.kind);
+    this.shown(req.fixedStyle === true, req.kind);
     // Focus starts on Cancel, or on the code to type: a key press meant for the page (Enter, Space) can't confirm.
     if (this.code !== null) this.codeInput.focus();
     else this.secondary.focus();
@@ -760,10 +890,10 @@ export class PromptUi {
     // A notice that waited behind the prompt comes back.
     if (this.notice !== null) {
       this.noticePanel.hidden = false;
-      this.onChange(true, this.notice.kind);
+      this.shown(true, this.notice.kind);
     } else {
       this.idle.hidden = false;
-      this.onChange(false, null);
+      this.shown(false, null);
     }
   }
 

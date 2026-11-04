@@ -100,12 +100,10 @@ jobs:
         run: corepack enable pnpm
 
       # @kokoah/shared is link:../kokoah-shared: its last commit, as the deploy build uses it (kokoah-infra
-      # vercel/build.sh), read with its read-only deploy key (KOKOAH_SHARED_DEPLOY_KEY, also a Dependabot secret),
-      # moved beside this checkout and built.
+      # vercel/build.sh). kokoah-shared is public, so it is read without a key; moved beside this checkout and built.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository_owner }}/kokoah-shared
-          ssh-key: ${{ secrets.KOKOAH_SHARED_DEPLOY_KEY }}
           persist-credentials: false
           path: .kokoah-shared
 

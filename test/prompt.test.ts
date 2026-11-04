@@ -7,6 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PromptUi, PromptError, type PromptRequest } from "../src/frame/prompt.js";
+import { PROMPT_SIZE_MAX_PX } from "../src/protocol/index.js";
 import { pointerOnto } from "./helpers.js";
 
 const REQ: PromptRequest = {
@@ -691,5 +692,127 @@ describe("prompt arming", () => {
       primary.dispatchEvent(new PointerEvent("pointermove", { ...at(49), clientX: 79 }));
       expect(primary.disabled).toBe(true);
     });
+  });
+});
+
+describe("the prompt's size (promptSize) and look", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    document.body.replaceChildren();
+    document.documentElement.className = "";
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1024 });
+  });
+
+  /**
+   * A prompt UI whose events (`size …`, `shown …`) are recorded in order. jsdom lays nothing out: the root's padding
+   * is 24 px, the panels are `panel` px tall and the prompt's text `text.scroll` px in a box of `text.client`.
+   */
+  function sized() {
+    const root = document.createElement("div");
+    root.style.padding = "24px";
+    document.body.append(root);
+    const log: string[] = [];
+    const ui = new PromptUi(document, root, (visible, kind) => log.push(`shown ${visible} ${kind}`), { armMs: 0, isTrusted: () => true, onSize: (h) => log.push(`size ${h}`) });
+    const layout = { panel: 250, scroll: 40, client: 40 };
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const height = /ks-prompt|ks-notice/.test(this.className) ? layout.panel : 0;
+      return { x: 0, y: 0, top: 0, left: 0, right: 300, bottom: height, width: 300, height, toJSON: () => ({}) };
+    });
+    const body = root.querySelector<HTMLElement>(".ks-body")!;
+    Object.defineProperty(body, "scrollHeight", { configurable: true, get: () => layout.scroll });
+    Object.defineProperty(body, "clientHeight", { configurable: true, get: () => layout.client });
+    const resize = (width = window.innerWidth) => {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+      window.dispatchEvent(new Event("resize"));
+    };
+    const cancel = () => root.querySelector<HTMLButtonElement>(".ks-secondary")!.click();
+    return { root, ui, log, layout, resize, cancel };
+  }
+
+  it("reports the natural height before it says the prompt is shown, at least the least height a prompt arms in", () => {
+    const { ui, log, layout, cancel } = sized();
+    void ui.run(REQ, async () => "ok", () => ({ retry: false })).catch(() => {});
+    // 24 + 250 + 24 = 298: the frame asks for the 300 px a prompt needs to arm.
+    expect(log).toEqual(["size 300", "shown true passkey-unlock"]);
+    cancel();
+    layout.panel = 400;
+    void ui.run(HOLD, async () => "ok", () => ({ retry: false })).catch(() => {});
+    expect(log.slice(-2)).toEqual(["size 448", "shown true limits"]);
+  });
+
+  it("counts the text scrolled out of view whole, and stays within the protocol's bounds", () => {
+    const { ui, log, layout, cancel } = sized();
+    layout.panel = 500;
+    layout.scroll = 900;
+    layout.client = 300;
+    void ui.run(HOLD, async () => "ok", () => ({ retry: false })).catch(() => {});
+    expect(log[0]).toBe("size 1148");
+    cancel();
+    layout.panel = 5_000;
+    void ui.run(HOLD, async () => "ok", () => ({ retry: false })).catch(() => {});
+    expect(log.at(-2)).toBe(`size ${PROMPT_SIZE_MAX_PX}`);
+  });
+
+  it("never shrinks within one prompt at one width, starts again at another width and for the next prompt", () => {
+    const { ui, log, layout, resize, cancel } = sized();
+    layout.panel = 400;
+    void ui.run(HOLD, async () => "ok", () => ({ retry: false })).catch(() => {});
+    layout.panel = 430; // a status line that wrapped
+    resize();
+    layout.panel = 400; // and its shorter text again: the frame doesn't resize (and start the prompt over) for it
+    resize();
+    expect(log.filter((l) => l.startsWith("size"))).toEqual(["size 448", "size 478"]);
+    resize(700);
+    expect(log.at(-1)).toBe("size 448");
+    cancel();
+    layout.panel = 300;
+    void ui.run(REQ, async () => "ok", () => ({ retry: false })).catch(() => {});
+    expect(log.slice(-2)).toEqual(["size 348", "shown true passkey-unlock"]);
+  });
+
+  it("reports nothing while the frame isn't laid out (a hidden iframe), then once it is", () => {
+    const { ui, log, layout, resize } = sized();
+    layout.panel = 0;
+    void ui.run(REQ, async () => "ok", () => ({ retry: false })).catch(() => {});
+    expect(log).toEqual(["shown true passkey-unlock"]);
+    layout.panel = 320;
+    resize();
+    expect(log).toEqual(["shown true passkey-unlock", "size 368"]);
+  });
+
+  it("reports the agent approval notice's height too, and the frame's own fixed look for it and for fixed-style prompts", () => {
+    const { ui, log, layout, cancel } = sized();
+    const fixed = () => document.documentElement.classList.contains("ks-fixed-look");
+    void ui.run(REQ, async () => "ok", () => ({ retry: false })).catch(() => {});
+    expect(fixed()).toBe(false);
+    cancel();
+    void ui.run({ ...HOLD, fixedStyle: true }, async () => "ok", () => ({ retry: false })).catch(() => {});
+    expect(fixed()).toBe(true);
+    cancel();
+    expect(fixed()).toBe(false);
+    layout.panel = 280;
+    const end = ui.showNotice({ kind: "agent-approval", title: "Check the key", body: "Compare it.", lines: ["0xabc"], closeLabel: "Hide", timeoutMs: 60_000 });
+    expect(log.slice(-2)).toEqual(["size 328", "shown true agent-approval"]);
+    expect(fixed()).toBe(true);
+    end();
+    expect(fixed()).toBe(false);
+  });
+
+  it("draws its icon with DOM calls (no HTML parsing), hidden from screen readers: a lock, a key, or a caution sign", () => {
+    const { root, ui, cancel } = sized();
+    const shape = () => {
+      const svg = root.querySelector(".ks-icon svg");
+      expect(svg?.getAttribute("aria-hidden")).toBe("true");
+      return svg?.querySelector("path")?.getAttribute("d")?.slice(0, 12);
+    };
+    void ui.run(REQ, async () => "ok", () => ({ retry: false })).catch(() => {});
+    expect(shape()).toBe("M7 11V7a5 5 ");
+    cancel();
+    void ui.run({ ...REQ, kind: "passkey-create" }, async () => "ok", () => ({ retry: false })).catch(() => {});
+    expect(shape()).toBe("M2.586 17.41");
+    cancel();
+    void ui.run({ ...REQ, fixedStyle: true }, async () => "ok", () => ({ retry: false })).catch(() => {});
+    expect(shape()).toBe("m21.73 18-8-");
+    expect(root.querySelectorAll(".ks-icon svg")).toHaveLength(1);
   });
 });

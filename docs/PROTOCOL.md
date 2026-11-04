@@ -62,7 +62,7 @@ parent                                     frame (iframe, other origin)
   │ ── request hello ───────────────────▶
   │ ◀── response hello {network, builder…}  (the frame now sends events to this origin)
   │ ── getStatus / createAgent / … ─────▶
-  │ ◀── events: statusChanged, keyExpiringSoon, keyExpired, promptChanged
+  │ ◀── events: statusChanged, keyExpiringSoon, keyExpired, promptChanged, promptSize
 ```
 
 - Until `hello` succeeds, every other method answers `NOT_CONNECTED`.
@@ -136,10 +136,22 @@ The client sets no `sandbox`. If the app adds one, it must include `allow-script
 **Showing the prompt.** When the frame needs the user (passkey ceremonies, an HLP deposit or a vault withdrawal, a loosening of the user's limits, a large order or many orders in a short time, margin taken out of an isolated position), it emits `promptChanged {visible: true}`. The client then removes `hidden` from the iframe and sets `data-kokoah-signer-prompt="<kind>"`. Style that state as a modal, for example:
 
 ```css
-iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min(420px, 92vw); height: min(480px, 92vh); border: 0; border-radius: 12px; z-index: 1000; }
+iframe[data-kokoah-signer] { position: fixed; inset: 0; margin: auto; width: min(400px, 92vw); height: min(var(--kokoah-signer-height, 480px), 92dvh); border: 0; border-radius: 12px; z-index: 1000; }
 ```
 
 The iframe must be visible, on top and clickable. Don't cover it or make it transparent.
+
+**Sizing the prompt** (2026-11-04). With `promptChanged {visible: true}` (just before it, or, when the iframe was
+hidden, as soon as it is laid out) and again whenever it changes, the frame emits `promptSize {height}`: the height in
+CSS px (an integer from 300 to 2,000, `PROMPT_SIZE_MIN_PX` and `PROMPT_SIZE_MAX_PX`) at which what it shows fits whole
+at the frame's current width, never less than the least height a prompt arms in; within one prompt at one width it
+never shrinks. The client sets it on the iframe as the custom property `--kokoah-signer-height` (through the CSSOM) and
+removes it when the prompt closes; an iframe that was hidden stays laid out but invisible (`visibility: hidden`, at
+most 150 ms) until that height arrives, so the prompt never shows at another size first. Size the iframe with it,
+capped to the screen as above: a prompt taller than that keeps its text scrolling inside the frame, and the user
+scrolls it to its end before it arms. Give the iframe no border of its own (a border takes from the frame's room) and
+no padding. A themed prompt is the dialog itself (no box of its own inside the frame); a fixed-style prompt and the
+agent approval panel fill the frame as the frame's own cream card with its crimson edge.
 
 **The agent approval panel** (`promptChanged` kind `agent-approval`, `hello.capabilities.showsAgentApproval`,
 2026-10-23) is the one exception to "style it as a modal": it is shown while the main wallet's own window asks the user
@@ -786,6 +798,7 @@ Allowed variables:
 | `keyExpiringSoon` | `{ agentAddress, validUntil, msRemaining }` | Once per key per frame load, when it expires within 7 days (right after `hello`, and on a timer). Show the renew banner. Also in `status.expiringSoon` |
 | `keyExpired` | `{ agentAddress, validUntil }` | Once per key per frame load, at `validUntil − 15 s`. The frame refuses to sign from then on. Also in `status.expired` |
 | `promptChanged` | `{ visible: boolean, kind: "passkey-create" \| "passkey-unlock" \| "vault-deposit" \| "vault-withdraw" \| "limits" \| "order" \| "margin" \| "key-remove" \| "agent-approval" \| null }` | The frame needs (or no longer needs) a click inside it. **Show the iframe, clickable, while `visible` is true**, whatever the kind (`vault-withdraw`, `margin`, `key-remove` and `agent-approval` since 2026-10-23). `agent-approval` is the panel shown while the main wallet approves a new key: beside the wallet's window, never over it (see `createAgent`) |
+| `promptSize` | `{ height: number }` | With `promptChanged {visible: true}` (just before it, or once the shown iframe is laid out) and when that height changes: what the frame shows fits whole in a frame this tall (CSS px, 300 to 2,000) at its current width. Size the iframe to it, capped to the screen; the client sets it as `--kokoah-signer-height` on the iframe ([§3](#3-the-client), 2026-11-04). Absent in older frames |
 | `reconnected` (client-side, not sent by the frame) | `HelloResult` | `KokoahSignerClient` re-ran `hello` after the frame reloaded ([§3](#3-the-client)). Re-apply `setLimits` (a no-op when stored) and `setTheme` |
 
 Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event": "promptChanged", "data": { "visible": true, "kind": "passkey-unlock" } }`
