@@ -193,6 +193,7 @@ describe("KokoahSignerClient", () => {
         new MessageEvent("message", { data: { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, kind: "event", event: "promptSize", data: { height } }, origin: FRAME_ORIGIN, source: frameWindow }),
       );
     for (const bad of [299, 2001, 320.5, "400", Number.NaN, null]) send(bad);
+    window.dispatchEvent(new MessageEvent("message", { data: { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, kind: "event", event: "promptSize", data: null }, origin: FRAME_ORIGIN, source: frameWindow }));
     expect(seen).toEqual([]);
     expect(client.iframe.style.getPropertyValue("--kokoah-signer-height")).toBe("");
     send(PROMPT_SIZE_MIN_PX);

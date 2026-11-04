@@ -174,7 +174,8 @@ export interface PromptUiOptions {
   randomDigits?: (count: number) => string;
   /**
    * The natural height of the shown prompt or notice (the `promptSize` event, see {@link PromptUi.measure}): called
-   * before `onChange` reports it shown, and again when that height changes.
+   * before `onChange` reports it shown (or, while the frame isn't laid out, as soon as it is), and again when that
+   * height changes.
    */
   onSize?: (height: number) => void;
 }

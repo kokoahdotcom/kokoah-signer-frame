@@ -591,7 +591,7 @@ export class KokoahSignerClient {
       }
     }
     if (msg.event === "promptSize") {
-      const { height } = msg.data as EventData["promptSize"];
+      const height = (msg.data as Partial<EventData["promptSize"]> | null)?.height;
       if (typeof height !== "number" || !Number.isInteger(height) || height < PROMPT_SIZE_MIN_PX || height > PROMPT_SIZE_MAX_PX) return;
       if (this.options.autoShowOnPrompt) {
         // Through the CSSOM, which a page whose CSP forbids style attributes still allows.
