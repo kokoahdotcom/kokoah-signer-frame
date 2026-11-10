@@ -20,8 +20,8 @@ importers:
         specifier: 1.5.0
         version: 1.5.0(typescript@7.0.2)
       viem:
-        specifier: 2.56.9
-        version: 2.56.9(typescript@7.0.2)
+        specifier: 2.57.17
+        version: 2.57.17(typescript@7.0.2)
     devDependencies:
       '@types/node':
         specifier: 24.13.6
@@ -569,8 +569,8 @@ packages:
     resolution: {integrity: sha512-5vvB5+W7ePv+p3uqxi+RcW1XAzLW0/hxt3/4X4Lc4qHudzOhmBiBwOY6DRob4WnanAEGvNcLjF+KNOufrUoEQw==}
     engines: {node: '>=12.20.0'}
 
-  ox@0.14.45:
-    resolution: {integrity: sha512-jpsQ+p0JZh9mKCxxzxz0d5qFHZZg2/O9xW18IpEC/dNXXPVqmDJ0c//9RMz0CILkbSGPA42+cbU0fC/ghwJ03w==}
+  ox@0.14.63:
+    resolution: {integrity: sha512-TSKYN151boL1Aq/vsFrd8Buvd7v+oTQr8V7z4f4QQTSMB+ohD8cbNbHCtKRLI0Gs8LuYKirf5qvElTKVIFe2jw==}
     peerDependencies:
       typescript: '>=5.4.0'
     peerDependenciesMeta:
@@ -662,11 +662,14 @@ packages:
       typescript:
         optional: true
 
-  viem@2.56.9:
-    resolution: {integrity: sha512-UC1G0Qz+RbPKqwl6yRrp3dH6ltrOmUcFJMTcOyE1Mg0nO5lxrEBTONh/8OFWPnALGuN/O7LkNcz/IsSj83Svqw==}
+  viem@2.57.17:
+    resolution: {integrity: sha512-yIMqNoKoVAMwX+zVbqkxfqq7qbGHmKXZidh/xfVpiPTJlAbbDDdDIMH5dDQWxhZcj56L8tPOwsIIxF618P+TOg==}
     peerDependencies:
+      mppx: '>=0.17.0'
       typescript: '>=5.0.4'
     peerDependenciesMeta:
+      mppx:
+        optional: true
       typescript:
         optional: true
 
@@ -1155,7 +1158,7 @@ snapshots:
 
   obug@3.0.0: {}
 
-  ox@0.14.45(typescript@7.0.2):
+  ox@0.14.63(typescript@7.0.2):
     dependencies:
       '@adraffy/ens-normalize': 1.11.1
       '@noble/ciphers': 1.3.0
@@ -1271,7 +1274,7 @@ snapshots:
     optionalDependencies:
       typescript: 7.0.2
 
-  viem@2.56.9(typescript@7.0.2):
+  viem@2.57.17(typescript@7.0.2):
     dependencies:
       '@noble/curves': 1.9.1
       '@noble/hashes': 1.8.0
@@ -1279,7 +1282,7 @@ snapshots:
       '@scure/bip39': 1.6.0
       abitype: 1.2.3(typescript@7.0.2)
       isows: 1.0.7(ws@8.21.0)
-      ox: 0.14.45(typescript@7.0.2)
+      ox: 0.14.63(typescript@7.0.2)
       ws: 8.21.0
     optionalDependencies:
       typescript: 7.0.2
