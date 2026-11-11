@@ -879,13 +879,17 @@ export class FrameCore {
 
       // Keep the previous passkey credential (if any) so a renewal needs no new passkey.
       let previousRecord: StoredKeyRecord | undefined;
+      let recordUnreadable = false;
       try {
         previousRecord = await this.deps.store.getKeyRecord();
       } catch {
         previousRecord = undefined;
+        recordUnreadable = true;
       }
-      // A new key that unlocks without the passkey must not silently take the place of one protected by it.
-      const protectedKey = existing?.meta.storageMode === "passkey" || (previousRecord?.network === this.config.network.name && previousRecord.storageMode === "passkey");
+      // A new key that unlocks without the passkey must not silently take the place of one protected by it. A stored
+      // record that can't be read may be such a key: the user confirms the same way.
+      const protectedKey =
+        recordUnreadable || existing?.meta.storageMode === "passkey" || (previousRecord?.network === this.config.network.name && previousRecord.storageMode === "passkey");
       if (protectedKey && mode !== "passkey") await this.confirmKeyRemoval("replace");
 
       // Fresh key, never reused.

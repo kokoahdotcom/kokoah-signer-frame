@@ -85,6 +85,28 @@ describe("removing a passkey-protected key", () => {
     expect(await confirmed).toMatchObject({ storageMode: "device", requestedStorageMode: "passkey" });
   });
 
+  it("asks before a key without the passkey is stored where the stored key can't be read", async () => {
+    const first = await frame();
+    await first.activeAgent("passkey");
+    // Another tab of this origin, whose read of the stored key record fails.
+    const store = await IdbSignerStore.open(first.idb);
+    const unreadable = new Proxy(store, {
+      get(target, prop) {
+        if (prop === "getKeyRecord") return async () => Promise.reject(new Error("read failed"));
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    const h = await frame({ idb: first.idb, store: unreadable, clock: first.clock, hl: first.hl });
+    await h.ok("hello", { protocolVersion: 1 });
+    const device = h.request("createAgent", { userAddress: USER, validForDays: 30, storageMode: "device", replaceExisting: true });
+    await waitFor(() => removePrompts(h).length === 1);
+    expect(h.promptText()).toContain("unlocks without your passkey");
+    await h.clickPrompt("cancel");
+    expect((await device).ok).toBe(false);
+    expect(await store.getKeyRecord()).toMatchObject({ storageMode: "passkey" });
+  });
+
   it("renews a passkey key with the passkey without asking to remove it", async () => {
     const h = await frame();
     await h.activeAgent("passkey");
