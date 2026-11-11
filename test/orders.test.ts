@@ -5,7 +5,7 @@
  */
 import { MarketRegistry } from "@kokoah/shared/markets";
 import { afterEach, describe, expect, it } from "vitest";
-import { ConfirmationNeededError, nextUsage, SigningCoordinator, UNPROMPTED_DAY_MS, UNPROMPTED_WINDOW_MS, usageOf } from "../src/frame/nonces.js";
+import { ConfirmationNeededError, nextUsage, SigningCoordinator, UNPROMPTED_DAY_MS, UNPROMPTED_WINDOW_MS, usageOf, type LockManagerLike } from "../src/frame/nonces.js";
 import { CONFIRM_ORDERS_ABOVE_USD, CONFIRM_UNPROMPTED_ABOVE_USD, CONFIRM_UNPROMPTED_DAY_ABOVE_USD, describeOrders } from "../src/frame/policy.js";
 import type { UsageRecord } from "../src/frame/storage.js";
 import { MemorySignerStore } from "../src/frame/storage.js";
@@ -306,6 +306,52 @@ describe("many orders without a prompt", () => {
     expect(codes(e)).toEqual(["ORDER_NOTIONAL_EXCEEDED"]);
     expect(e.details?.violations?.[0]?.message).toContain("$96,000 so far");
     expect(h.hl.exchangeCalls).toHaveLength(4);
+  });
+
+  it("say so when another tab's orders signed in between need this one confirmed (SIGNER_BUSY ordersSigned)", async () => {
+    const locks = new FakeLocks();
+    let waiting = false;
+    let open!: () => void;
+    let gate: Promise<void> | null = null;
+    // This tab's signing lock waits until the other tab has signed.
+    const gated: LockManagerLike = {
+      request: async (name, options, callback) => {
+        if (gate !== null && name.includes("/sign/")) {
+          waiting = true;
+          await gate;
+        }
+        return await locks.request(name, options, callback);
+      },
+    };
+    await ready({ locks: gated });
+    for (const id of ["a", "b", "c"]) await just(id); // $72,000
+    const other = await FrameHarness.create({ idb: h.idb, clock: h.clock, hl: h.hl, locks });
+    try {
+      await other.ok("hello", { protocolVersion: 1 });
+      gate = new Promise((r) => (open = r));
+      const pending = h.fail("signAndSubmit", { requestId: "d", intent: btc("0.24") });
+      await waitFor(() => waiting);
+      expect((await other.ok("signAndSubmit", { requestId: "e", intent: btc("0.24") })).status).toBe("ok"); // $96,000
+      open();
+      expect(await pending).toMatchObject({ code: "SIGNER_BUSY", retryable: true, details: { reason: "ordersSigned" } });
+      expect(h.hl.exchangeCalls).toHaveLength(4);
+    } finally {
+      other.destroy();
+    }
+  });
+
+  it("say so when the signing lock isn't free in time (SIGNER_BUSY lock)", async () => {
+    const locks = new FakeLocks();
+    const busy: LockManagerLike = {
+      request: async (name, options, callback) => {
+        // What AbortSignal.timeout makes Web Locks reject with.
+        if (name.includes("/sign/")) throw Object.assign(new Error("The lock wasn't granted in time."), { name: "TimeoutError" });
+        return await locks.request(name, options, callback);
+      },
+    };
+    await ready({ locks: busy });
+    expect(await h.fail("signAndSubmit", { requestId: "a", intent: btc("0.01") })).toMatchObject({ code: "SIGNER_BUSY", retryable: true, details: { reason: "lock" } });
+    expect(h.hl.exchangeCalls).toHaveLength(0);
   });
 
   it("are checked again when the nonce is reserved, so another tab's orders in between can't slip past it", async () => {

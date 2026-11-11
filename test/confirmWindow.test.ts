@@ -5,7 +5,7 @@
  */
 import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { FrameHarness, MockPasskeys, waitFor } from "./helpers.js";
+import { FrameHarness, MockPasskeys, USER, waitFor } from "./helpers.js";
 import { installIntersectionObserver } from "./visibility.js";
 
 let h: FrameHarness | undefined;
@@ -131,6 +131,71 @@ describe("confirming in a window of its own", () => {
     expect(await pending).toMatchObject({ code: "USER_CANCELLED" });
     expect(passkeys.getCalls.length).toBe(before);
     expect((await f.ok("getStatus")).storageMode).toBe("passkey");
+  });
+
+  it("confirms looser limits, a vault withdrawal, margin out and a leverage raise there, each by its own words", async () => {
+    const VAULT = "0x2222222222222222222222222222222222222222";
+    const f = await frame();
+    await f.activeAgent();
+    const wordsOf = (w: Window) => w.document.querySelector(".ks-code-value")!.textContent;
+
+    await f.ok("setLimits", { maxOrderNotionalUsd: 100 });
+    const limits = f.ok("setLimits", { maxOrderNotionalUsd: 5_000 });
+    await waitFor(() => f.promptText().includes("Largest order: $100 → $5,000"));
+    let w = await openWindow(f);
+    expect(w.document.querySelector(".ks-body")!.textContent).toContain("Largest order: $100 → $5,000");
+    expect(wordsOf(w)).toBe("loosen limits");
+    await confirmThere(w, "Loosen limits");
+    expect((await limits).policy.maxOrderNotionalUsd).toBe(5_000);
+
+    f.hl.vaultEquities = [{ vaultAddress: VAULT, equity: "120.5" }];
+    const withdraw = f.ok("signAndSubmit", { requestId: "w", intent: { kind: "vaultWithdraw", origin: "manual", vaultAddress: VAULT, usd: "120.5" } });
+    await waitFor(() => f.promptText().includes("back into your Hyperliquid account"));
+    w = await openWindow(f);
+    expect(wordsOf(w)).toBe("withdraw 120.5");
+    await confirmThere(w, "withdraw 120.5");
+    expect((await withdraw).status).toBe("ok");
+
+    const margin = f.ok("signAndSubmit", { requestId: "m", intent: { kind: "updateIsolatedMargin", coin: "BTC", amountUsd: "-250.5", origin: "manual" } });
+    await waitFor(() => f.promptText().includes("of margin out of the isolated BTC position"));
+    w = await openWindow(f);
+    expect(wordsOf(w)).toBe("remove $250.5");
+    await confirmThere(w, "remove 250.5");
+    expect((await margin).status).toBe("ok");
+
+    f.hl.positions[USER.toLowerCase()] = [{ coin: "BTC", szi: "0.1", entryPx: "100000.0", leverage: { type: "isolated", value: 5 } }];
+    const leverage = f.ok("signAndSubmit", { requestId: "l", intent: { kind: "updateLeverage", coin: "BTC", leverage: 10, marginMode: "isolated", origin: "manual" } });
+    await waitFor(() => f.promptText().includes("from 5x to 10x"));
+    w = await openWindow(f);
+    expect(wordsOf(w)).toBe("raise to 10x");
+    await confirmThere(w, "raise to 10x");
+    expect((await leverage).status).toBe("ok");
+
+    expect(f.hl.exchangeCalls.map((c) => (c.body.action as { type: string }).type)).toEqual(["vaultTransfer", "updateIsolatedMargin", "updateLeverage"]);
+    expect(windows.every((x) => x.closed)).toBe(true);
+  });
+
+  it("confirms replacing a passkey-protected key there", async () => {
+    const f = await frame({ passkeys: new MockPasskeys() });
+    await f.activeAgent("passkey");
+    const replace = f.ok("createAgent", { userAddress: USER, validForDays: 30, storageMode: "device", replaceExisting: true });
+    await waitFor(() => f.promptText().includes("Replace your passkey-protected trading key?"));
+    const w = await openWindow(f);
+    expect(w.document.querySelector(".ks-code-value")!.textContent).toBe("replace key");
+    await confirmThere(w, "replace key");
+    expect(await replace).toMatchObject({ storageMode: "device" });
+  });
+
+  it("confirms removing a passkey-protected key there", async () => {
+    const f = await frame({ passkeys: new MockPasskeys() });
+    await f.activeAgent("passkey");
+    const revoke = f.ok("revoke", {});
+    await waitFor(() => f.promptText().includes("Remove the trading key from this device?"));
+    const w = await openWindow(f);
+    expect(w.document.querySelector(".ks-code-value")!.textContent).toBe("remove key");
+    await confirmThere(w, "remove key");
+    expect(await revoke).toMatchObject({ wiped: true });
+    expect(await f.ok("getStatus")).toMatchObject({ agentAddress: null });
   });
 
   it("signs nothing when the user cancels there", async () => {
