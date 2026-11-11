@@ -676,6 +676,14 @@ export interface SignerError {
     fields?: string[];
     /** USER_CANCELLED / USER_TIMEOUT / PROMPT_BUSY: the kind of the frame's prompt (as in `promptChanged`). */
     prompt?: EventData["promptChanged"]["kind"];
+    /**
+     * SIGNER_BUSY: why nothing was signed or changed. `lock`: the signing lock wasn't free within 20 s. `ordersSigned`:
+     * another tab signed orders in between, so this one now needs the `order` prompt. `limitsChanged`: the stored limits
+     * changed while the user confirmed. `marketMoved`: the mark moved toward a confirmed order's market trigger, so its
+     * slippage would now be refused. `leverageChanged`: the position's leverage changed while the user confirmed raising
+     * it. Each time, sending the request again shows the current state.
+     */
+    reason?: "lock" | "ordersSigned" | "limitsChanged" | "marketMoved" | "leverageChanged";
     /** Anything else worth showing (never secrets). */
     [key: string]: unknown;
   };

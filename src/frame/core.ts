@@ -465,7 +465,7 @@ export class FrameCore {
   private toSignerError(e: unknown): SignerError {
     if (e instanceof SignerFailure) return e.toJSON();
     if (e instanceof PromptError) return { code: e.code, message: e.message, retryable: true, details: { prompt: e.kind } };
-    if (e instanceof SignerBusyError) return { code: "SIGNER_BUSY", message: e.message, retryable: true };
+    if (e instanceof SignerBusyError) return { code: "SIGNER_BUSY", message: e.message, retryable: true, details: { reason: "lock" } };
     if (e instanceof Error && e.name === "MainnetWriteBlockedError") {
       return { code: "MAINNET_WRITES_DISABLED", message: "This frame build does not allow mainnet writes.", retryable: false };
     }
@@ -1513,7 +1513,7 @@ export class FrameCore {
       if (step.kind === "done") return { policy: summarizeFramePolicy(this.limits.policy, this.limits.master, this.limits.accounts, this.market.tradingPairCoins) };
       // Otherwise another tab wrote first, or changed the limits while this prompt waited: compare again.
     }
-    throw new SignerFailure("SIGNER_BUSY", "Your limits kept changing in another tab; nothing was changed. Try again.", { retryable: true });
+    throw new SignerFailure("SIGNER_BUSY", "Your limits kept changing in another tab; nothing was changed. Try again.", { retryable: true, details: { reason: "limitsChanged" } });
   }
 
   /**
@@ -1546,7 +1546,10 @@ export class FrameCore {
     const looser = changes.filter((c) => c.looser);
     if (looser.length > 0 && confirmedRev !== before.rev) {
       if (confirmedRev !== undefined) {
-        throw new SignerFailure("SIGNER_BUSY", "Your limits changed in another tab while you were confirming; nothing was changed. Try again.", { retryable: true });
+        throw new SignerFailure("SIGNER_BUSY", "Your limits changed in another tab while you were confirming; nothing was changed. Try again.", {
+          retryable: true,
+          details: { reason: "limitsChanged" },
+        });
       }
       if (!this.ui) {
         throw new SignerFailure("LIMIT_LOOSENING_REJECTED", "Loosening your limits needs a click in the signer frame, which has no user interface here.", {
@@ -1820,17 +1823,21 @@ export class FrameCore {
       requirePinnedDexes();
       // A market trigger compiled with more slippage than the marks read now allow (the mark moved toward it while the
       // user confirmed): the confirmed action would be refused, so nothing is signed and the user tries again.
-      const now = marketTriggerSlippageFor(compiledPolicy, snapshot.markPrices);
-      if (triggerLegs.some((t) => now(t.leg) < t.bps)) {
+      const slippageAllowedNow = marketTriggerSlippageFor(compiledPolicy, snapshot.markPrices);
+      if (triggerLegs.some((t) => slippageAllowedNow(t.leg) < t.bps)) {
         throw new SignerFailure("SIGNER_BUSY", "The market moved close to this order's stop or trigger while you were confirming; nothing was signed. Try again.", {
           retryable: true,
+          details: { reason: "marketMoved" },
         });
       }
       leverageByCoin = undefined;
       // Read again for the check under the lock: the position may have changed while the prompt was open.
       isolatedPositionLeverage = await isolatedFor();
       if (leverageUp && !(isolatedPositionLeverage?.[leverageUp.coin] === leverageUp.from)) {
-        throw new SignerFailure("SIGNER_BUSY", "The position's leverage changed while you were confirming; nothing was signed. Try again.", { retryable: true });
+        throw new SignerFailure("SIGNER_BUSY", "The position's leverage changed while you were confirming; nothing was signed. Try again.", {
+          retryable: true,
+          details: { reason: "leverageChanged" },
+        });
       }
     }
 
@@ -1876,7 +1883,7 @@ export class FrameCore {
           this.metrics.policyDenials++;
           throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: e.code, message: e.message }] } });
         }
-        if (e instanceof ConfirmationNeededError) throw new SignerFailure("SIGNER_BUSY", e.message, { retryable: true });
+        if (e instanceof ConfirmationNeededError) throw new SignerFailure("SIGNER_BUSY", e.message, { retryable: true, details: { reason: "ordersSigned" } });
         if (e instanceof RangeError) throw new SignerFailure("INTERNAL_ERROR", "Could not produce a valid nonce; check the device clock.");
         throw new SignerFailure("STORAGE_FAILED", "Could not reserve a nonce on this device.", { retryable: true });
       }

@@ -412,7 +412,7 @@ describe("raising the leverage of an isolated position", () => {
     await shown();
     isolatedAt(8);
     await h.clickPrompt();
-    expect((await moved).code).toBe("SIGNER_BUSY");
+    expect(await moved).toMatchObject({ code: "SIGNER_BUSY", details: { reason: "leverageChanged" } });
     h.hl.infoFailure = (body) => body.type === "clearinghouseState";
     expect((await h.fail("signAndSubmit", { requestId: "down", intent: lev(10) })).code).toBe("MARKET_DATA_UNAVAILABLE");
     h.hl.infoFailure = null;
@@ -489,7 +489,7 @@ describe("market triggers near the mark", () => {
     h.hl.mark.BTC = "99400";
     h.clock.advance(5_000);
     await h.clickPrompt();
-    expect(await first).toMatchObject({ code: "SIGNER_BUSY", retryable: true });
+    expect(await first).toMatchObject({ code: "SIGNER_BUSY", retryable: true, details: { reason: "marketMoved" } });
     expect(h.hl.exchangeCalls).toHaveLength(0);
     // Again: compiled at the new mark, within the band, and signed once confirmed.
     const again = h.ok("signAndSubmit", { requestId: "b2", intent: big });

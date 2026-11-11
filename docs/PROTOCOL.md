@@ -609,7 +609,12 @@ list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE`
   - `COMPILE_FAILED` (`details.compileCode`: `UNKNOWN_MARKET`, `DELISTED_MARKET`, `SIZE_PRECISION`, `PRICE_PRECISION`, `CROSS_NOT_ALLOWED`, `MARGIN_PRECISION`, `SCHEDULE_TOO_SOON`, …; the message includes the rounded suggestion);
   - `POLICY_DENIED` (`details.violations`: every `{ code, message }` from shared `evaluatePolicy`, plus the frame's own rules);
   - `MARKET_DATA_UNAVAILABLE` (retryable);
-  - `SIGNER_BUSY` (retryable; the signing lock wasn't free within 20 s);
+  - `SIGNER_BUSY` (retryable, nothing sent; `details.reason` says why): `lock`, the signing lock wasn't free within
+    20 s; `ordersSigned`, another tab signed orders in between and this one now needs the `order` prompt;
+    `marketMoved`, the mark moved toward a confirmed order's market trigger while the user confirmed, so its slippage
+    (compiled from the earlier mark) would now be refused; `leverageChanged`, the position's leverage changed while the
+    user confirmed raising it. Send it again: it is checked, and asked, against the new state. Show something like "The
+    price moved while you confirmed. Nothing was sent; confirm again.";
   - `USER_CANCELLED`, `USER_TIMEOUT`, `PROMPT_BUSY` (an HLP deposit or a large order the user didn't confirm; nothing sent);
   - `REQUEST_ID_REUSED`;
   - `MAINNET_WRITES_DISABLED`;
@@ -646,7 +651,9 @@ same order (`Buy 0.3 BTC + 2`), so they show even when the parent leaves the pro
 - It asks only about orders its rules allow (checked first) and doesn't hold up other requests meanwhile (a smaller
   order or a cancel signs at once; a second large order while one is asked about is `PROMPT_BUSY`).
 - After the user confirms, it reads prices, dexes and leverage again and checks everything again under the agent lock:
-  a market that moved past the band while the prompt was open is `POLICY_DENIED` (`PRICE_OUTSIDE_BAND`).
+  a market that moved past the band while the prompt was open is `POLICY_DENIED` (`PRICE_OUTSIDE_BAND`); a mark that
+  moved toward a market trigger so its compiled slippage is no longer allowed is `SIGNER_BUSY` (`details.reason:
+  "marketMoved"`, nothing sent).
 - Cancel or no answer within 120 s: `USER_CANCELLED` / `USER_TIMEOUT` with `details.prompt: "order"`. Nothing was sent,
   so the `requestId` may be used again. Show something like "You cancelled the order in the signer. Nothing was sent."
 - The client doesn't time `signAndSubmit` out while a prompt is open (it waits up to `interactiveTimeoutMs`, and gets its
@@ -668,6 +675,15 @@ many orders just under $25,000, however it spreads them out: at most $250,000 a 
 the frame's own prompt (`promptChanged` kind `margin`, fixed styling, press and hold) naming the amount and the market:
 it moves the position toward liquidation, which no notional cap covers. Cancel or timeout: `USER_CANCELLED` /
 `USER_TIMEOUT`; a frame without a UI refuses it. Adding margin signs at once.
+
+**Raising an isolated position's leverage** (`updateLeverage` with `marginMode: "isolated"` above the open isolated
+position's current leverage, 2026-11-11) waits for the same `margin` prompt (fixed styling, press and hold) naming the
+market and both figures (`Raise the leverage of this position to 10x?`, from 5x to 10x): it takes margin out of the
+position. The frame reads the account's isolated positions itself (`clearinghouseState`, the sub-account's for a
+sub-account) and reads them again after the confirmation; a leverage that changed meanwhile is `SIGNER_BUSY`
+(`details.reason: "leverageChanged"`, nothing sent). Requests whose origin isn't `manual` can't raise it, or switch an open
+isolated position to cross, at all (shared policy). Lowering it, or setting leverage on a market without an isolated
+position, signs at once. Positions that can't be read: `MARKET_DATA_UNAVAILABLE`, nothing signed.
 
 ### `setLimits`
 
@@ -834,7 +850,7 @@ Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event":
 | `MARKET_DATA_UNAVAILABLE` | HL `/info` failed | Retry later |
 | `HL_UNAVAILABLE` | HL `/info` unreachable during `confirmAgent` | Retry later |
 | `REQUEST_ID_REUSED` | Same `requestId`, different intent | Bug: log it |
-| `SIGNER_BUSY` | Signing lock busy for 20 s; or `setLimits`: the stored limits changed while the user was confirming | Retry |
+| `SIGNER_BUSY` | Nothing sent; `details.reason`: `lock` (signing lock busy for 20 s), `ordersSigned` (another tab signed orders in between), `limitsChanged` (`setLimits`: the stored limits changed while the user was confirming), `marketMoved` (the mark moved toward a confirmed market trigger), `leverageChanged` (the leverage changed while the user confirmed raising it) | Retry; for `marketMoved` and `leverageChanged`, say the market or the position changed and confirm again |
 | `LIMIT_LOOSENING_REJECTED` | `setLimits` above the baseline, or a loosening in a frame with no user interface (`details.fields`) | Show which limit can't be raised |
 | `PASSKEY_UNAVAILABLE` | WebAuthn/PRF not usable | Offer `device` or `session` |
 | `PASSKEY_FAILED` | The WebAuthn ceremony failed | Retry |

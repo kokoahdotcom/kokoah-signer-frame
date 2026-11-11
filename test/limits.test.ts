@@ -207,7 +207,7 @@ describe("limits stored by the frame", () => {
     expect((await h.ok("setLimits", { maxOrderNotionalUsd: 100 })).policy.maxOrderNotionalUsd).toBe(100);
     await h.clickPrompt();
     const r = await raise.answer;
-    expect(!r.ok && r.error).toMatchObject({ code: "SIGNER_BUSY", retryable: true });
+    expect(!r.ok && r.error).toMatchObject({ code: "SIGNER_BUSY", retryable: true, details: { reason: "limitsChanged" } });
     expect((await h.ok("getStatus")).policy.maxOrderNotionalUsd).toBe(100);
   });
 });
