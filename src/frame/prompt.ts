@@ -159,9 +159,17 @@ export const PROMPT_FULL_INTERSECTION = 0.995;
 /** The confirmation window's size (CSS px), as the frame asks the browser for it. */
 export const PROMPT_WINDOW_FEATURES = "popup=yes,width=460,height=660";
 
-/** `text` as {@link PromptRequest.confirmText} compares it: lowercase, letters, digits and the decimal point only. */
+/**
+ * `text` as {@link PromptRequest.confirmText} compares it: lowercase, letters, digits, the decimal point and single
+ * spaces between words only (so "Buy 1 1INCH" and "Buy 11 INCH" stay apart).
+ */
 export function confirmTextKey(text: string): string {
-  return text.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}.]/gu, "");
+  return text
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}.\s]/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
 }
 
 /** A timer's id, from a window's timers or Node's. */
@@ -294,6 +302,8 @@ export class PromptUi {
   private readonly topLevel: boolean;
   /** The confirmation window open for the current prompt, and its prompt. */
   private child: { w: Window; ui: PromptUi } | null = null;
+  /** The open prompt's button only opens the confirmation window (see {@link PromptUi.run}). */
+  private opensWindow = false;
   private armed = false;
   /** The words the open prompt asks for (their {@link confirmTextKey}; null: none asked), and whether they were typed. */
   private code: string | null = null;
@@ -384,7 +394,8 @@ export class PromptUi {
     this.codeInput.id = "ks-code-input";
     this.codeInput.type = "text";
     this.codeInput.autocomplete = "off";
-    this.codeInput.maxLength = 80;
+    this.codeInput.setAttribute("autocapitalize", "none");
+    this.codeInput.setAttribute("autocorrect", "off");
     this.codeInput.spellcheck = false;
     this.codeBox.append(codeLabel, this.codeInput);
     const actions = el(doc, "div", "ks-actions");
@@ -606,6 +617,7 @@ export class PromptUi {
         () => this.inWindow(req, action, onFailure),
         (e) => (e instanceof WindowStepError ? { retry: true, message: e.message } : onFailure(e)),
         WINDOW_OPEN,
+        true,
       );
     }
     return this.runHere(req, action, onFailure);
@@ -618,7 +630,9 @@ export class PromptUi {
 
   /**
    * Opens the confirmation window (from the user's click: this runs synchronously in it), shows `req` there and resolves
-   * with its result. Blocked or closed: {@link WindowStepError}, and the frame's prompt stays.
+   * with its result. Blocked, or closed (or reloaded) before it was confirmed: {@link WindowStepError}, and the frame's
+   * prompt stays to open it again. Once confirmed there, closing it changes nothing: the result stands. Actions confirmed
+   * in the window must not need its user activation (core.ts gives them none: the work is done after the prompt).
    */
   private inWindow<T>(req: PromptRequest, action: () => Promise<T>, onFailure: (e: unknown) => ActionFailure): Promise<T> {
     const frame = this.panel.ownerDocument.defaultView;
@@ -646,6 +660,11 @@ export class PromptUi {
       topLevel: true,
     });
     this.child = { w: opened, ui };
+    let started = false;
+    const confirmed = () => {
+      started = true;
+      return action();
+    };
     return new Promise<T>((resolve, reject) => {
       let done = false;
       const end = (fn: () => void) => {
@@ -660,15 +679,18 @@ export class PromptUi {
         }
         fn();
       };
-      // Closed by the user: the frame's prompt offers it again.
+      // Closed or reloaded by the user before confirming: the frame's prompt offers it again.
+      const gone = () => {
+        if (!done && !started) end(() => reject(new WindowStepError(WINDOW_CLOSED)));
+      };
       const check = () => {
         if (done) return;
-        if (opened.closed) end(() => reject(new WindowStepError(WINDOW_CLOSED)));
-        else poll = this.timers.setTimeout(check, 500);
+        if (opened.closed) gone();
+        if (!done) poll = this.timers.setTimeout(check, 500);
       };
       let poll = this.timers.setTimeout(check, 500);
-      opened.addEventListener("pagehide", () => this.timers.setTimeout(check, 0));
-      ui.run({ ...req, fixedStyle: true }, action, onFailure).then(
+      opened.addEventListener("pagehide", gone);
+      ui.run({ ...req, fixedStyle: true }, confirmed, onFailure).then(
         (value) => end(() => resolve(value)),
         (e: unknown) => end(() => reject(e)),
       );
@@ -693,8 +715,9 @@ export class PromptUi {
     this.cancel?.();
   }
 
-  private runHere<T>(req: PromptRequest, action: () => Promise<T>, onFailure: (e: unknown) => ActionFailure, busyText?: string): Promise<T> {
+  private runHere<T>(req: PromptRequest, action: () => Promise<T>, onFailure: (e: unknown) => ActionFailure, busyText?: string, opensWindow = false): Promise<T> {
     this.active = req.kind;
+    this.opensWindow = opensWindow;
     return new Promise<T>((resolve, reject) => {
       let settled = false;
       let running = false;
@@ -719,6 +742,8 @@ export class PromptUi {
         }
         running = true;
         this.setBusy(true, busyText ?? (req.hold ? "Confirmed." : "Waiting for your passkey…"));
+        // While its window is open, the frame's prompt can still be cancelled (which closes the window).
+        if (this.opensWindow) this.secondary.disabled = false;
         let p: Promise<T>;
         try {
           p = action();
@@ -738,11 +763,11 @@ export class PromptUi {
         );
       };
       this.secondary.onclick = () => {
-        if (!running) finish(() => reject(new PromptError("USER_CANCELLED", "The user cancelled.", req.kind)));
+        if (!running || this.opensWindow) finish(() => reject(new PromptError("USER_CANCELLED", "The user cancelled.", req.kind)));
       };
       this.cancel = () => finish(() => reject(new PromptError("USER_CANCELLED", "The prompt was closed.", req.kind)));
       this.panel.onkeydown = (ev: KeyboardEvent) => {
-        if (ev.key === "Escape" && !running) finish(() => reject(new PromptError("USER_CANCELLED", "The user cancelled.", req.kind)));
+        if (ev.key === "Escape" && (!running || this.opensWindow)) finish(() => reject(new PromptError("USER_CANCELLED", "The user cancelled.", req.kind)));
       };
       this.show(req);
     });
@@ -791,6 +816,7 @@ export class PromptUi {
     this.codeBox.hidden = text === null;
     this.codeValue.textContent = text ?? "";
     this.codeInput.value = "";
+    this.codeInput.maxLength = Math.max(80, (text ?? "").length * 2);
   }
 
   /** The user typed in the field: the words shown let the armed button work. */
@@ -801,7 +827,9 @@ export class PromptUi {
       this.primary.disabled = true;
       return;
     }
-    if (this.armed && this.panel.getAttribute("aria-busy") !== "true") this.primary.disabled = false;
+    // Not armed: the status says why (not in view, too small), or it is the resting one already.
+    if (!this.armed) return;
+    if (this.panel.getAttribute("aria-busy") !== "true") this.primary.disabled = false;
     this.status.textContent = this.restingStatus();
   }
 
@@ -985,7 +1013,12 @@ export class PromptUi {
     ev.preventDefault();
     if (!this.isTrusted(ev)) return;
     if (!down) this.releaseHold("key");
-    else if (!ev.repeat) this.startHold("key");
+    else if (ev.repeat) return;
+    // Opening the confirmation window confirms nothing, and a browser lets a page open one only from the key event
+    // itself: a fresh press opens it (with the same focus and arming rules), no hold.
+    else if (this.opensWindow) {
+      if (this.armed && this.keyboardFocus && this.fits()) this.confirm?.();
+    } else this.startHold("key");
   }
 
   private startHold(by: "pointer" | "key"): void {
@@ -1039,6 +1072,7 @@ export class PromptUi {
 
   private hide(): void {
     this.closeChild();
+    this.opensWindow = false;
     this.disarm();
     this.newCode(null);
     this.hold = false;

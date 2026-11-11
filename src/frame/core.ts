@@ -1306,9 +1306,9 @@ export class FrameCore {
         };
         try {
           if (this.requirePromptUi().confirmsInWindow(removal)) {
-            // Confirmed in the confirmation window; the passkey then needs a click in the frame itself (WebAuthn wants
-            // the frame's own user activation).
-            await this.prompt("passkey-unlock", removal, async () => undefined);
+            // Confirmed in the confirmation window (pressed and held there, as removing a key is); the passkey then
+            // needs a click in the frame itself (WebAuthn wants the frame's own user activation).
+            await this.prompt("passkey-unlock", { ...removal, hold: true }, async () => undefined);
             secret = await this.prompt("passkey-unlock", { title: "Use your passkey", body: "Use your passkey to remove its protection from the trading key on this device.", actionLabel: "Use passkey" }, decrypt);
           } else {
             secret = await this.prompt("passkey-unlock", removal, decrypt);

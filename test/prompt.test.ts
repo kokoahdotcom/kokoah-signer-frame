@@ -643,11 +643,122 @@ describe("prompt arming", () => {
         expect(opened).toHaveLength(0);
       });
 
-      it("compares the words without case, spaces or punctuation but the decimal point", () => {
-        expect(confirmTextKey(" Deposit 1,000.5 USDC ")).toBe("deposit1000.5usdc");
-        expect(confirmTextKey("remove $250.5")).toBe("remove250.5");
+      it("compares the words without case, extra spaces or punctuation but the decimal point", () => {
+        expect(confirmTextKey(" Deposit 1,000.5  USDC ")).toBe("deposit 1000.5 usdc");
+        expect(confirmTextKey("remove $250.5")).toBe("remove 250.5");
         expect(confirmTextKey("Buy 0.1 BTC")).toBe(confirmTextKey("buy 0.1 btc"));
         expect(confirmTextKey("buy 0.1 btc")).not.toBe(confirmTextKey("buy 1 btc"));
+        // Word boundaries stay.
+        expect(confirmTextKey("Buy 1 1INCH")).not.toBe(confirmTextKey("Buy 11 INCH"));
+      });
+
+      it("ignores what a script types or presses in the window", async () => {
+        const root = document.createElement("div");
+        document.body.append(root);
+        // The frame's own events count; the window's are a script's.
+        const ui = new PromptUi(document, root, () => {}, {
+          armMs: 0,
+          holdMs: 0,
+          isTrusted: (ev) => (ev.target as Node | null)?.ownerDocument === document,
+          openWindow: popup,
+          timersFor: () => globalThis,
+        });
+        const action = vi.fn(async () => "ok");
+        void ui.run(FIXED, action, () => ({ retry: false })).catch(() => {});
+        const primary = root.querySelector<HTMLButtonElement>(".ks-primary")!;
+        pointerOnto(primary);
+        vi.advanceTimersByTime(0);
+        pointerOnto(primary);
+        primary.click();
+        const w = opened[0]!;
+        typeIn(w, "loosen limits");
+        const there = w.document.querySelector<HTMLButtonElement>(".ks-primary")!;
+        expect(there.disabled).toBe(true);
+        pressIn(w, there);
+        vi.advanceTimersByTime(5_000);
+        expect(action).not.toHaveBeenCalled();
+      });
+
+      it("opens one window however often the button is clicked, and lets the frame's Cancel close it", async () => {
+        const f = frame();
+        const result = f.ui.run(FIXED, async () => "ok", () => ({ retry: false }));
+        open(f);
+        pointerOnto(f.primary);
+        f.primary.click();
+        expect(opened).toHaveLength(1);
+        const cancel = f.root.querySelector<HTMLButtonElement>(".ks-secondary")!;
+        expect(cancel.disabled).toBe(false);
+        cancel.click();
+        await expect(result).rejects.toMatchObject({ code: "USER_CANCELLED" });
+        expect(opened[0]!.closed).toBe(true);
+      });
+
+      it("treats a reload of the window like closing it, and closes it when the frame goes away", async () => {
+        const f = frame();
+        void f.ui.run(FIXED, async () => "ok", () => ({ retry: false })).catch(() => {});
+        open(f);
+        opened[0]!.dispatchEvent(new opened[0]!.Event("pagehide"));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(f.status.textContent).toContain("was closed");
+        expect(opened[0]!.closed).toBe(true);
+        pointerOnto(f.primary);
+        f.primary.click();
+        expect(opened).toHaveLength(2);
+        window.dispatchEvent(new Event("pagehide"));
+        expect(opened[1]!.closed).toBe(true);
+      });
+
+      it("says blocked, and closes it, when the window it got isn't one the frame can fill", async () => {
+        let closedForeign = false;
+        const foreign = {
+          get document(): Document {
+            throw new DOMException("Blocked a frame from accessing a cross-origin frame.", "SecurityError");
+          },
+          close: () => {
+            closedForeign = true;
+          },
+        } as unknown as Window;
+        const f = frame({ openWindow: () => foreign });
+        void f.ui.run(FIXED, async () => "ok", () => ({ retry: false })).catch(() => {});
+        open(f);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(f.status.textContent).toContain("blocked the confirmation window");
+        expect(closedForeign).toBe(true);
+      });
+
+      it("opens it from the keyboard with a fresh Enter or Space after the user's own Tab, with no hold", () => {
+        const f = frame();
+        void f.ui.run(FIXED, async () => "ok", () => ({ retry: false })).catch(() => {});
+        vi.advanceTimersByTime(800);
+        const key = (type: "keydown" | "keyup", k: string, repeat = false) => f.primary.dispatchEvent(new KeyboardEvent(type, { key: k, bubbles: true, cancelable: true, repeat }));
+        // Focus a script moved: nothing.
+        f.primary.focus();
+        key("keydown", "Enter");
+        expect(opened).toHaveLength(0);
+        f.primary.blur();
+        (document.activeElement ?? document.body).dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+        f.primary.focus();
+        key("keydown", "Enter", true);
+        expect(opened).toHaveLength(0);
+        key("keydown", "Enter");
+        expect(opened).toHaveLength(1);
+      });
+
+      it("never arms the window's prompt where the window can't show it is in view", () => {
+        const f = frame({
+          openWindow: () => {
+            const w = popup();
+            installIntersectionObserver(w, "none");
+            return w;
+          },
+        });
+        void f.ui.run(FIXED, async () => "ok", () => ({ retry: false })).catch(() => {});
+        open(f);
+        const w = opened[0]!;
+        typeIn(w, "loosen limits");
+        vi.advanceTimersByTime(5_000);
+        expect(w.document.querySelector<HTMLButtonElement>(".ks-primary")!.disabled).toBe(true);
+        expect(w.document.querySelector(".ks-status")!.textContent).toContain("can't show that the prompt is in view");
       });
     });
   });

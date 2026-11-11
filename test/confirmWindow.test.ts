@@ -117,6 +117,22 @@ describe("confirming in a window of its own", () => {
     expect(passkeys.getCalls.length).toBe(before + 1);
   });
 
+  it("keeps passkey protection when the user cancels the passkey step after the window's confirmation", async () => {
+    const passkeys = new MockPasskeys();
+    const f = await frame({ passkeys });
+    await f.activeAgent("passkey");
+    const before = passkeys.getCalls.length;
+    const pending = f.fail("setStorageMode", { to: "device" });
+    await waitFor(() => f.promptText().includes("Remove passkey protection?"));
+    const w = await openWindow(f);
+    await confirmThere(w, "remove protection");
+    await waitFor(() => f.promptText().includes("Use your passkey"));
+    await f.clickPrompt("cancel");
+    expect(await pending).toMatchObject({ code: "USER_CANCELLED" });
+    expect(passkeys.getCalls.length).toBe(before);
+    expect((await f.ok("getStatus")).storageMode).toBe("passkey");
+  });
+
   it("signs nothing when the user cancels there", async () => {
     const f = await frame();
     await f.activeAgent();
