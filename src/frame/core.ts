@@ -121,12 +121,12 @@ import {
   type OrdersDescription,
   policyForAccount,
   printable,
-  separateDailyAccounts,
+  dailyCounters,
   storedUserLimits,
   summarizeFramePolicy,
   vaultTransfersAllowed,
 } from "./policy.js";
-import { applyTheme, invalidThemeVariables, PromptError, PromptUi, type ActionFailure, type PromptKind } from "./prompt.js";
+import { applyTheme, invalidThemeVariables, PromptError, PromptUi, type ActionFailure, type PromptKind, type PromptTimers } from "./prompt.js";
 import { limitsRev, limitsSlot, type SignerStore, type StoredKeyRecord, type StoredLimitsRecord } from "./storage.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -184,6 +184,8 @@ export interface FrameDeps {
   promptHoldMs?: number;
   /** Test seam: which input events count as the user's own (default `ev.isTrusted`; jsdom can't make trusted events). */
   promptIsTrusted?: (ev: Event) => boolean;
+  /** Test seam: how the prompt opens its confirmation window, and that window's timers (prompt.ts `PromptUiOptions`). */
+  promptWindow?: { open: (frame: Window) => Window | null; timers?: (w: Window) => PromptTimers };
   /** How long the agent approval panel stays without `confirmAgent`. Default AGENT_APPROVAL_PANEL_MS. */
   agentApprovalTimeoutMs?: number;
   logger?: Logger;
@@ -217,7 +219,7 @@ interface LimitsState extends LimitsSet {
 
 /** Compares the limits of two states, whatever their revisions. */
 function limitsKey(s: LimitsSet): string {
-  return stableStringify({ master: s.master, accounts: Object.fromEntries([...s.accounts].map(([a, l]) => [a, l.limits])) });
+  return stableStringify({ master: s.master, accounts: Object.fromEntries([...s.accounts].map(([a, l]) => [a, l.limits])), onTop: dailyCounters(s.accounts).onTop.sort() });
 }
 
 interface RequestEntry {
@@ -325,6 +327,7 @@ export class FrameCore {
             ...(deps.promptArmMs !== undefined ? { armMs: deps.promptArmMs } : {}),
             ...(deps.promptHoldMs !== undefined ? { holdMs: deps.promptHoldMs } : {}),
             ...(deps.promptIsTrusted ? { isTrusted: deps.promptIsTrusted } : {}),
+            ...(deps.promptWindow ? { openWindow: deps.promptWindow.open, ...(deps.promptWindow.timers ? { timersFor: deps.promptWindow.timers } : {}) } : {}),
           })
         : null;
     if (deps.broadcast) deps.broadcast.onmessage = (ev) => this.onBroadcast(ev.data);
@@ -462,7 +465,7 @@ export class FrameCore {
   private toSignerError(e: unknown): SignerError {
     if (e instanceof SignerFailure) return e.toJSON();
     if (e instanceof PromptError) return { code: e.code, message: e.message, retryable: true, details: { prompt: e.kind } };
-    if (e instanceof SignerBusyError) return { code: "SIGNER_BUSY", message: e.message, retryable: true };
+    if (e instanceof SignerBusyError) return { code: "SIGNER_BUSY", message: e.message, retryable: true, details: { reason: "lock" } };
     if (e instanceof Error && e.name === "MainnetWriteBlockedError") {
       return { code: "MAINNET_WRITES_DISABLED", message: "This frame build does not allow mainnet writes.", retryable: false };
     }
@@ -876,13 +879,17 @@ export class FrameCore {
 
       // Keep the previous passkey credential (if any) so a renewal needs no new passkey.
       let previousRecord: StoredKeyRecord | undefined;
+      let recordUnreadable = false;
       try {
         previousRecord = await this.deps.store.getKeyRecord();
       } catch {
         previousRecord = undefined;
+        recordUnreadable = true;
       }
-      // A new key that unlocks without the passkey must not silently take the place of one protected by it.
-      const protectedKey = existing?.meta.storageMode === "passkey" || (previousRecord?.network === this.config.network.name && previousRecord.storageMode === "passkey");
+      // A new key that unlocks without the passkey must not silently take the place of one protected by it. A stored
+      // record that can't be read may be such a key: the user confirms the same way.
+      const protectedKey =
+        recordUnreadable || existing?.meta.storageMode === "passkey" || (previousRecord?.network === this.config.network.name && previousRecord.storageMode === "passkey");
       if (protectedKey && mode !== "passkey") await this.confirmKeyRemoval("replace");
 
       // Fresh key, never reused.
@@ -914,6 +921,9 @@ export class FrameCore {
         if (mode === "passkey") {
           const outcome = await this.storePasskeyRecord(meta, secret, previousRecord);
           if (outcome === "unsupported") {
+            // The passkey step can't protect the new key (an authenticator without PRF, or WebAuthn blocked): a key that
+            // unlocks without the passkey takes the protected one's place only after the user confirms it.
+            if (protectedKey) await this.confirmKeyRemoval("replace");
             mode = "device";
             meta.storageMode = "device";
             fallbackReason = "passkey unavailable: the authenticator does not support the PRF extension";
@@ -977,7 +987,11 @@ export class FrameCore {
     return this.ui;
   }
 
-  private async prompt<T>(kind: PromptKind, texts: { title: string; body: string; actionLabel: string; fixedStyle?: boolean; hold?: boolean }, action: () => Promise<T>): Promise<T> {
+  private async prompt<T>(
+    kind: PromptKind,
+    texts: { title: string; body: string; actionLabel: string; fixedStyle?: boolean; hold?: boolean; confirmText?: string },
+    action: () => Promise<T>,
+  ): Promise<T> {
     const ui = this.requirePromptUi();
     return await ui.run({ kind, ...texts, cancelLabel: "Cancel", timeoutMs: this.deps.promptTimeoutMs ?? 120_000 }, action, (e) => this.promptFailure(e));
   }
@@ -1274,29 +1288,35 @@ export class FrameCore {
         const aad = keyAad(rec.network, "passkey", rec.agentAddress);
         const wrapped = rec.wrapped;
         let secret: Uint8Array;
+        const removal = {
+          title: "Remove passkey protection?",
+          body: "After this, the trading key on this device unlocks without your passkey. Continue only if you asked for this.",
+          actionLabel: "Remove protection",
+          confirmText: "remove protection",
+          fixedStyle: true,
+        };
+        const decrypt = async () => {
+          const { prfFirst } = await this.deps.passkeys.get({ rpId: pk.rpId, credentialId: pk.credentialId, prfSalt: pk.prfSalt, timeoutMs: 60_000 });
+          try {
+            const wrapKey = await deriveKeyFromPrf(this.deps.crypto, prfFirst, pk.hkdfSalt);
+            try {
+              return await unwrapSecret(this.deps.crypto, wrapKey, wrapped, aad);
+            } catch {
+              throw new SignerFailure("UNLOCK_FAILED", "This passkey could not unlock the trading key.");
+            }
+          } finally {
+            wipe(prfFirst);
+          }
+        };
         try {
-          secret = await this.prompt(
-            "passkey-unlock",
-            {
-              title: "Remove passkey protection?",
-              body: "After this, the trading key on this device unlocks without your passkey. Continue only if you asked for this.",
-              actionLabel: "Remove protection",
-              fixedStyle: true,
-            },
-            async () => {
-              const { prfFirst } = await this.deps.passkeys.get({ rpId: pk.rpId, credentialId: pk.credentialId, prfSalt: pk.prfSalt, timeoutMs: 60_000 });
-              try {
-                const wrapKey = await deriveKeyFromPrf(this.deps.crypto, prfFirst, pk.hkdfSalt);
-                try {
-                  return await unwrapSecret(this.deps.crypto, wrapKey, wrapped, aad);
-                } catch {
-                  throw new SignerFailure("UNLOCK_FAILED", "This passkey could not unlock the trading key.");
-                }
-              } finally {
-                wipe(prfFirst);
-              }
-            },
-          );
+          if (this.requirePromptUi().confirmsInWindow(removal)) {
+            // Confirmed in the confirmation window (pressed and held there, as removing a key is); the passkey then
+            // needs a click in the frame itself (WebAuthn wants the frame's own user activation).
+            await this.prompt("passkey-unlock", { ...removal, hold: true }, async () => undefined);
+            secret = await this.prompt("passkey-unlock", { title: "Use your passkey", body: "Use your passkey to remove its protection from the trading key on this device.", actionLabel: "Use passkey" }, decrypt);
+          } else {
+            secret = await this.prompt("passkey-unlock", removal, decrypt);
+          }
         } catch (e) {
           if (e instanceof PasskeyError) throw new SignerFailure(e.code === "unsupported" ? "PASSKEY_UNAVAILABLE" : "PASSKEY_FAILED", e.message, { retryable: e.code !== "unsupported" });
           throw e;
@@ -1387,13 +1407,18 @@ export class FrameCore {
     const rev = limitsRev(rec);
     const valid = isRecord(rec) && rec.network === this.config.network.name;
     const accounts = new Map<string, AccountLimits>();
+    const master = valid ? storedUserLimits(this.baseline, rec.master) : null;
+    // On top of the master's daily limit only while both have one (see AccountLimits.onTop).
+    const onTop = new Set(valid && Array.isArray(rec.dailyOnTop) ? rec.dailyOnTop.filter((a): a is string => typeof a === "string") : []);
     if (valid && isRecord(rec.accounts)) {
       for (const [address, raw] of Object.entries(rec.accounts)) {
         const limits = /^0x[0-9a-f]{40}$/.test(address) ? storedUserLimits(this.baseline, raw) : null;
-        if (limits !== null && accounts.size < MAX_ACCOUNT_LIMITS) accounts.set(address, { limits });
+        if (limits === null || accounts.size >= MAX_ACCOUNT_LIMITS) continue;
+        const top = onTop.has(address) && limits.maxDailyNotionalUsd !== undefined && master?.maxDailyNotionalUsd !== undefined;
+        accounts.set(address, top ? { limits, onTop: true } : { limits });
       }
     }
-    return this.withPolicy(rev, valid ? storedUserLimits(this.baseline, rec.master) : null, accounts);
+    return this.withPolicy(rev, master, accounts);
   }
 
   private withPolicy(rev: number, master: UserLimits | null, accounts: Map<string, AccountLimits>): LimitsState {
@@ -1484,6 +1509,7 @@ export class FrameCore {
               title: "Loosen your trading limits?",
               body: `The Kokoah app asks to change ${whose} on this device. Confirm only if you asked for this.\n\n${changes.map((c) => c.text).join("\n")}`,
               actionLabel: "Loosen limits",
+              confirmText: "loosen limits",
               fixedStyle: true,
               hold: true,
             },
@@ -1496,7 +1522,7 @@ export class FrameCore {
       if (step.kind === "done") return { policy: summarizeFramePolicy(this.limits.policy, this.limits.master, this.limits.accounts, this.market.tradingPairCoins) };
       // Otherwise another tab wrote first, or changed the limits while this prompt waited: compare again.
     }
-    throw new SignerFailure("SIGNER_BUSY", "Your limits kept changing in another tab; nothing was changed. Try again.", { retryable: true });
+    throw new SignerFailure("SIGNER_BUSY", "Your limits kept changing in another tab; nothing was changed. Try again.", { retryable: true, details: { reason: "limitsChanged" } });
   }
 
   /**
@@ -1519,9 +1545,19 @@ export class FrameCore {
         if (!accounts.has(sub) && accounts.size >= MAX_ACCOUNT_LIMITS) {
           throw new SignerFailure("INVALID_REQUEST", `At most ${MAX_ACCOUNT_LIMITS} sub-accounts can have their own limits.`);
         }
-        // Checked against the baseline; at signing they apply on top of the master's limits of that moment.
-        accounts.set(sub, { limits });
+        // Checked against the baseline; at signing they apply on top of the master's limits of that moment. A daily
+        // counter it gets while the master has a daily limit is on top of it (a loosening the user confirms); one it
+        // already had keeps what it was (one set while the master had none counts against the master's limit too).
+        const was = before.accounts.get(sub);
+        const onTop =
+          limits.maxDailyNotionalUsd !== undefined &&
+          before.master?.maxDailyNotionalUsd !== undefined &&
+          (was?.onTop === true || was?.limits.maxDailyNotionalUsd === undefined);
+        accounts.set(sub, onTop ? { limits, onTop: true } : { limits });
       }
+    } else if (limits?.maxDailyNotionalUsd === undefined) {
+      // The master without a daily limit: nothing to be on top of. One it gets later holds for every sub-account.
+      for (const [address, a] of accounts) if (a.onTop === true) accounts.set(address, { limits: a.limits });
     }
     const after = this.withPolicy(before.rev + 1, sub === undefined ? limits : before.master, accounts);
     if (limitsKey(after) === limitsKey(before)) return { kind: "done" };
@@ -1529,7 +1565,10 @@ export class FrameCore {
     const looser = changes.filter((c) => c.looser);
     if (looser.length > 0 && confirmedRev !== before.rev) {
       if (confirmedRev !== undefined) {
-        throw new SignerFailure("SIGNER_BUSY", "Your limits changed in another tab while you were confirming; nothing was changed. Try again.", { retryable: true });
+        throw new SignerFailure("SIGNER_BUSY", "Your limits changed in another tab while you were confirming; nothing was changed. Try again.", {
+          retryable: true,
+          details: { reason: "limitsChanged" },
+        });
       }
       if (!this.ui) {
         throw new SignerFailure("LIMIT_LOOSENING_REJECTED", "Loosening your limits needs a click in the signer frame, which has no user interface here.", {
@@ -1546,6 +1585,7 @@ export class FrameCore {
       rev: after.rev,
       master: after.master,
       accounts: Object.fromEntries([...after.accounts].map(([a, l]) => [a, l.limits])),
+      dailyOnTop: dailyCounters(after.accounts).onTop,
       updatedAt: this.now(),
     };
     let written: boolean;
@@ -1736,8 +1776,11 @@ export class FrameCore {
     const evaluate = async (limits: LimitsState, now: number) => {
       const accountPolicy = policyForAccount(limits.policy, limits.accounts, vault, this.market.tradingPairCoins);
       const expiresAfter = now + EXPIRES_AFTER_MS;
-      // Sub-accounts without a daily limit of their own share the master's daily limit and counter.
-      const usageAccount = { account, master, separate: separateDailyAccounts(limits.accounts) };
+      // Sub-accounts without a daily limit of their own share the master's daily limit and counter. One with its own
+      // counts against both, unless the user confirmed its counter on top of the master's (AccountLimits.onTop).
+      const counters = dailyCounters(limits.accounts);
+      const usageAccount = { account, master, ...counters };
+      const masterDailyLimitUsd = account !== master && counters.separate.includes(account) && !counters.onTop.includes(account) ? limits.policy.maxDailyNotionalUsd : undefined;
       const usage = await this.coordinator.usage(usageKey, now, usageAccount);
       const accountBook = await bookFor(accountPolicy);
       const decision = evaluateFramePolicy({
@@ -1751,6 +1794,7 @@ export class FrameCore {
         ordersInLastMinute: usage.ordersInLastMinute,
         dailyNotionalUsedUsd: usage.accountDailyNotionalUsd,
         agentDailyNotionalUsedUsd: usage.dailyNotionalUsedUsd,
+        ...(masterDailyLimitUsd !== undefined ? { masterDaily: { usedUsd: usage.masterDailyNotionalUsd, limitUsd: masterDailyLimitUsd } } : {}),
         ...(leverageByCoin !== undefined ? { leverageByCoin } : {}),
         ...(ownedSubAccount !== undefined ? { ownedSubAccount } : {}),
         network: this.config.network.name,
@@ -1764,7 +1808,7 @@ export class FrameCore {
         this.log("sign.denied", { actionType: decision.actionType, codes: decision.violations.map((v) => v.code).join(",") });
         throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: decision.violations } });
       }
-      return { decision, accountPolicy, usageAccount, expiresAfter };
+      return { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter };
     };
 
     // 4b. Orders above CONFIRM_ORDERS_ABOVE_USD in all (reduce-only ones included), or that would take what this account
@@ -1803,17 +1847,21 @@ export class FrameCore {
       requirePinnedDexes();
       // A market trigger compiled with more slippage than the marks read now allow (the mark moved toward it while the
       // user confirmed): the confirmed action would be refused, so nothing is signed and the user tries again.
-      const now = marketTriggerSlippageFor(compiledPolicy, snapshot.markPrices);
-      if (triggerLegs.some((t) => now(t.leg) < t.bps)) {
+      const slippageAllowedNow = marketTriggerSlippageFor(compiledPolicy, snapshot.markPrices);
+      if (triggerLegs.some((t) => slippageAllowedNow(t.leg) < t.bps)) {
         throw new SignerFailure("SIGNER_BUSY", "The market moved close to this order's stop or trigger while you were confirming; nothing was signed. Try again.", {
           retryable: true,
+          details: { reason: "marketMoved" },
         });
       }
       leverageByCoin = undefined;
       // Read again for the check under the lock: the position may have changed while the prompt was open.
       isolatedPositionLeverage = await isolatedFor();
       if (leverageUp && !(isolatedPositionLeverage?.[leverageUp.coin] === leverageUp.from)) {
-        throw new SignerFailure("SIGNER_BUSY", "The position's leverage changed while you were confirming; nothing was signed. Try again.", { retryable: true });
+        throw new SignerFailure("SIGNER_BUSY", "The position's leverage changed while you were confirming; nothing was signed. Try again.", {
+          retryable: true,
+          details: { reason: "leverageChanged" },
+        });
       }
     }
 
@@ -1828,7 +1876,7 @@ export class FrameCore {
       if (leverageByCoin === undefined && needsLeverage(limits)) leverageByCoin = await this.accountLeverage(account, coins, snapshot);
       const now = this.correctedNow();
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
-      const { decision, accountPolicy, usageAccount, expiresAfter } = await evaluate(limits, now);
+      const { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter } = await evaluate(limits, now);
 
       let nonce: number;
       try {
@@ -1842,6 +1890,7 @@ export class FrameCore {
             maxActionsPerMinute: BASELINE_LIMITS.maxActionsPerMinute,
             maxDailyNotionalUsd: accountPolicy.maxDailyNotionalUsd,
             maxAgentDailyNotionalUsd: BASELINE_LIMITS.maxDailyNotionalUsd,
+            ...(masterDailyLimitUsd !== undefined ? { maxMasterDailyNotionalUsd: masterDailyLimitUsd } : {}),
           },
           // Checked again in the record's own transaction: another tab may have signed orders since the check above. A
           // confirmation whose prompt showed the unconfirmed total of a window starts that window again (the orders in
@@ -1859,7 +1908,7 @@ export class FrameCore {
           this.metrics.policyDenials++;
           throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: e.code, message: e.message }] } });
         }
-        if (e instanceof ConfirmationNeededError) throw new SignerFailure("SIGNER_BUSY", e.message, { retryable: true });
+        if (e instanceof ConfirmationNeededError) throw new SignerFailure("SIGNER_BUSY", e.message, { retryable: true, details: { reason: "ordersSigned" } });
         if (e instanceof RangeError) throw new SignerFailure("INTERNAL_ERROR", "Could not produce a valid nonce; check the device clock.");
         throw new SignerFailure("STORAGE_FAILED", "Could not reserve a nonce on this device.", { retryable: true });
       }
@@ -2080,6 +2129,7 @@ export class FrameCore {
             `Move ${usdText} USDC from your Hyperliquid account into HLP, Hyperliquid's own vault. ` +
             `You can withdraw it ${HLP_LOCKUP_DAYS} days after this deposit. HLP can lose money.`,
           actionLabel: `Deposit ${usdText} USDC`,
+          confirmText: `deposit ${usdText}`,
           fixedStyle: true,
           hold: true,
         },
@@ -2093,6 +2143,7 @@ export class FrameCore {
           title: "Withdraw from a vault",
           body: `Move ${usdText} USDC from vault ${vault.slice(0, 6)}…${vault.slice(-4)} back into your Hyperliquid account. Confirm only if you asked for this.`,
           actionLabel: `Withdraw ${usdText} USDC`,
+          confirmText: `withdraw ${usdText}`,
           fixedStyle: true,
           hold: true,
         },
@@ -2194,6 +2245,8 @@ export class FrameCore {
         title: `Confirm${orders.changes ? " change" : ""}: ${first}${more > 0 ? ` + ${more} more` : ""}, ${total}`,
         body: `The Kokoah app asks to send ${one ? "this order" : "these orders"}${whose} to Hyperliquid.${why} Confirm only if you placed ${one ? "it" : "them"}.\n\n${orders.lines.join("\n")}`,
         actionLabel: `${change}${first}${more > 0 ? ` + ${more}` : ""}`,
+        // The words to type (in the confirmation window): the first order's side, size and market.
+        confirmText: first,
         fixedStyle: true,
         hold: true,
       },
@@ -2223,6 +2276,7 @@ export class FrameCore {
         title: "Take margin out of this position?",
         body: `The Kokoah app asks to take ${amount} of margin out of the isolated ${name} position${whose}. This moves the position closer to liquidation. Confirm only if you asked for this.`,
         actionLabel: `Remove ${amount}`,
+        confirmText: `remove ${amount}`,
         fixedStyle: true,
         hold: true,
       },
@@ -2252,6 +2306,7 @@ export class FrameCore {
         title: `Raise the leverage of this position to ${raise.to}x?`,
         body: `The Kokoah app asks to raise the leverage of the isolated ${name} position${whose} from ${raise.from}x to ${raise.to}x. This takes margin out of the position and moves it closer to liquidation. Confirm only if you asked for this.`,
         actionLabel: `Raise to ${raise.to}x`,
+        confirmText: `raise to ${raise.to}x`,
         fixedStyle: true,
         hold: true,
       },
@@ -2273,6 +2328,7 @@ export class FrameCore {
             title: "Remove the trading key from this device?",
             body: "The Kokoah app asks to delete this device's trading key, which is protected with your passkey. To trade here again you will approve a new key in your wallet. Confirm only if you asked for this.",
             actionLabel: "Remove key",
+            confirmText: "remove key",
             fixedStyle: true,
             hold: true,
           }
@@ -2280,6 +2336,7 @@ export class FrameCore {
             title: "Replace your passkey-protected trading key?",
             body: "The Kokoah app asks to replace this device's trading key, which is protected with your passkey, with a new one that unlocks without your passkey. Confirm only if you asked for this.",
             actionLabel: "Replace key",
+            confirmText: "replace key",
             fixedStyle: true,
             hold: true,
           },

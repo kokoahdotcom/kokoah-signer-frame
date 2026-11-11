@@ -92,7 +92,7 @@ describe("nonces across two tabs sharing IndexedDB", () => {
     expect(Math.min(...nonces)).toBe(T0);
     expect(Math.max(...nonces)).toBe(T0 + 49);
     const usage = usageOf(await s1.readUsage("0xabc"), T0);
-    expect(usage).toEqual({ ordersInLastMinute: 50, actionsInLastMinute: 50, dailyNotionalUsedUsd: 500, accountDailyNotionalUsd: 500, unpromptedUsd: 0, unpromptedDayUsd: 0 });
+    expect(usage).toEqual({ ordersInLastMinute: 50, actionsInLastMinute: 50, dailyNotionalUsedUsd: 500, accountDailyNotionalUsd: 500, masterDailyNotionalUsd: 500, unpromptedUsd: 0, unpromptedDayUsd: 0 });
   });
 
   it("checks the limits again inside the reservation, so tabs without a shared lock can't both pass", async () => {

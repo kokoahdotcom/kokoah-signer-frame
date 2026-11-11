@@ -11,7 +11,8 @@ import { TESTNET } from "@kokoah/shared/network";
 import { afterEach, describe, expect, it } from "vitest";
 import { nextUsage, usageOf } from "../src/frame/nonces.js";
 import type { AllowedActionType } from "../src/protocol/index.js";
-import { applyUserLimits, BASELINE_LIMITS, createBaselinePolicy, evaluateFramePolicy, limitsForAccount, policyForAccount, separateDailyAccounts } from "../src/frame/policy.js";
+import { applyUserLimits, BASELINE_LIMITS, createBaselinePolicy, dailyCounters, evaluateFramePolicy, limitsForAccount, policyForAccount } from "../src/frame/policy.js";
+import type { UserLimits } from "../src/protocol/index.js";
 import { BUILDER, FrameHarness, limitOrder, META0, subAccountEntry, T0, USER } from "./helpers.js";
 
 let h: FrameHarness;
@@ -105,12 +106,14 @@ describe("frame policy: vaultAddress", () => {
   });
 
   it("gives a sub-account a daily counter of its own only when its own limits set a daily limit", () => {
-    const map = new Map([
+    const map = new Map<string, { limits: UserLimits; onTop?: true }>([
       [SUB, { limits: { maxLeverage: 3, maxOrderNotionalUsd: 100, requireStopLossForNewEntries: true as const } }],
       [SUB2, { limits: { maxDailyNotionalUsd: 1_000 } }],
     ]);
-    expect(separateDailyAccounts(map)).toEqual([SUB2]);
-    expect(separateDailyAccounts(new Map())).toEqual([]);
+    expect(dailyCounters(map)).toEqual({ separate: [SUB2], onTop: [] });
+    map.set(SUB2, { limits: { maxDailyNotionalUsd: 1_000 }, onTop: true });
+    expect(dailyCounters(map)).toEqual({ separate: [SUB2], onTop: [SUB2] });
+    expect(dailyCounters(new Map())).toEqual({ separate: [], onTop: [] });
   });
 });
 
@@ -320,12 +323,15 @@ describe("usage records per account", () => {
     const b = nextUsage("0xa", a, T0 + 1, 1, 30, sub);
     expect(b.dayNotionalUsd).toBe(130);
     expect(b.accountNotionalUsd).toEqual({ [USER.toLowerCase()]: 100, [SUB]: 30 });
-    expect(usageOf(b, T0 + 2, sub)).toEqual({ ordersInLastMinute: 2, actionsInLastMinute: 2, dailyNotionalUsedUsd: 130, accountDailyNotionalUsd: 30, unpromptedUsd: 0, unpromptedDayUsd: 0 });
-    // A sub-account without limits of its own shares the master's counter; one with its own keeps its own.
+    expect(usageOf(b, T0 + 2, sub)).toEqual({ ordersInLastMinute: 2, actionsInLastMinute: 2, dailyNotionalUsedUsd: 130, accountDailyNotionalUsd: 30, masterDailyNotionalUsd: 100, unpromptedUsd: 0, unpromptedDayUsd: 0 });
+    // A sub-account without limits of its own shares the master's counter; one with its own keeps its own, and still
+    // counts in the master's unless its counter is on top of the master's limit.
     expect(usageOf(b, T0 + 2, { ...sub, separate: [] }).accountDailyNotionalUsd).toBe(130);
     expect(usageOf(b, T0 + 2, { ...master, separate: [] }).accountDailyNotionalUsd).toBe(130);
-    expect(usageOf(b, T0 + 2, { ...sub, separate: [SUB] }).accountDailyNotionalUsd).toBe(30);
-    expect(usageOf(b, T0 + 2, { ...master, separate: [SUB] }).accountDailyNotionalUsd).toBe(100);
+    expect(usageOf(b, T0 + 2, { ...sub, separate: [SUB] })).toMatchObject({ accountDailyNotionalUsd: 30, masterDailyNotionalUsd: 130 });
+    expect(usageOf(b, T0 + 2, { ...master, separate: [SUB] }).accountDailyNotionalUsd).toBe(130);
+    expect(usageOf(b, T0 + 2, { ...sub, separate: [SUB], onTop: [SUB] })).toMatchObject({ accountDailyNotionalUsd: 30, masterDailyNotionalUsd: 100 });
+    expect(usageOf(b, T0 + 2, { ...master, separate: [SUB], onTop: [SUB] }).accountDailyNotionalUsd).toBe(100);
     expect(usageOf(b, T0 + 2, master).accountDailyNotionalUsd).toBe(100);
     const tomorrow = nextUsage("0xa", b, T0 + 86_400_000, 0, 5, sub);
     expect(tomorrow.accountNotionalUsd).toEqual({ [SUB]: 5 });

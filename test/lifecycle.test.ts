@@ -62,6 +62,51 @@ describe("removing a passkey-protected key", () => {
     expect(removePrompts(h)).toHaveLength(3);
   });
 
+  it("asks before a renewal whose passkey step can't protect the key falls back to a key without it", async () => {
+    const passkeys = new MockPasskeys();
+    const h = await frame({ passkeys });
+    const { address } = await h.activeAgent("passkey");
+    // The passkey step says the passkey can't give the PRF secret any more (or the page blocked WebAuthn).
+    passkeys.failNextGet = "unsupported";
+    const renewal = h.request("createAgent", { userAddress: USER, validForDays: 30, storageMode: "passkey", replaceExisting: true });
+    await h.clickPrompt();
+    await waitFor(() => removePrompts(h).length === 1);
+    expect(h.promptText()).toContain("unlocks without your passkey");
+    await h.clickPrompt("cancel");
+    expect((await renewal).ok).toBe(false);
+    expect(await h.ok("getStatus")).toMatchObject({ agentAddress: address, storageMode: "passkey" });
+    expect(await (await IdbSignerStore.open(h.idb)).getKeyRecord()).toMatchObject({ agentAddress: address, storageMode: "passkey" });
+    // Confirmed: the device key takes its place, saying why.
+    passkeys.failNextGet = "unsupported";
+    const confirmed = h.createAgent({ userAddress: USER, validForDays: 30, storageMode: "passkey", replaceExisting: true });
+    await h.clickPrompt();
+    await waitFor(() => removePrompts(h).length === 2);
+    await h.clickPrompt();
+    expect(await confirmed).toMatchObject({ storageMode: "device", requestedStorageMode: "passkey" });
+  });
+
+  it("asks before a key without the passkey is stored where the stored key can't be read", async () => {
+    const first = await frame();
+    await first.activeAgent("passkey");
+    // Another tab of this origin, whose read of the stored key record fails.
+    const store = await IdbSignerStore.open(first.idb);
+    const unreadable = new Proxy(store, {
+      get(target, prop) {
+        if (prop === "getKeyRecord") return async () => Promise.reject(new Error("read failed"));
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    const h = await frame({ idb: first.idb, store: unreadable, clock: first.clock, hl: first.hl });
+    await h.ok("hello", { protocolVersion: 1 });
+    const device = h.request("createAgent", { userAddress: USER, validForDays: 30, storageMode: "device", replaceExisting: true });
+    await waitFor(() => removePrompts(h).length === 1);
+    expect(h.promptText()).toContain("unlocks without your passkey");
+    await h.clickPrompt("cancel");
+    expect((await device).ok).toBe(false);
+    expect(await store.getKeyRecord()).toMatchObject({ storageMode: "passkey" });
+  });
+
   it("renews a passkey key with the passkey without asking to remove it", async () => {
     const h = await frame();
     await h.activeAgent("passkey");

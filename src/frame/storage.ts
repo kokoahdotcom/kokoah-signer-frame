@@ -64,6 +64,12 @@ export interface StoredLimitsRecord {
   master: UserLimits | null;
   /** Sub-accounts' own limits, by lowercase address. */
   accounts: Record<string, UserLimits>;
+  /**
+   * Sub-accounts (lowercase) whose own daily counter the user confirmed on top of the master's daily limit (policy.ts
+   * `AccountLimits.onTop`). Missing (records from before 2026-11-11, or written by an older build): none, so every
+   * sub-account's trading counts against the master's daily limit too.
+   */
+  dailyOnTop?: string[];
   updatedAt: number;
 }
 

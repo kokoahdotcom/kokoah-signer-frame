@@ -207,7 +207,7 @@ describe("limits stored by the frame", () => {
     expect((await h.ok("setLimits", { maxOrderNotionalUsd: 100 })).policy.maxOrderNotionalUsd).toBe(100);
     await h.clickPrompt();
     const r = await raise.answer;
-    expect(!r.ok && r.error).toMatchObject({ code: "SIGNER_BUSY", retryable: true });
+    expect(!r.ok && r.error).toMatchObject({ code: "SIGNER_BUSY", retryable: true, details: { reason: "limitsChanged" } });
     expect((await h.ok("getStatus")).policy.maxOrderNotionalUsd).toBe(100);
   });
 });
@@ -357,6 +357,57 @@ describe("sub-account limits", () => {
     expect((await h.ok("getStatus")).policy.accountLimits).toEqual({ [SUB]: { maxOrderNotionalUsd: 100 } });
   });
 
+  it("applies the master's first daily limit at once, and counts a sub-account's own counter against it", async () => {
+    const h = await frame();
+    h.hl.subAccounts[USER.toLowerCase()] = [subAccountEntry(SUB), subAccountEntry(SUB2, USER, "Scalp")];
+    await h.activeAgent("device");
+    // No daily limit on the master: a sub-account's own is only a tightening.
+    await h.ok("setLimits", { account: SUB2, maxDailyNotionalUsd: 500 });
+    // The master's new daily limit is a tightening too: applied at once, with no prompt.
+    expect((await h.ok("setLimits", { maxDailyNotionalUsd: 1_000 })).policy.userLimits).toEqual({ maxDailyNotionalUsd: 1_000 });
+    expect(shownPrompts(h)).toHaveLength(0);
+    // SUB2's trading counts against its own $500 and against the master's $1,000.
+    expect((await h.ok("signAndSubmit", order("s1", { vaultAddress: SUB2, size: "0.2" }))).status).toBe("ok"); // SUB2: $400
+    expect(codes(await h.fail("signAndSubmit", order("s2", { vaultAddress: SUB2 })))).toContain("DAILY_NOTIONAL_EXCEEDED"); // own: $600
+    expect((await h.ok("signAndSubmit", order("m1", { size: "0.3" }))).status).toBe("ok"); // master's: $1,000
+    expect(codes(await h.fail("signAndSubmit", order("m2", { size: "0.01" })))).toContain("DAILY_NOTIONAL_EXCEEDED");
+    const full = await h.fail("signAndSubmit", order("s3", { vaultAddress: SUB2, size: "0.01" })); // own: $420, master's: $1,020
+    expect(full.details?.violations?.map((v) => v.message).join(" ")).toContain("main account's daily limit of $1,000");
+    // The same limits again: nothing changes and nothing is asked, also in a frame without a user interface.
+    await h.ok("setLimits", { account: SUB2, maxDailyNotionalUsd: 500 });
+    await h.ok("setLimits", { maxDailyNotionalUsd: 1_000 });
+    expect(shownPrompts(h)).toHaveLength(0);
+    const headless = await frame({ withUi: false });
+    headless.hl.subAccounts[USER.toLowerCase()] = [subAccountEntry(SUB2, USER, "Scalp")];
+    await headless.activeAgent("device");
+    await headless.ok("setLimits", { account: SUB2, maxDailyNotionalUsd: 500 });
+    expect((await headless.ok("setLimits", { maxDailyNotionalUsd: 1_000 })).policy.userLimits).toEqual({ maxDailyNotionalUsd: 1_000 });
+  });
+
+  it("keeps a counter the user confirmed next to the master's daily limit on top of it, until the master's limit goes", async () => {
+    const h = await ready();
+    const own = await asking(h, { account: SUB2, maxDailyNotionalUsd: 500 });
+    await h.clickPrompt();
+    expect((await own.answer).ok).toBe(true);
+    expect((await h.ok("signAndSubmit", order("m1", { size: "0.25" }))).status).toBe("ok");
+    expect((await h.ok("signAndSubmit", order("m2", { size: "0.25" }))).status).toBe("ok"); // master's: $1,000
+    // SUB2's own $500 is neither used up by the master's trading nor counted in it, also after a reload.
+    expect((await h.ok("signAndSubmit", order("s1", { vaultAddress: SUB2, size: "0.2" }))).status).toBe("ok");
+    const b = await frame({ idb: h.idb, clock: h.clock, hl: h.hl });
+    await b.ok("hello", { protocolVersion: 1 });
+    expect((await b.ok("signAndSubmit", order("s2", { vaultAddress: SUB2, size: "0.01" }))).status).toBe("ok");
+    expect(codes(await b.fail("signAndSubmit", order("m3", { size: "0.01" })))).toContain("DAILY_NOTIONAL_EXCEEDED");
+    // The master's daily limit removed (a loosening) and set again: SUB2's counter counts against the new one.
+    const off = await asking(h, { maxOrderNotionalUsd: 500 });
+    await h.clickPrompt();
+    expect((await off.answer).ok).toBe(true);
+    await h.ok("setLimits", { maxOrderNotionalUsd: 500, maxDailyNotionalUsd: 1_800 });
+    expect(shownPrompts(h)).toHaveLength(2);
+    expect((await h.ok("signAndSubmit", order("s3", { vaultAddress: SUB2, size: "0.02" }))).status).toBe("ok"); // own: $460; master's: $1,000 + $420 + $40
+    // $1,500 without SUB2's trading; $1,960 with it.
+    expect(codes(await h.fail("signAndSubmit", order("m4", { size: "0.25" })))).toContain("DAILY_NOTIONAL_EXCEEDED");
+  });
+
   it("keeps a sub-account's limits across a reload and in another tab", async () => {
     const h = await ready();
     const b = await frame({ idb: h.idb, clock: h.clock, hl: h.hl });
@@ -370,7 +421,10 @@ describe("sub-account limits", () => {
 
 describe("limitChanges and stored limits", () => {
   const baseline = createBaselinePolicy({ address: BUILDER, feeTenthsBps: 25 });
-  const set = (master: UserLimits | null, accounts: Record<string, UserLimits> = {}) => ({ master, accounts: new Map(Object.entries(accounts).map(([a, limits]) => [a, { limits }])) });
+  const set = (master: UserLimits | null, accounts: Record<string, UserLimits> = {}, onTop: string[] = []) => ({
+    master,
+    accounts: new Map(Object.entries(accounts).map(([a, limits]) => [a, onTop.includes(a) ? { limits, onTop: true as const } : { limits }])),
+  });
 
   it("compares effective values: the account's own, else the master's, else the baseline's", () => {
     expect(limitChanges(baseline, set({ maxLeverage: 3 }), set({ maxLeverage: 3 }))).toEqual([]);
@@ -384,7 +438,16 @@ describe("limitChanges and stored limits", () => {
     expect(limitChanges(baseline, set(null), set(null, { [SUB]: { maxDailyNotionalUsd: 500 } }), SUB)).toEqual([
       { field: "maxDailyNotionalUsd", text: "Trading per day: $25,000,000 → $500", looser: false },
     ]);
-    expect(limitChanges(baseline, set({ maxDailyNotionalUsd: 1_000 }), set({ maxDailyNotionalUsd: 1_000 }, { [SUB]: { maxDailyNotionalUsd: 1_000 } }), SUB)[0]?.looser).toBe(true);
+    expect(limitChanges(baseline, set({ maxDailyNotionalUsd: 1_000 }), set({ maxDailyNotionalUsd: 1_000 }, { [SUB]: { maxDailyNotionalUsd: 1_000 } }, [SUB]), SUB)[0]?.looser).toBe(true);
+    // A counter that stays where it was (on top or not) compares by its number only.
+    expect(limitChanges(baseline, set({ maxDailyNotionalUsd: 1_000 }, { [SUB]: { maxDailyNotionalUsd: 500 } }), set({ maxDailyNotionalUsd: 1_000 }, { [SUB]: { maxDailyNotionalUsd: 400 } }), SUB)).toEqual([
+      { field: "maxDailyNotionalUsd", text: "Trading per day: $500 → $400", looser: false },
+    ]);
+    // The master's first daily limit is a tightening, whatever counters the sub-accounts have: they count against it.
+    const counters = { [SUB]: { maxDailyNotionalUsd: 500 } };
+    expect(limitChanges(baseline, set(null, counters), set({ maxDailyNotionalUsd: 1_000 }, counters))).toEqual([
+      { field: "maxDailyNotionalUsd", text: "Trading per day: $25,000,000 → $1,000", looser: false },
+    ]);
   });
 
   it("drops stored fields that no longer parse or fit the baseline, so the stricter baseline applies", () => {

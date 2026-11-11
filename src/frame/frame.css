@@ -138,7 +138,10 @@ body {
     radial-gradient(farthest-side at 50% 100%, color-mix(in srgb, var(--ks-fg) 14%, transparent), transparent) bottom / 100% 8px no-repeat scroll;
 }
 
-/* The code a fixed-style prompt asks for where the browser can't tell whether the prompt is seen. */
+/*
+ * The words a fixed-style prompt asks the user to type in the confirmation window (prompt.ts `confirmText`: "deposit
+ * 1,000", "remove protection", "Buy 0.3 BTC"), where the browser can't tell whether the frame's prompt is seen.
+ */
 .ks-code {
   margin: 16px 0 0;
 }
@@ -147,12 +150,14 @@ body {
   margin-bottom: 0.4em;
 }
 .ks-code-value {
-  font-size: 1.3em;
-  letter-spacing: 0.15em;
+  font-size: 1.2em;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
 }
 .ks-code-input {
-  width: 6em;
+  width: 100%;
+  max-width: 24em;
   min-height: 44px;
   padding: 0.4em 0.6em;
   border: 1px solid var(--ks-border);
@@ -160,8 +165,7 @@ body {
   background: transparent;
   color: inherit;
   font: inherit;
-  font-size: 1.2em;
-  letter-spacing: 0.15em;
+  font-size: 1.1em;
 }
 .ks-code-input:focus-visible {
   outline: 2px solid var(--ks-focus);
@@ -307,6 +311,29 @@ body {
  * showNotice) always has it too. While one of them is shown the whole frame is that card (prompt.ts sets
  * `ks-fixed-look` on the root element): cream to its edges, the crimson edge just inside them.
  */
+/*
+ * The confirmation window (prompt.ts `prepareWindow`): the prompt as a card of readable width at the top of the window,
+ * growing with its text (the window scrolls, not the card).
+ */
+html.ks-window,
+html.ks-window body {
+  height: auto;
+  min-height: 100%;
+}
+html.ks-window .ks-root,
+html.ks-window.ks-fixed-look .ks-root {
+  justify-content: flex-start;
+  height: auto;
+  max-width: 480px;
+  margin: 24px auto;
+}
+@media (max-width: 520px) {
+  html.ks-window .ks-root,
+  html.ks-window.ks-fixed-look .ks-root {
+    margin: 8px;
+  }
+}
+
 html.ks-fixed-look,
 html.ks-fixed-look body {
   background: #fbf4ec;

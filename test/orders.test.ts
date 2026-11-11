@@ -5,7 +5,7 @@
  */
 import { MarketRegistry } from "@kokoah/shared/markets";
 import { afterEach, describe, expect, it } from "vitest";
-import { ConfirmationNeededError, nextUsage, SigningCoordinator, UNPROMPTED_DAY_MS, UNPROMPTED_WINDOW_MS, usageOf } from "../src/frame/nonces.js";
+import { ConfirmationNeededError, nextUsage, SigningCoordinator, UNPROMPTED_DAY_MS, UNPROMPTED_WINDOW_MS, usageOf, type LockManagerLike } from "../src/frame/nonces.js";
 import { CONFIRM_ORDERS_ABOVE_USD, CONFIRM_UNPROMPTED_ABOVE_USD, CONFIRM_UNPROMPTED_DAY_ABOVE_USD, describeOrders } from "../src/frame/policy.js";
 import type { UsageRecord } from "../src/frame/storage.js";
 import { MemorySignerStore } from "../src/frame/storage.js";
@@ -308,6 +308,52 @@ describe("many orders without a prompt", () => {
     expect(h.hl.exchangeCalls).toHaveLength(4);
   });
 
+  it("say so when another tab's orders signed in between need this one confirmed (SIGNER_BUSY ordersSigned)", async () => {
+    const locks = new FakeLocks();
+    let waiting = false;
+    let open!: () => void;
+    let gate: Promise<void> | null = null;
+    // This tab's signing lock waits until the other tab has signed.
+    const gated: LockManagerLike = {
+      request: async (name, options, callback) => {
+        if (gate !== null && name.includes("/sign/")) {
+          waiting = true;
+          await gate;
+        }
+        return await locks.request(name, options, callback);
+      },
+    };
+    await ready({ locks: gated });
+    for (const id of ["a", "b", "c"]) await just(id); // $72,000
+    const other = await FrameHarness.create({ idb: h.idb, clock: h.clock, hl: h.hl, locks });
+    try {
+      await other.ok("hello", { protocolVersion: 1 });
+      gate = new Promise((r) => (open = r));
+      const pending = h.fail("signAndSubmit", { requestId: "d", intent: btc("0.24") });
+      await waitFor(() => waiting);
+      expect((await other.ok("signAndSubmit", { requestId: "e", intent: btc("0.24") })).status).toBe("ok"); // $96,000
+      open();
+      expect(await pending).toMatchObject({ code: "SIGNER_BUSY", retryable: true, details: { reason: "ordersSigned" } });
+      expect(h.hl.exchangeCalls).toHaveLength(4);
+    } finally {
+      other.destroy();
+    }
+  });
+
+  it("say so when the signing lock isn't free in time (SIGNER_BUSY lock)", async () => {
+    const locks = new FakeLocks();
+    const busy: LockManagerLike = {
+      request: async (name, options, callback) => {
+        // What AbortSignal.timeout makes Web Locks reject with.
+        if (name.includes("/sign/")) throw Object.assign(new Error("The lock wasn't granted in time."), { name: "TimeoutError" });
+        return await locks.request(name, options, callback);
+      },
+    };
+    await ready({ locks: busy });
+    expect(await h.fail("signAndSubmit", { requestId: "a", intent: btc("0.01") })).toMatchObject({ code: "SIGNER_BUSY", retryable: true, details: { reason: "lock" } });
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+  });
+
   it("are checked again when the nonce is reserved, so another tab's orders in between can't slip past it", async () => {
     const coordinator = new SigningCoordinator({ store: new MemorySignerStore(), locks: undefined, lockPrefix: "t" });
     const key = { key: "account/testnet/0xabc", legacy: "0xagent" };
@@ -412,7 +458,7 @@ describe("raising the leverage of an isolated position", () => {
     await shown();
     isolatedAt(8);
     await h.clickPrompt();
-    expect((await moved).code).toBe("SIGNER_BUSY");
+    expect(await moved).toMatchObject({ code: "SIGNER_BUSY", details: { reason: "leverageChanged" } });
     h.hl.infoFailure = (body) => body.type === "clearinghouseState";
     expect((await h.fail("signAndSubmit", { requestId: "down", intent: lev(10) })).code).toBe("MARKET_DATA_UNAVAILABLE");
     h.hl.infoFailure = null;
@@ -489,7 +535,7 @@ describe("market triggers near the mark", () => {
     h.hl.mark.BTC = "99400";
     h.clock.advance(5_000);
     await h.clickPrompt();
-    expect(await first).toMatchObject({ code: "SIGNER_BUSY", retryable: true });
+    expect(await first).toMatchObject({ code: "SIGNER_BUSY", retryable: true, details: { reason: "marketMoved" } });
     expect(h.hl.exchangeCalls).toHaveLength(0);
     // Again: compiled at the new mark, within the band, and signed once confirmed.
     const again = h.ok("signAndSubmit", { requestId: "b2", intent: big });

@@ -159,15 +159,19 @@ to approve a new key (see `createAgent`), and must sit **beside** that window, n
 corner, not centred over the page). It asks for nothing and takes no focus.
 
 **How the prompt resists a hostile page.** Its primary button works only after the prompt has been shown for 800 ms
-(where the browser reports occlusion, IntersectionObserver v2, shown whole, wholly in view and unobscured; covering,
-fading or clipping part of it starts over). On every browser (2026-10-30) it arms, and confirms, only in a frame of at
+while IntersectionObserver reports it wholly in view (on every browser, 2026-11-11; a browser without it never arms a
+prompt), and where the browser reports occlusion (IntersectionObserver v2) also visible and unobscured; covering,
+fading or clipping part of it starts over. On every browser (2026-10-30) it arms, and confirms, only in a frame of at
 least 280 × 300 CSS px and while its text is shown whole; where the text doesn't fit (a small phone), the user scrolls
 it to its end first, with at least five lines in view; a smaller frame leaves it disarmed, saying so. Give the iframe
 room (the frame's own text is short). Where
 the browser can't report occlusion (Firefox, Safari, every iOS browser), the fixed-style prompts (`limits`,
-`vault-deposit`, `vault-withdraw`, `order`, `margin`, `key-remove` and removing passkey protection) also show a random 3-digit code
-the user types before the button works; a wrong code shows a new one, and after three wrong ones the prompt ends with
-`USER_CANCELLED` (2026-10-23). Moving the frame to a fragment (`#…`) scrolls it back and starts over, and so does
+`vault-deposit`, `vault-withdraw`, `order`, `margin`, `key-remove` and removing passkey protection) are confirmed in a
+window of their own (2026-11-11): the frame's button opens a top-level `about:blank` window of the signer's origin (the
+browser must allow the signer's pop-ups), the frame fills it with the same prompt and the same rules, and there the user
+also types a few words saying what it does (for example `deposit 250`, the first order's side, size and market, or
+`loosen limits`) before its button works. Closing that window leaves the frame's prompt to open it again or cancel;
+the frame's prompt ending closes it. Removing passkey protection then takes a passkey click in the frame itself. Moving the frame to a fragment (`#…`) scrolls it back and starts over, and so does
 moving the iframe under the user's pointer (2026-10-30); a mouse pointer the frame first sees while a prompt is open,
 or sees again after it left the frame, counts only after 800 ms there. Then a click counts only after the user's own pointer moved over the button inside the frame (a touch
 press on it, for pointers that can't hover); events a script dispatches and a pointer that was already resting where
@@ -605,7 +609,12 @@ list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE`
   - `COMPILE_FAILED` (`details.compileCode`: `UNKNOWN_MARKET`, `DELISTED_MARKET`, `SIZE_PRECISION`, `PRICE_PRECISION`, `CROSS_NOT_ALLOWED`, `MARGIN_PRECISION`, `SCHEDULE_TOO_SOON`, …; the message includes the rounded suggestion);
   - `POLICY_DENIED` (`details.violations`: every `{ code, message }` from shared `evaluatePolicy`, plus the frame's own rules);
   - `MARKET_DATA_UNAVAILABLE` (retryable);
-  - `SIGNER_BUSY` (retryable; the signing lock wasn't free within 20 s);
+  - `SIGNER_BUSY` (retryable, nothing sent; `details.reason` says why): `lock`, the signing lock wasn't free within
+    20 s; `ordersSigned`, another tab signed orders in between and this one now needs the `order` prompt;
+    `marketMoved`, the mark moved toward a confirmed order's market trigger while the user confirmed, so its slippage
+    (compiled from the earlier mark) would now be refused; `leverageChanged`, the position's leverage changed while the
+    user confirmed raising it. Send it again: it is checked, and asked, against the new state. Show something like "The
+    price moved while you confirmed. Nothing was sent; confirm again.";
   - `USER_CANCELLED`, `USER_TIMEOUT`, `PROMPT_BUSY` (an HLP deposit or a large order the user didn't confirm; nothing sent);
   - `REQUEST_ID_REUSED`;
   - `MAINNET_WRITES_DISABLED`;
@@ -642,7 +651,9 @@ same order (`Buy 0.3 BTC + 2`), so they show even when the parent leaves the pro
 - It asks only about orders its rules allow (checked first) and doesn't hold up other requests meanwhile (a smaller
   order or a cancel signs at once; a second large order while one is asked about is `PROMPT_BUSY`).
 - After the user confirms, it reads prices, dexes and leverage again and checks everything again under the agent lock:
-  a market that moved past the band while the prompt was open is `POLICY_DENIED` (`PRICE_OUTSIDE_BAND`).
+  a market that moved past the band while the prompt was open is `POLICY_DENIED` (`PRICE_OUTSIDE_BAND`); a mark that
+  moved toward a market trigger so its compiled slippage is no longer allowed is `SIGNER_BUSY` (`details.reason:
+  "marketMoved"`, nothing sent).
 - Cancel or no answer within 120 s: `USER_CANCELLED` / `USER_TIMEOUT` with `details.prompt: "order"`. Nothing was sent,
   so the `requestId` may be used again. Show something like "You cancelled the order in the signer. Nothing was sent."
 - The client doesn't time `signAndSubmit` out while a prompt is open (it waits up to `interactiveTimeoutMs`, and gets its
@@ -664,6 +675,15 @@ many orders just under $25,000, however it spreads them out: at most $250,000 a 
 the frame's own prompt (`promptChanged` kind `margin`, fixed styling, press and hold) naming the amount and the market:
 it moves the position toward liquidation, which no notional cap covers. Cancel or timeout: `USER_CANCELLED` /
 `USER_TIMEOUT`; a frame without a UI refuses it. Adding margin signs at once.
+
+**Raising an isolated position's leverage** (`updateLeverage` with `marginMode: "isolated"` above the open isolated
+position's current leverage, 2026-11-11) waits for the same `margin` prompt (fixed styling, press and hold) naming the
+market and both figures (`Raise the leverage of this position to 10x?`, from 5x to 10x): it takes margin out of the
+position. The frame reads the account's isolated positions itself (`clearinghouseState`, the sub-account's for a
+sub-account) and reads them again after the confirmation; a leverage that changed meanwhile is `SIGNER_BUSY`
+(`details.reason: "leverageChanged"`, nothing sent). Requests whose origin isn't `manual` can't raise it, or switch an open
+isolated position to cross, at all (shared policy). Lowering it, or setting leverage on a market without an isolated
+position, signs at once. Positions that can't be read: `MARKET_DATA_UNAVAILABLE`, nothing signed.
 
 ### `setLimits`
 
@@ -723,8 +743,11 @@ Loosening means any of:
 - more `allowedCoins` or `allowedActionTypes` (or the list removed);
 - `requireStopLossForNewEntries` dropped while it is required;
 - `{ "account": "0x…sub" }` alone while the master's values are looser than the sub-account's own;
-- a sub-account getting `maxDailyNotionalUsd` of its own while the master has a daily limit: it then has a daily
-  counter of its own on top of the master's, so the day's total can grow.
+- a sub-account getting `maxDailyNotionalUsd` of its own while the master has a daily limit: its counter is then on
+  top of the master's (its trading no longer counts against the master's limit), so the day's total can grow.
+
+The master getting a daily limit is a tightening, also while sub-accounts have daily limits of their own: their trading
+counts against it (see Counting), so it applies at once, as the app's silent step expects (2026-11-11).
 
 Timing and order:
 - While the prompt is open, the stored (stricter) limits keep applying to every signature, in every tab.
@@ -744,9 +767,11 @@ device): a tightening applies, a loosening asks the user. When the user cancels,
 last for this frame load only.
 
 - Counting: orders per minute are counted per key across all accounts. Daily notional is counted per key across all
-  accounts for the baseline $25M. For personal limits, a sub-account whose own limits set `maxDailyNotionalUsd` has a
-  counter of its own against that limit; the master and every other sub-account share one counter against the
-  master's `maxDailyNotionalUsd`.
+  accounts for the baseline $25M. For personal limits, the master and every sub-account count against the master's
+  `maxDailyNotionalUsd`, and a sub-account whose own limits set `maxDailyNotionalUsd` also has a counter of its own
+  against that limit. Only a sub-account whose own counter the user confirmed on top of the master's daily limit (the
+  loosening above) is left out of the master's count, and only while both keep a daily limit: once the master's daily
+  limit is removed, one it gets later counts every sub-account again (2026-11-11).
 - Errors:
   - `LIMIT_LOOSENING_REJECTED`, with `details.fields` listing the fields above the baseline (or, in a frame with no user
     interface, the fields that would loosen the stored limits);
@@ -830,7 +855,7 @@ Example: `{ "protocol": "kokoah-signer", "version": 1, "kind": "event", "event":
 | `MARKET_DATA_UNAVAILABLE` | HL `/info` failed | Retry later |
 | `HL_UNAVAILABLE` | HL `/info` unreachable during `confirmAgent` | Retry later |
 | `REQUEST_ID_REUSED` | Same `requestId`, different intent | Bug: log it |
-| `SIGNER_BUSY` | Signing lock busy for 20 s; or `setLimits`: the stored limits changed while the user was confirming | Retry |
+| `SIGNER_BUSY` | Nothing sent; `details.reason`: `lock` (signing lock busy for 20 s), `ordersSigned` (another tab signed orders in between), `limitsChanged` (`setLimits`: the stored limits changed while the user was confirming), `marketMoved` (the mark moved toward a confirmed market trigger), `leverageChanged` (the leverage changed while the user confirmed raising it) | Retry; for `marketMoved` and `leverageChanged`, say the market or the position changed and confirm again |
 | `LIMIT_LOOSENING_REJECTED` | `setLimits` above the baseline, or a loosening in a frame with no user interface (`details.fields`) | Show which limit can't be raised |
 | `PASSKEY_UNAVAILABLE` | WebAuthn/PRF not usable | Offer `device` or `session` |
 | `PASSKEY_FAILED` | The WebAuthn ceremony failed | Retry |

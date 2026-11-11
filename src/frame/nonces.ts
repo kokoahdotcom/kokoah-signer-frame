@@ -112,6 +112,11 @@ export interface ReserveLimits {
   maxActionsPerMinute: number;
   /** The account's own daily limit (the master's, for sub-accounts without a daily limit of their own). */
   maxDailyNotionalUsd: number;
+  /**
+   * The master's daily limit, for a sub-account with a daily limit of its own whose trading counts against the
+   * master's too (see {@link UsageAccount.onTop}).
+   */
+  maxMasterDailyNotionalUsd?: number;
   /** The agent's daily limit across every account. */
   maxAgentDailyNotionalUsd: number;
 }
@@ -130,6 +135,8 @@ export interface Usage {
   dailyNotionalUsedUsd: number;
   /** Notional signed today for the account asked about (the master when none was given). */
   accountDailyNotionalUsd: number;
+  /** Notional signed today that counts against the master's daily limit (see {@link UsageAccount.onTop}). */
+  masterDailyNotionalUsd: number;
   /** Notional of the orders signed without a prompt in the last {@link UNPROMPTED_WINDOW_MS}, across every account. */
   unpromptedUsd: number;
   /** The same over the last {@link UNPROMPTED_DAY_MS}. */
@@ -143,11 +150,15 @@ export interface UsageAccount {
   /** The key's master (records from before sub-accounts count everything for it). */
   master: string;
   /**
-   * Sub-accounts with daily limits of their own (`maxDailyNotionalUsd` in their own limits; lowercase). Every other
-   * account shares the master's limit, so its notional is counted together with the master's and that of every other
-   * account without a daily limit of its own.
+   * Sub-accounts with daily limits of their own (`maxDailyNotionalUsd` in their own limits; lowercase): each has a
+   * counter of its own. The master's counter holds the notional of every account but those in `onTop`.
    */
   separate?: readonly string[];
+  /**
+   * Of `separate`, those the master's counter leaves out: the user confirmed their counters on top of the master's
+   * daily limit. Omitted: none.
+   */
+  onTop?: readonly string[];
 }
 
 export interface SigningCoordinatorOptions {
@@ -302,7 +313,7 @@ export class SigningCoordinator {
 
 /** Usage counters of a record at `now`. Without `account`, the account figure is the master's. */
 export function usageOf(record: UsageRecord | undefined, now: number, account?: UsageAccount): Usage {
-  if (!record) return { ordersInLastMinute: 0, actionsInLastMinute: 0, dailyNotionalUsedUsd: 0, accountDailyNotionalUsd: 0, unpromptedUsd: 0, unpromptedDayUsd: 0 };
+  if (!record) return { ordersInLastMinute: 0, actionsInLastMinute: 0, dailyNotionalUsedUsd: 0, accountDailyNotionalUsd: 0, masterDailyNotionalUsd: 0, unpromptedUsd: 0, unpromptedDayUsd: 0 };
   const today = record.day === utcDay(now);
   const inLastMinute = (t: number) => t > now - MINUTE && t <= now + MINUTE;
   return {
@@ -310,6 +321,7 @@ export function usageOf(record: UsageRecord | undefined, now: number, account?: 
     actionsInLastMinute: (record.actionTimes ?? []).filter(inLastMinute).length,
     dailyNotionalUsedUsd: today ? record.dayNotionalUsd : 0,
     accountDailyNotionalUsd: today ? accountNotional(record, account) : 0,
+    masterDailyNotionalUsd: today ? masterNotional(record, account) : 0,
     unpromptedUsd: sumUsd(recentUnprompted(record, now, UNPROMPTED_WINDOW_MS)),
     unpromptedDayUsd: sumUsd(recentUnprompted(record, now, UNPROMPTED_DAY_MS)),
   };
@@ -344,10 +356,21 @@ function accountNotional(record: UsageRecord, account: UsageAccount | undefined)
   if (account.separate === undefined) return amount(key);
   const separate = new Set(account.separate.map((a) => a.toLowerCase()));
   if (separate.has(key)) return amount(key);
-  // The master's limit is shared by every account without a daily limit of its own.
-  return Object.keys(byAccount)
-    .filter((a) => !separate.has(a))
-    .reduce((sum, a) => sum + amount(a), 0);
+  return masterNotional(record, account);
+}
+
+/**
+ * The notional counted against the master's daily limit: every account's but that of the sub-accounts whose own
+ * counters are on top of it ({@link UsageAccount.onTop}). Without `separate`, the master's own (records and callers from
+ * before sub-account counters).
+ */
+function masterNotional(record: UsageRecord, account: UsageAccount | undefined): number {
+  const byAccount = record.accountNotionalUsd;
+  if (byAccount === undefined || account?.separate === undefined) return accountNotional(record, account === undefined ? undefined : { account: account.master, master: account.master });
+  const onTop = new Set((account.onTop ?? []).map((a) => a.toLowerCase()));
+  return Object.entries(byAccount)
+    .filter(([a, value]) => !onTop.has(a) && typeof value === "number" && Number.isFinite(value))
+    .reduce((sum, [, value]) => sum + (value as number), 0);
 }
 
 /** HLP deposits (USD) a record holds for `master` in the last {@link HLP_DEPOSIT_RECENT_MS} before `now`. */
@@ -370,6 +393,9 @@ function limitProblem(usage: Usage, p: { orders: number; notionalUsd: number; li
   if (p.orders > 0 && usage.ordersInLastMinute + p.orders > l.maxOrdersPerMinute) return new UsageLimitError("ORDER_RATE_EXCEEDED", `More than ${l.maxOrdersPerMinute} orders per minute.`);
   const added = Number.isFinite(p.notionalUsd) && p.notionalUsd > 0 ? p.notionalUsd : 0;
   if (added > 0 && usage.accountDailyNotionalUsd + added > l.maxDailyNotionalUsd) return new UsageLimitError("DAILY_NOTIONAL_EXCEEDED", `Daily notional would pass the $${l.maxDailyNotionalUsd} limit.`);
+  if (added > 0 && l.maxMasterDailyNotionalUsd !== undefined && usage.masterDailyNotionalUsd + added > l.maxMasterDailyNotionalUsd) {
+    return new UsageLimitError("DAILY_NOTIONAL_EXCEEDED", `Daily notional would pass the main account's $${l.maxMasterDailyNotionalUsd} limit.`);
+  }
   if (added > 0 && usage.dailyNotionalUsedUsd + added > l.maxAgentDailyNotionalUsd) return new UsageLimitError("DAILY_NOTIONAL_EXCEEDED", `This device's key would pass its daily limit of $${l.maxAgentDailyNotionalUsd} across all accounts.`);
   return undefined;
 }
