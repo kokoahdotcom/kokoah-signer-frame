@@ -4,6 +4,13 @@
  * loosening of the user's limits and large orders need the user's own confirmation of the frame's own description of
  * them).
  *
+ * A prompt confirms only where the browser shows it is in view: IntersectionObserver must report all of it (at least
+ * {@link PROMPT_FULL_INTERSECTION}) on every browser, and also visible and unobscured where the browser can tell
+ * (IntersectionObserver v2, Chromium). Where it can't (Firefox, Safari, every iOS browser), a fixed-style prompt (one
+ * that moves money or loosens the user's protection) is confirmed in a top-level window of the signer's own origin that
+ * the frame opens on the user's click, where the parent page can't cover it, by typing what it does (its
+ * `confirmText`).
+ *
  * The DOM is built with `createElement` and `textContent` only: the frame's CSP has `trusted-types 'none'`, so any
  * HTML sink (`innerHTML`, …) would throw. Styling comes from `frame.css` and CSS custom properties that the parent
  * may set through `setTheme` (validated here).
@@ -33,9 +40,15 @@ export interface PromptRequest {
   /**
    * Shown in the frame's own fixed colors and size, whatever the parent's `setTheme` set: for a step that weakens the
    * key's protection, so the parent can't hide or disguise what the user is agreeing to. Where the browser can't tell
-   * whether the prompt is seen (no IntersectionObserver v2), such a prompt also asks for a code it shows.
+   * whether the prompt is seen (no IntersectionObserver v2), such a prompt is confirmed in a window of its own (see the
+   * module notes), by typing {@link PromptRequest.confirmText}.
    */
   fixedStyle?: boolean;
+  /**
+   * What the user types to confirm a fixed-style prompt in its own window: a few words saying what it does ("deposit
+   * 1000"). Default: the action label. Compared without case, spaces or punctuation other than the decimal point.
+   */
+  confirmText?: string;
   /**
    * Confirmed by pressing and holding the primary button (`holdMs`, with a filling bar) instead of a click: for a step
    * that moves money or loosens the user's protection, so a click the parent lured onto the button isn't enough.
@@ -58,7 +71,7 @@ export interface NoticeRequest {
 
 interface NoticeEntry {
   kind: PromptKind;
-  timer: ReturnType<typeof setTimeout>;
+  timer: TimerId;
 }
 
 /** Why a prompt ended without success. `kind`: the prompt's. */
@@ -129,18 +142,44 @@ const HOLD_HINT = "Press and hold the button to confirm.";
 const TOO_SMALL = "This window is too small to show the whole prompt. Make it larger to confirm.";
 const SCROLL_HINT = "Scroll to the end of the text above to confirm.";
 const KEY_HINT = "Press and hold Enter or Space to confirm.";
-const CODE_HINT = "Type the code shown above first.";
-const CODE_MISS = "That is not the code shown. A new code is shown: type it to confirm.";
+const CODE_HINT = "Type the words shown above first.";
+const NOT_SEEN = "This browser can't show that the prompt is in view, so it can't be confirmed here. Update the browser to confirm.";
+const WINDOW_LABEL = "Open the confirmation window";
+const WINDOW_HINT = "This browser confirms this in a separate Kokoah signer window.";
+const WINDOW_OPEN = "Confirm in the Kokoah signer window that opened.";
+const WINDOW_BLOCKED = "The browser blocked the confirmation window. Allow pop-ups for the Kokoah signer, then try again.";
+const WINDOW_CLOSED = "The confirmation window was closed. Open it again, or choose Cancel.";
 
-/** Digits of the code a fixed-style prompt asks for where the browser can't tell whether the prompt is seen. */
-export const PROMPT_CODE_DIGITS = 3;
-/** Wrong codes typed before the prompt gives up (USER_CANCELLED). */
-export const PROMPT_CODE_ATTEMPTS = 3;
 /**
- * How much of the prompt must be in view, where the browser reports it (IntersectionObserver), before it arms: all of
+ * How much of the prompt must be in view, as IntersectionObserver reports it (on every browser), before it arms: all of
  * it, give or take rounding. A parent that clips part of it (the order lines) leaves it disarmed.
  */
 export const PROMPT_FULL_INTERSECTION = 0.995;
+
+/** The confirmation window's size (CSS px), as the frame asks the browser for it. */
+export const PROMPT_WINDOW_FEATURES = "popup=yes,width=460,height=660";
+
+/** `text` as {@link PromptRequest.confirmText} compares it: lowercase, letters, digits and the decimal point only. */
+export function confirmTextKey(text: string): string {
+  return text.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}.]/gu, "");
+}
+
+/** A timer's id, from a window's timers or Node's. */
+type TimerId = ReturnType<typeof globalThis.setTimeout> | number;
+
+/** The timers a prompt runs on: its own window's (a confirmation window's prompt doesn't wait on the frame's). */
+export interface PromptTimers {
+  setTimeout(fn: () => void, ms: number): TimerId;
+  clearTimeout(id: TimerId | undefined): void;
+}
+
+/** Why the confirmation window step didn't complete (the in-frame prompt stays, so the user can try again). */
+class WindowStepError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WindowStepError";
+  }
+}
 
 /**
  * Least size (CSS px) of the frame's window for a prompt to arm. Smaller, the parent leaves room for little more than
@@ -168,10 +207,20 @@ const SIZE_TRIES = 20;
 export interface PromptUiOptions {
   armMs?: number;
   holdMs?: number;
+  /** The timers this prompt runs on (default: the global ones, the frame's). */
+  timers?: PromptTimers;
   /** Default `ev.isTrusted`: events a script dispatches never confirm. */
   isTrusted?: (ev: Event) => boolean;
-  /** Test seam: the confirmation code's digits (default `crypto.getRandomValues`). */
-  randomDigits?: (count: number) => string;
+  /**
+   * Opens the confirmation window (see the module notes) from the user's click in the frame: by default
+   * `window.open("", "_blank", PROMPT_WINDOW_FEATURES)`, an `about:blank` window of the signer's own origin (and CSP)
+   * that the frame fills itself. Null: blocked.
+   */
+  openWindow?: (frame: Window) => Window | null;
+  /** The timers of a confirmation window's prompt (default: that window's own). */
+  timersFor?: (w: Window) => PromptTimers;
+  /** This prompt is the one in the confirmation window (a top-level window of the signer's origin): no further window. */
+  topLevel?: boolean;
   /**
    * The natural height of the shown prompt or notice (the `promptSize` event, see {@link PromptUi.measure}): called
    * before `onChange` reports it shown (or, while the frame isn't laid out, as soon as it is), and again when that
@@ -180,18 +229,30 @@ export interface PromptUiOptions {
   onSize?: (height: number) => void;
 }
 
-function randomDigits(doc: Document, count: number): string {
-  const crypto = doc.defaultView?.crypto;
-  if (!crypto) throw new Error("No crypto.getRandomValues for the prompt's code");
-  const bytes = new Uint32Array(count);
-  crypto.getRandomValues(bytes);
-  return [...bytes].map((b) => String(b % 10)).join("");
+/** Fills a fresh `about:blank` confirmation window with the frame's own stylesheets and a root for the prompt. */
+function prepareWindow(w: Window, frame: Document): HTMLElement {
+  const doc = w.document;
+  doc.title = "Kokoah signer: confirm";
+  doc.documentElement.lang = frame.documentElement.lang || "en";
+  const meta = doc.createElement("meta");
+  meta.name = "viewport";
+  meta.content = "width=device-width, initial-scale=1";
+  doc.head.append(meta);
+  // The same stylesheets, with their integrity attributes (style-src 'self': the window has the signer's origin and CSP).
+  for (const link of frame.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')) doc.head.append(doc.importNode(link, true));
+  doc.documentElement.classList.add("ks-window");
+  const root = doc.createElement("main");
+  root.className = "ks-root";
+  doc.body.replaceChildren(root);
+  return root;
 }
 
 /**
  * The primary button works only for the user's own pointer or keyboard on the frame's own document:
- * - it is armed once the prompt has been shown for `armMs` (and, where the browser reports occlusion, seen; see
- *   {@link PromptUi.arm}); resizing the frame, the frame losing focus or the page being hidden starts that over;
+ * - it is armed once the prompt has been shown for `armMs` while IntersectionObserver reports all of it in view (and,
+ *   where the browser reports occlusion, visible and unobscured; see {@link PromptUi.arm}); a browser without
+ *   IntersectionObserver never arms it; resizing the frame, the frame losing focus or the page being hidden starts that
+ *   over;
  * - then a click (or, for a `hold` prompt, a press) counts only after real, trusted pointer movement over the armed
  *   button (screen coordinates that change); for a pointer that can't hover (touch, most pens) the press itself;
  *   leaving the button needs new movement. A pointer that was already resting where the button appeared doesn't count;
@@ -200,9 +261,10 @@ function randomDigits(doc: Document, count: number): string {
  *   inside the frame (not a script's `focus()`, not focus that came from the parent page) and Enter or Space is then
  *   held for `holdMs` (a fresh press; auto-repeat keeps it going). A key press alone never clicks the button;
  * - where the browser can't tell whether the prompt is seen (no IntersectionObserver v2: Firefox, Safari, every iOS
- *   browser), a fixed-style prompt also shows a random code the user types first: a parent that hides the prompt under
- *   a decoy can't know it. A wrong code shows a new one; after {@link PROMPT_CODE_ATTEMPTS} wrong ones the prompt gives
- *   up (USER_CANCELLED). Where it can tell, the prompt must be wholly in view and unobscured;
+ *   browser), a fixed-style prompt's button only opens the confirmation window (a top-level `about:blank` window of the
+ *   signer's origin, filled by the frame); there the same prompt, with the same rules, also asks the user to type what
+ *   it does ({@link PromptRequest.confirmText}) before it confirms. Closing that window leaves the frame's prompt to
+ *   open it again or cancel; the frame's prompt ending (cancel, timeout) closes it;
  * - every browser: the prompt arms, and confirms, only in a window of at least {@link PROMPT_MIN_WIDTH} ×
  *   {@link PROMPT_MIN_HEIGHT}, while its text is shown whole (no part of it scrolled out of view), or, where it can't
  *   be (a small phone), once the user scrolled it to its end with at least {@link PROMPT_MIN_BODY_LINES} lines in view;
@@ -223,18 +285,21 @@ export class PromptUi {
   private sizeSent: number | null = null;
   private sizeFloor = 0;
   private sizeWidth = -1;
-  private sizeRetry: ReturnType<typeof setTimeout> | undefined;
+  private sizeRetry: TimerId | undefined;
   private readonly armMs: number;
   private readonly holdMs: number;
   private readonly isTrusted: (ev: Event) => boolean;
-  private readonly digits: (count: number) => string;
+  private readonly options: PromptUiOptions;
+  private readonly timers: PromptTimers;
+  private readonly topLevel: boolean;
+  /** The confirmation window open for the current prompt, and its prompt. */
+  private child: { w: Window; ui: PromptUi } | null = null;
   private armed = false;
-  /** The code the open prompt asks for (null: none asked), whether the user typed it, and wrong ones so far. */
+  /** The words the open prompt asks for (their {@link confirmTextKey}; null: none asked), and whether they were typed. */
   private code: string | null = null;
   private codeOk = false;
-  private codeMisses = 0;
   private cancel: (() => void) | null = null;
-  private armTimer: ReturnType<typeof setTimeout> | undefined;
+  private armTimer: TimerId | undefined;
   private observer: IntersectionObserver | null = null;
   /** The user's pointer moved over the armed primary button (or pressed it, for a pointer that can't hover). */
   private pointerSeen = false;
@@ -253,7 +318,7 @@ export class PromptUi {
   private bodyRead = false;
   /** A trusted Tab keydown whose focus move hasn't landed yet. */
   private tabbing = false;
-  private holdTimer: ReturnType<typeof setTimeout> | undefined;
+  private holdTimer: TimerId | undefined;
   /** What is holding the button down while `holdTimer` runs. */
   private holdBy: "pointer" | "key" | null = null;
   /** The open prompt's: whether it confirms by holding, and what confirming does. */
@@ -287,7 +352,10 @@ export class PromptUi {
     this.armMs = options.armMs ?? PROMPT_ARM_MS;
     this.holdMs = options.holdMs ?? PROMPT_HOLD_MS;
     this.isTrusted = options.isTrusted ?? ((ev) => ev.isTrusted);
-    this.digits = options.randomDigits ?? ((count) => randomDigits(doc, count));
+    this.options = options;
+    this.topLevel = options.topLevel === true;
+    // The frame's own (global) timers, or the confirmation window's for its prompt.
+    this.timers = options.timers ?? globalThis;
     this.root = root;
     this.idle = el(doc, "section", "ks-idle");
     this.idle.setAttribute("aria-label", "Kokoah signer status");
@@ -311,13 +379,12 @@ export class PromptUi {
     const codeLabel = el(doc, "label", "ks-code-label");
     codeLabel.htmlFor = "ks-code-input";
     this.codeValue = el(doc, "strong", "ks-code-value");
-    codeLabel.append("To confirm, type this code: ", this.codeValue);
+    codeLabel.append("To confirm, type: ", this.codeValue);
     this.codeInput = el(doc, "input", "ks-code-input");
     this.codeInput.id = "ks-code-input";
     this.codeInput.type = "text";
-    this.codeInput.inputMode = "numeric";
     this.codeInput.autocomplete = "off";
-    this.codeInput.maxLength = PROMPT_CODE_DIGITS;
+    this.codeInput.maxLength = 80;
     this.codeInput.spellcheck = false;
     this.codeBox.append(codeLabel, this.codeInput);
     const actions = el(doc, "div", "ks-actions");
@@ -385,7 +452,7 @@ export class PromptUi {
       (ev) => {
         if (ev.key !== "Tab" || !this.isTrusted(ev)) return;
         this.tabbing = true;
-        setTimeout(() => (this.tabbing = false), 0);
+        this.timers.setTimeout(() => (this.tabbing = false), 0);
       },
       true,
     );
@@ -419,6 +486,8 @@ export class PromptUi {
       this.scrollToTop();
       this.rearm();
     });
+    // The frame going away takes its confirmation window with it.
+    win?.addEventListener("pagehide", () => this.closeChild());
   }
 
   /**
@@ -433,7 +502,7 @@ export class PromptUi {
     this.noticeBody.textContent = req.body;
     this.noticeLines.replaceChildren(...req.lines.map((line) => el(doc, "p", "ks-notice-line", line)));
     this.noticeClose.textContent = req.closeLabel;
-    const entry: NoticeEntry = { kind: req.kind, timer: setTimeout(() => this.endNotice(entry), req.timeoutMs) };
+    const entry: NoticeEntry = { kind: req.kind, timer: this.timers.setTimeout(() => this.endNotice(entry), req.timeoutMs) };
     this.notice = entry;
     if (this.active === null) {
       this.idle.hidden = true;
@@ -447,7 +516,7 @@ export class PromptUi {
   private endNotice(entry?: NoticeEntry): void {
     const n = this.notice;
     if (n === null || (entry !== undefined && entry !== n)) return;
-    clearTimeout(n.timer);
+    this.timers.clearTimeout(n.timer);
     this.notice = null;
     this.noticePanel.hidden = true;
     if (this.active === null) {
@@ -466,7 +535,7 @@ export class PromptUi {
     this.sizeSent = null;
     this.sizeFloor = 0;
     this.sizeWidth = -1;
-    clearTimeout(this.sizeRetry);
+    this.timers.clearTimeout(this.sizeRetry);
     if (kind === null) {
       this.onChange(false, null);
       return;
@@ -483,7 +552,7 @@ export class PromptUi {
     if (!this.onSize) return;
     this.measure();
     if (this.sizeSent !== null || tries <= 1) return;
-    this.sizeRetry = setTimeout(() => this.measureUntilKnown(tries - 1), SIZE_RETRY_MS);
+    this.sizeRetry = this.timers.setTimeout(() => this.measureUntilKnown(tries - 1), SIZE_RETRY_MS);
   }
 
   /**
@@ -529,6 +598,102 @@ export class PromptUi {
    */
   run<T>(req: PromptRequest, action: () => Promise<T>, onFailure: (e: unknown) => ActionFailure): Promise<T> {
     if (this.active !== null) return Promise.reject(new PromptError("PROMPT_BUSY", "Another prompt is already waiting for the user.", req.kind));
+    if (req.fixedStyle === true && !this.topLevel && this.visibility() !== "occlusion") {
+      // The frame can't show the user is seeing it: its button opens the confirmation window, where it is confirmed.
+      const step: PromptRequest = { ...req, actionLabel: WINDOW_LABEL, hold: false };
+      return this.runHere(
+        step,
+        () => this.inWindow(req, action, onFailure),
+        (e) => (e instanceof WindowStepError ? { retry: true, message: e.message } : onFailure(e)),
+        WINDOW_OPEN,
+      );
+    }
+    return this.runHere(req, action, onFailure);
+  }
+
+  /** Whether `req` is confirmed in the confirmation window here (see the module notes). */
+  confirmsInWindow(req: Pick<PromptRequest, "fixedStyle">): boolean {
+    return req.fixedStyle === true && !this.topLevel && this.visibility() !== "occlusion";
+  }
+
+  /**
+   * Opens the confirmation window (from the user's click: this runs synchronously in it), shows `req` there and resolves
+   * with its result. Blocked or closed: {@link WindowStepError}, and the frame's prompt stays.
+   */
+  private inWindow<T>(req: PromptRequest, action: () => Promise<T>, onFailure: (e: unknown) => ActionFailure): Promise<T> {
+    const frame = this.panel.ownerDocument.defaultView;
+    let w: Window | null = null;
+    try {
+      w = frame ? (this.options.openWindow ?? ((f: Window) => f.open("", "_blank", PROMPT_WINDOW_FEATURES)))(frame) : null;
+    } catch {
+      w = null;
+    }
+    if (!w) return Promise.reject(new WindowStepError(WINDOW_BLOCKED));
+    let root: HTMLElement;
+    try {
+      root = prepareWindow(w, this.panel.ownerDocument);
+    } catch {
+      // Not a window the frame can fill (another origin): never confirm there.
+      w.close();
+      return Promise.reject(new WindowStepError(WINDOW_BLOCKED));
+    }
+    const opened = w;
+    const ui = new PromptUi(opened.document, root, () => {}, {
+      ...(this.options.armMs !== undefined ? { armMs: this.options.armMs } : {}),
+      ...(this.options.holdMs !== undefined ? { holdMs: this.options.holdMs } : {}),
+      ...(this.options.isTrusted ? { isTrusted: this.options.isTrusted } : {}),
+      timers: this.options.timersFor?.(opened) ?? { setTimeout: opened.setTimeout.bind(opened), clearTimeout: opened.clearTimeout.bind(opened) },
+      topLevel: true,
+    });
+    this.child = { w: opened, ui };
+    return new Promise<T>((resolve, reject) => {
+      let done = false;
+      const end = (fn: () => void) => {
+        if (done) return;
+        done = true;
+        this.timers.clearTimeout(poll);
+        if (this.child?.w === opened) this.child = null;
+        try {
+          opened.close();
+        } catch {
+          // Already gone.
+        }
+        fn();
+      };
+      // Closed by the user: the frame's prompt offers it again.
+      const check = () => {
+        if (done) return;
+        if (opened.closed) end(() => reject(new WindowStepError(WINDOW_CLOSED)));
+        else poll = this.timers.setTimeout(check, 500);
+      };
+      let poll = this.timers.setTimeout(check, 500);
+      opened.addEventListener("pagehide", () => this.timers.setTimeout(check, 0));
+      ui.run({ ...req, fixedStyle: true }, action, onFailure).then(
+        (value) => end(() => resolve(value)),
+        (e: unknown) => end(() => reject(e)),
+      );
+    });
+  }
+
+  /** Closes the confirmation window, if one is open (its prompt ends as cancelled). */
+  private closeChild(): void {
+    const c = this.child;
+    if (c === null) return;
+    this.child = null;
+    c.ui.cancelOpen();
+    try {
+      c.w.close();
+    } catch {
+      // Already gone.
+    }
+  }
+
+  /** Ends the open prompt as cancelled (its window closed, or the frame's prompt ended). */
+  private cancelOpen(): void {
+    this.cancel?.();
+  }
+
+  private runHere<T>(req: PromptRequest, action: () => Promise<T>, onFailure: (e: unknown) => ActionFailure, busyText?: string): Promise<T> {
     this.active = req.kind;
     return new Promise<T>((resolve, reject) => {
       let settled = false;
@@ -536,7 +701,7 @@ export class PromptUi {
       const finish = (fn: () => void) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        this.timers.clearTimeout(timer);
         this.confirm = null;
         this.cancel = null;
         this.secondary.onclick = null;
@@ -544,7 +709,7 @@ export class PromptUi {
         this.hide();
         fn();
       };
-      const timer = setTimeout(() => finish(() => reject(new PromptError("USER_TIMEOUT", "The user did not respond in time.", req.kind))), req.timeoutMs);
+      const timer = this.timers.setTimeout(() => finish(() => reject(new PromptError("USER_TIMEOUT", "The user did not respond in time.", req.kind))), req.timeoutMs);
       this.confirm = () => {
         if (settled || running || !this.armed || (this.code !== null && !this.codeOk)) return;
         // Shown whole at the moment it is confirmed, too.
@@ -553,7 +718,7 @@ export class PromptUi {
           return;
         }
         running = true;
-        this.setBusy(true, req.hold ? "Confirmed." : "Waiting for your passkey…");
+        this.setBusy(true, busyText ?? (req.hold ? "Confirmed." : "Waiting for your passkey…"));
         let p: Promise<T>;
         try {
           p = action();
@@ -575,7 +740,7 @@ export class PromptUi {
       this.secondary.onclick = () => {
         if (!running) finish(() => reject(new PromptError("USER_CANCELLED", "The user cancelled.", req.kind)));
       };
-      this.cancel = () => finish(() => reject(new PromptError("USER_CANCELLED", "The user typed a wrong code too often.", req.kind)));
+      this.cancel = () => finish(() => reject(new PromptError("USER_CANCELLED", "The prompt was closed.", req.kind)));
       this.panel.onkeydown = (ev: KeyboardEvent) => {
         if (ev.key === "Escape" && !running) finish(() => reject(new PromptError("USER_CANCELLED", "The user cancelled.", req.kind)));
       };
@@ -592,12 +757,12 @@ export class PromptUi {
     this.body.textContent = req.body;
     this.primary.textContent = req.actionLabel;
     this.secondary.textContent = req.cancelLabel;
-    this.codeMisses = 0;
     this.forgetFramePointer();
     this.pointerReadyAt = 0;
     this.bodyRead = false;
-    this.newCode(req.fixedStyle === true && !this.tracksVisibility());
-    this.setBusy(false, this.restingStatus());
+    // In the confirmation window, a fixed-style prompt also asks the user to type what it does.
+    this.newCode(req.fixedStyle === true && this.topLevel ? (req.confirmText ?? req.actionLabel) : null);
+    this.setBusy(false, this.confirmsInWindow(req) ? WINDOW_HINT : this.restingStatus());
     this.idle.hidden = true;
     this.noticePanel.hidden = true;
     this.panel.hidden = false;
@@ -609,45 +774,35 @@ export class PromptUi {
     this.arm();
   }
 
-  /** Whether the browser reports occlusion (IntersectionObserver v2, `isVisible`). */
-  private tracksVisibility(): boolean {
+  /**
+   * What the browser can tell about the prompt being seen: `occlusion` (IntersectionObserver v2, `isVisible`: in view,
+   * visible and unobscured), `geometry` (IntersectionObserver v1: in view only), or `none` (no IntersectionObserver).
+   */
+  private visibility(): "occlusion" | "geometry" | "none" {
     const win = this.panel.ownerDocument.defaultView as (Window & typeof globalThis) | null;
-    return !!win?.IntersectionObserver && !!win.IntersectionObserverEntry && "isVisible" in win.IntersectionObserverEntry.prototype;
+    if (!win?.IntersectionObserver) return "none";
+    return win.IntersectionObserverEntry && "isVisible" in win.IntersectionObserverEntry.prototype ? "occlusion" : "geometry";
   }
 
-  /** Shows a fresh code to type (`ask`), or none. */
-  private newCode(ask: boolean): void {
-    this.code = ask ? this.digits(PROMPT_CODE_DIGITS).slice(0, PROMPT_CODE_DIGITS).padStart(PROMPT_CODE_DIGITS, "0") : null;
+  /** Shows the words to type (`text`), or none. */
+  private newCode(text: string | null): void {
+    this.code = text === null ? null : confirmTextKey(text);
     this.codeOk = false;
-    this.codeBox.hidden = !ask;
-    this.codeValue.textContent = this.code ?? "";
+    this.codeBox.hidden = text === null;
+    this.codeValue.textContent = text ?? "";
     this.codeInput.value = "";
   }
 
-  /** The user typed in the code field: the right code lets the armed button work; a wrong one shows a new code. */
+  /** The user typed in the field: the words shown let the armed button work. */
   private onCode(ev: Event): void {
     if (this.active === null || this.code === null || !this.isTrusted(ev)) return;
-    const typed = this.codeInput.value.replace(/\D/g, "");
-    if (typed !== this.codeInput.value) this.codeInput.value = typed;
-    if (typed.length < PROMPT_CODE_DIGITS) {
-      this.codeOk = false;
+    this.codeOk = confirmTextKey(this.codeInput.value) === this.code;
+    if (!this.codeOk) {
       this.primary.disabled = true;
       return;
     }
-    if (typed === this.code) {
-      this.codeOk = true;
-      if (this.armed && this.panel.getAttribute("aria-busy") !== "true") this.primary.disabled = false;
-      this.status.textContent = this.restingStatus();
-      return;
-    }
-    this.codeMisses++;
-    if (this.codeMisses >= PROMPT_CODE_ATTEMPTS) {
-      this.cancel?.();
-      return;
-    }
-    this.newCode(true);
-    this.primary.disabled = true;
-    this.status.textContent = CODE_MISS;
+    if (this.armed && this.panel.getAttribute("aria-busy") !== "true") this.primary.disabled = false;
+    this.status.textContent = this.restingStatus();
   }
 
   /** Back to the top of the frame's document and of the prompt (after a fragment moved them). */
@@ -689,18 +844,19 @@ export class PromptUi {
   }
 
   /**
-   * Enables the primary button once the prompt has been shown for `armMs` (and its code typed, when it asks for one).
-   * Where the browser reports occlusion (IntersectionObserver v2, `isVisible`), that time counts only while the whole
-   * prompt is in view ({@link PROMPT_FULL_INTERSECTION}), visible and unobscured; clipping, covering, fading or hiding
-   * it disables the button again and restarts the wait. Either way, the prompt's text must be shown whole in a window
-   * large enough for it ({@link PromptUi.fits}; resizing the frame arms it again), and the pointer must then move over
-   * the button again, or the keyboard bring focus to it again.
+   * Enables the primary button once the prompt has been shown for `armMs` (and its words typed, when it asks for them).
+   * That time counts only while IntersectionObserver reports the whole prompt in view ({@link PROMPT_FULL_INTERSECTION})
+   * and, where the browser reports occlusion (IntersectionObserver v2, `isVisible`), visible and unobscured; clipping,
+   * covering, fading or hiding it disables the button again and restarts the wait. A browser without
+   * IntersectionObserver never arms it. Either way, the prompt's text must be shown whole in a window large enough for it
+   * ({@link PromptUi.fits}; resizing the frame arms it again), and the pointer must then move over the button again, or
+   * the keyboard bring focus to it again.
    */
   private arm(): void {
     this.disarm();
     const start = () => {
-      clearTimeout(this.armTimer);
-      this.armTimer = setTimeout(() => {
+      this.timers.clearTimeout(this.armTimer);
+      this.armTimer = this.timers.setTimeout(() => {
         const why = this.unfit();
         if (why !== null) {
           this.status.textContent = why;
@@ -712,18 +868,20 @@ export class PromptUi {
       }, this.armMs);
     };
     const win = this.panel.ownerDocument.defaultView as (Window & typeof globalThis) | null;
-    if (!win || !this.tracksVisibility()) {
-      start();
+    const mode = this.visibility();
+    if (!win || mode === "none") {
+      this.status.textContent = NOT_SEEN;
       return;
     }
+    const occlusion = mode === "occlusion";
     this.observer = new win.IntersectionObserver(
       (entries) => {
         const entry = entries.at(-1) as VisibilityEntry | undefined;
-        if (entry?.isVisible === true && entry.isIntersecting && entry.intersectionRatio >= PROMPT_FULL_INTERSECTION) start();
+        if (entry !== undefined && (!occlusion || entry.isVisible === true) && entry.isIntersecting && entry.intersectionRatio >= PROMPT_FULL_INTERSECTION) start();
         else this.disarm(false);
       },
       // `trackVisibility` and `delay` are IntersectionObserver v2 options (not in every DOM typing).
-      { threshold: [PROMPT_FULL_INTERSECTION, 1], trackVisibility: true, delay: 100 } as IntersectionObserverInit,
+      (occlusion ? { threshold: [PROMPT_FULL_INTERSECTION, 1], trackVisibility: true, delay: 100 } : { threshold: [PROMPT_FULL_INTERSECTION, 1] }) as IntersectionObserverInit,
     );
     this.observer.observe(this.panel);
   }
@@ -738,7 +896,7 @@ export class PromptUi {
    * stops watching the prompt unless `stopWatching` is false.
    */
   private disarm(stopWatching = true): void {
-    clearTimeout(this.armTimer);
+    this.timers.clearTimeout(this.armTimer);
     this.armed = false;
     this.primary.disabled = true;
     this.forgetPointer();
@@ -840,7 +998,7 @@ export class PromptUi {
     this.holdBy = by;
     this.primary.classList.add("ks-holding");
     this.status.textContent = "Keep holding…";
-    this.holdTimer = setTimeout(() => {
+    this.holdTimer = this.timers.setTimeout(() => {
       this.holdTimer = undefined;
       this.holdBy = null;
       this.primary.classList.remove("ks-holding");
@@ -851,7 +1009,7 @@ export class PromptUi {
   /** Stops a hold that hasn't completed (released early, pointer or focus gone, prompt disarmed); `by`: only that one's. */
   private releaseHold(by?: "pointer" | "key"): void {
     if (this.holdTimer === undefined || (by !== undefined && by !== this.holdBy)) return;
-    clearTimeout(this.holdTimer);
+    this.timers.clearTimeout(this.holdTimer);
     this.holdTimer = undefined;
     this.holdBy = null;
     this.primary.classList.remove("ks-holding");
@@ -880,8 +1038,9 @@ export class PromptUi {
   }
 
   private hide(): void {
+    this.closeChild();
     this.disarm();
-    this.newCode(false);
+    this.newCode(null);
     this.hold = false;
     this.primary.classList.remove("ks-hold");
     this.panel.hidden = true;

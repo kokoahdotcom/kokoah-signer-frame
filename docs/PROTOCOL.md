@@ -159,15 +159,19 @@ to approve a new key (see `createAgent`), and must sit **beside** that window, n
 corner, not centred over the page). It asks for nothing and takes no focus.
 
 **How the prompt resists a hostile page.** Its primary button works only after the prompt has been shown for 800 ms
-(where the browser reports occlusion, IntersectionObserver v2, shown whole, wholly in view and unobscured; covering,
-fading or clipping part of it starts over). On every browser (2026-10-30) it arms, and confirms, only in a frame of at
+while IntersectionObserver reports it wholly in view (on every browser, 2026-11-11; a browser without it never arms a
+prompt), and where the browser reports occlusion (IntersectionObserver v2) also visible and unobscured; covering,
+fading or clipping part of it starts over. On every browser (2026-10-30) it arms, and confirms, only in a frame of at
 least 280 × 300 CSS px and while its text is shown whole; where the text doesn't fit (a small phone), the user scrolls
 it to its end first, with at least five lines in view; a smaller frame leaves it disarmed, saying so. Give the iframe
 room (the frame's own text is short). Where
 the browser can't report occlusion (Firefox, Safari, every iOS browser), the fixed-style prompts (`limits`,
-`vault-deposit`, `vault-withdraw`, `order`, `margin`, `key-remove` and removing passkey protection) also show a random 3-digit code
-the user types before the button works; a wrong code shows a new one, and after three wrong ones the prompt ends with
-`USER_CANCELLED` (2026-10-23). Moving the frame to a fragment (`#…`) scrolls it back and starts over, and so does
+`vault-deposit`, `vault-withdraw`, `order`, `margin`, `key-remove` and removing passkey protection) are confirmed in a
+window of their own (2026-11-11): the frame's button opens a top-level `about:blank` window of the signer's origin (the
+browser must allow the signer's pop-ups), the frame fills it with the same prompt and the same rules, and there the user
+also types a few words saying what it does (for example `deposit 250`, the first order's side, size and market, or
+`loosen limits`) before its button works. Closing that window leaves the frame's prompt to open it again or cancel;
+the frame's prompt ending closes it. Removing passkey protection then takes a passkey click in the frame itself. Moving the frame to a fragment (`#…`) scrolls it back and starts over, and so does
 moving the iframe under the user's pointer (2026-10-30); a mouse pointer the frame first sees while a prompt is open,
 or sees again after it left the frame, counts only after 800 ms there. Then a click counts only after the user's own pointer moved over the button inside the frame (a touch
 press on it, for pointers that can't hover); events a script dispatches and a pointer that was already resting where

@@ -416,6 +416,8 @@ export interface HarnessOptions {
   promptHoldMs?: number;
   /** How long the agent approval panel stays without confirmAgent. */
   agentApprovalTimeoutMs?: number;
+  /** How the prompt opens its confirmation window (where the browser can't tell whether the prompt is seen). */
+  promptWindow?: FrameDeps["promptWindow"];
 }
 
 export class FrameHarness {
@@ -478,6 +480,7 @@ export class FrameHarness {
       ...(o.logger ? { logger: o.logger } : {}),
       ...(o.promptTimeoutMs !== undefined ? { promptTimeoutMs: o.promptTimeoutMs } : {}),
       ...(o.agentApprovalTimeoutMs !== undefined ? { agentApprovalTimeoutMs: o.agentApprovalTimeoutMs } : {}),
+      ...(o.promptWindow ? { promptWindow: o.promptWindow } : {}),
       promptArmMs: o.promptArmMs ?? 0,
       promptHoldMs: o.promptHoldMs ?? 0,
       // jsdom can't make trusted events; test/prompt.test.ts covers that untrusted ones never confirm.

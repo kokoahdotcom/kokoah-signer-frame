@@ -126,7 +126,7 @@ import {
   summarizeFramePolicy,
   vaultTransfersAllowed,
 } from "./policy.js";
-import { applyTheme, invalidThemeVariables, PromptError, PromptUi, type ActionFailure, type PromptKind } from "./prompt.js";
+import { applyTheme, invalidThemeVariables, PromptError, PromptUi, type ActionFailure, type PromptKind, type PromptTimers } from "./prompt.js";
 import { limitsRev, limitsSlot, type SignerStore, type StoredKeyRecord, type StoredLimitsRecord } from "./storage.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -184,6 +184,8 @@ export interface FrameDeps {
   promptHoldMs?: number;
   /** Test seam: which input events count as the user's own (default `ev.isTrusted`; jsdom can't make trusted events). */
   promptIsTrusted?: (ev: Event) => boolean;
+  /** Test seam: how the prompt opens its confirmation window, and that window's timers (prompt.ts `PromptUiOptions`). */
+  promptWindow?: { open: (frame: Window) => Window | null; timers?: (w: Window) => PromptTimers };
   /** How long the agent approval panel stays without `confirmAgent`. Default AGENT_APPROVAL_PANEL_MS. */
   agentApprovalTimeoutMs?: number;
   logger?: Logger;
@@ -325,6 +327,7 @@ export class FrameCore {
             ...(deps.promptArmMs !== undefined ? { armMs: deps.promptArmMs } : {}),
             ...(deps.promptHoldMs !== undefined ? { holdMs: deps.promptHoldMs } : {}),
             ...(deps.promptIsTrusted ? { isTrusted: deps.promptIsTrusted } : {}),
+            ...(deps.promptWindow ? { openWindow: deps.promptWindow.open, ...(deps.promptWindow.timers ? { timersFor: deps.promptWindow.timers } : {}) } : {}),
           })
         : null;
     if (deps.broadcast) deps.broadcast.onmessage = (ev) => this.onBroadcast(ev.data);
@@ -977,7 +980,11 @@ export class FrameCore {
     return this.ui;
   }
 
-  private async prompt<T>(kind: PromptKind, texts: { title: string; body: string; actionLabel: string; fixedStyle?: boolean; hold?: boolean }, action: () => Promise<T>): Promise<T> {
+  private async prompt<T>(
+    kind: PromptKind,
+    texts: { title: string; body: string; actionLabel: string; fixedStyle?: boolean; hold?: boolean; confirmText?: string },
+    action: () => Promise<T>,
+  ): Promise<T> {
     const ui = this.requirePromptUi();
     return await ui.run({ kind, ...texts, cancelLabel: "Cancel", timeoutMs: this.deps.promptTimeoutMs ?? 120_000 }, action, (e) => this.promptFailure(e));
   }
@@ -1274,29 +1281,35 @@ export class FrameCore {
         const aad = keyAad(rec.network, "passkey", rec.agentAddress);
         const wrapped = rec.wrapped;
         let secret: Uint8Array;
+        const removal = {
+          title: "Remove passkey protection?",
+          body: "After this, the trading key on this device unlocks without your passkey. Continue only if you asked for this.",
+          actionLabel: "Remove protection",
+          confirmText: "remove protection",
+          fixedStyle: true,
+        };
+        const decrypt = async () => {
+          const { prfFirst } = await this.deps.passkeys.get({ rpId: pk.rpId, credentialId: pk.credentialId, prfSalt: pk.prfSalt, timeoutMs: 60_000 });
+          try {
+            const wrapKey = await deriveKeyFromPrf(this.deps.crypto, prfFirst, pk.hkdfSalt);
+            try {
+              return await unwrapSecret(this.deps.crypto, wrapKey, wrapped, aad);
+            } catch {
+              throw new SignerFailure("UNLOCK_FAILED", "This passkey could not unlock the trading key.");
+            }
+          } finally {
+            wipe(prfFirst);
+          }
+        };
         try {
-          secret = await this.prompt(
-            "passkey-unlock",
-            {
-              title: "Remove passkey protection?",
-              body: "After this, the trading key on this device unlocks without your passkey. Continue only if you asked for this.",
-              actionLabel: "Remove protection",
-              fixedStyle: true,
-            },
-            async () => {
-              const { prfFirst } = await this.deps.passkeys.get({ rpId: pk.rpId, credentialId: pk.credentialId, prfSalt: pk.prfSalt, timeoutMs: 60_000 });
-              try {
-                const wrapKey = await deriveKeyFromPrf(this.deps.crypto, prfFirst, pk.hkdfSalt);
-                try {
-                  return await unwrapSecret(this.deps.crypto, wrapKey, wrapped, aad);
-                } catch {
-                  throw new SignerFailure("UNLOCK_FAILED", "This passkey could not unlock the trading key.");
-                }
-              } finally {
-                wipe(prfFirst);
-              }
-            },
-          );
+          if (this.requirePromptUi().confirmsInWindow(removal)) {
+            // Confirmed in the confirmation window; the passkey then needs a click in the frame itself (WebAuthn wants
+            // the frame's own user activation).
+            await this.prompt("passkey-unlock", removal, async () => undefined);
+            secret = await this.prompt("passkey-unlock", { title: "Use your passkey", body: "Use your passkey to remove its protection from the trading key on this device.", actionLabel: "Use passkey" }, decrypt);
+          } else {
+            secret = await this.prompt("passkey-unlock", removal, decrypt);
+          }
         } catch (e) {
           if (e instanceof PasskeyError) throw new SignerFailure(e.code === "unsupported" ? "PASSKEY_UNAVAILABLE" : "PASSKEY_FAILED", e.message, { retryable: e.code !== "unsupported" });
           throw e;
@@ -1484,6 +1497,7 @@ export class FrameCore {
               title: "Loosen your trading limits?",
               body: `The Kokoah app asks to change ${whose} on this device. Confirm only if you asked for this.\n\n${changes.map((c) => c.text).join("\n")}`,
               actionLabel: "Loosen limits",
+              confirmText: "loosen limits",
               fixedStyle: true,
               hold: true,
             },
@@ -2080,6 +2094,7 @@ export class FrameCore {
             `Move ${usdText} USDC from your Hyperliquid account into HLP, Hyperliquid's own vault. ` +
             `You can withdraw it ${HLP_LOCKUP_DAYS} days after this deposit. HLP can lose money.`,
           actionLabel: `Deposit ${usdText} USDC`,
+          confirmText: `deposit ${usdText}`,
           fixedStyle: true,
           hold: true,
         },
@@ -2093,6 +2108,7 @@ export class FrameCore {
           title: "Withdraw from a vault",
           body: `Move ${usdText} USDC from vault ${vault.slice(0, 6)}…${vault.slice(-4)} back into your Hyperliquid account. Confirm only if you asked for this.`,
           actionLabel: `Withdraw ${usdText} USDC`,
+          confirmText: `withdraw ${usdText}`,
           fixedStyle: true,
           hold: true,
         },
@@ -2194,6 +2210,8 @@ export class FrameCore {
         title: `Confirm${orders.changes ? " change" : ""}: ${first}${more > 0 ? ` + ${more} more` : ""}, ${total}`,
         body: `The Kokoah app asks to send ${one ? "this order" : "these orders"}${whose} to Hyperliquid.${why} Confirm only if you placed ${one ? "it" : "them"}.\n\n${orders.lines.join("\n")}`,
         actionLabel: `${change}${first}${more > 0 ? ` + ${more}` : ""}`,
+        // The words to type (in the confirmation window): the first order's side, size and market.
+        confirmText: first,
         fixedStyle: true,
         hold: true,
       },
@@ -2223,6 +2241,7 @@ export class FrameCore {
         title: "Take margin out of this position?",
         body: `The Kokoah app asks to take ${amount} of margin out of the isolated ${name} position${whose}. This moves the position closer to liquidation. Confirm only if you asked for this.`,
         actionLabel: `Remove ${amount}`,
+        confirmText: `remove ${amount}`,
         fixedStyle: true,
         hold: true,
       },
@@ -2252,6 +2271,7 @@ export class FrameCore {
         title: `Raise the leverage of this position to ${raise.to}x?`,
         body: `The Kokoah app asks to raise the leverage of the isolated ${name} position${whose} from ${raise.from}x to ${raise.to}x. This takes margin out of the position and moves it closer to liquidation. Confirm only if you asked for this.`,
         actionLabel: `Raise to ${raise.to}x`,
+        confirmText: `raise to ${raise.to}x`,
         fixedStyle: true,
         hold: true,
       },
@@ -2273,6 +2293,7 @@ export class FrameCore {
             title: "Remove the trading key from this device?",
             body: "The Kokoah app asks to delete this device's trading key, which is protected with your passkey. To trade here again you will approve a new key in your wallet. Confirm only if you asked for this.",
             actionLabel: "Remove key",
+            confirmText: "remove key",
             fixedStyle: true,
             hold: true,
           }
@@ -2280,6 +2301,7 @@ export class FrameCore {
             title: "Replace your passkey-protected trading key?",
             body: "The Kokoah app asks to replace this device's trading key, which is protected with your passkey, with a new one that unlocks without your passkey. Confirm only if you asked for this.",
             actionLabel: "Replace key",
+            confirmText: "replace key",
             fixedStyle: true,
             hold: true,
           },
