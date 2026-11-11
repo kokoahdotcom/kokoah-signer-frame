@@ -62,6 +62,29 @@ describe("removing a passkey-protected key", () => {
     expect(removePrompts(h)).toHaveLength(3);
   });
 
+  it("asks before a renewal whose passkey step can't protect the key falls back to a key without it", async () => {
+    const passkeys = new MockPasskeys();
+    const h = await frame({ passkeys });
+    const { address } = await h.activeAgent("passkey");
+    // The passkey step says the passkey can't give the PRF secret any more (or the page blocked WebAuthn).
+    passkeys.failNextGet = "unsupported";
+    const renewal = h.request("createAgent", { userAddress: USER, validForDays: 30, storageMode: "passkey", replaceExisting: true });
+    await h.clickPrompt();
+    await waitFor(() => removePrompts(h).length === 1);
+    expect(h.promptText()).toContain("unlocks without your passkey");
+    await h.clickPrompt("cancel");
+    expect((await renewal).ok).toBe(false);
+    expect(await h.ok("getStatus")).toMatchObject({ agentAddress: address, storageMode: "passkey" });
+    expect(await (await IdbSignerStore.open(h.idb)).getKeyRecord()).toMatchObject({ agentAddress: address, storageMode: "passkey" });
+    // Confirmed: the device key takes its place, saying why.
+    passkeys.failNextGet = "unsupported";
+    const confirmed = h.createAgent({ userAddress: USER, validForDays: 30, storageMode: "passkey", replaceExisting: true });
+    await h.clickPrompt();
+    await waitFor(() => removePrompts(h).length === 2);
+    await h.clickPrompt();
+    expect(await confirmed).toMatchObject({ storageMode: "device", requestedStorageMode: "passkey" });
+  });
+
   it("renews a passkey key with the passkey without asking to remove it", async () => {
     const h = await frame();
     await h.activeAgent("passkey");

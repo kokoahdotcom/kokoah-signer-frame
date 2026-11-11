@@ -917,6 +917,9 @@ export class FrameCore {
         if (mode === "passkey") {
           const outcome = await this.storePasskeyRecord(meta, secret, previousRecord);
           if (outcome === "unsupported") {
+            // The passkey step can't protect the new key (an authenticator without PRF, or WebAuthn blocked): a key that
+            // unlocks without the passkey takes the protected one's place only after the user confirms it.
+            if (protectedKey) await this.confirmKeyRemoval("replace");
             mode = "device";
             meta.storageMode = "device";
             fallbackReason = "passkey unavailable: the authenticator does not support the PRF extension";
