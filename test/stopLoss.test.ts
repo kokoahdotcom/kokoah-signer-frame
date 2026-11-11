@@ -150,6 +150,13 @@ describe("readAccountBook", () => {
     const named = { kind: "cancel" as const, cancels: [{ coin: "BTC", oid: 5 }], origin: "manual" as const };
     await expect(readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [{ ...entry, origSz: "x" }] }), ACCOUNT, named)).rejects.toThrow();
     await expect(readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [{ ...entry, children: "x" }] }), ACCOUNT, named)).rejects.toThrow();
+    // An entry that doesn't say how much filled, or what is attached to it, is unreadable; a stop may leave them out.
+    const { origSz: _o, ...noOrigSz } = entry;
+    const { children: _c, ...noChildren } = entry;
+    await expect(readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [noOrigSz] }), ACCOUNT, named)).rejects.toThrow();
+    await expect(readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [noChildren] }), ACCOUNT, named)).rejects.toThrow();
+    const { origSz: _s, children: _k, ...bareStop } = openOrder();
+    expect((await readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [bareStop] }), ACCOUNT, { kind: "cancel" as const, cancels: [{ coin: "BTC", oid: 77 }], origin: "manual" as const })).orders[0]).toMatchObject({ filledSize: 0, attachedStops: [] });
   });
 
   it("keeps an open stop on another market out of notStops, and looks up at most 10 orders", async () => {

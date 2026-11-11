@@ -3,9 +3,10 @@
  * the stop-loss check where the user's limits require a stop-loss (shared `stopCoverage.ts`): `clearinghouseState` and
  * `frontendOpenOrders` on each perp dex the action names, and `orderStatus` for each order it names that isn't among
  * them (at most {@link MAX_ORDER_LOOKUPS}): one that is closed (filled, canceled, never placed), or open but neither a
- * perp stop-loss nor a partly filled entry with an attached stop-loss, takes nothing away. `isolatedPositions` reads the
- * account's open isolated positions and their leverage for a leverage change. Read strictly: anything malformed, or a trigger order of a type the frame doesn't
- * know, throws {@link AccountBookError}, and nothing is signed.
+ * perp stop-loss nor a partly filled entry with an attached stop-loss, takes nothing away. Read strictly: anything
+ * malformed (an entry without its filled size or attached orders included), or a trigger order of a type the frame
+ * doesn't know, throws {@link AccountBookError}, and nothing is signed. {@link readIsolatedPositions} reads the
+ * account's open isolated positions and their leverage, for a leverage change.
  *
  * @module
  */
@@ -66,7 +67,10 @@ function order(o: unknown): BookOrder {
   const trigger = o.isTrigger ? TRIGGER_TYPES[o.orderType] : null;
   if (trigger === undefined) throw new AccountBookError("Hyperliquid sent a trigger order of an unknown type");
   const size = num(o.sz, "order size");
-  if (o.children !== undefined && !Array.isArray(o.children)) throw new AccountBookError("Hyperliquid sent an unreadable open order");
+  // An entry (a plain order that isn't reduce-only) must say how much of it filled and what is attached to it.
+  const entry = !o.isTrigger && !o.reduceOnly;
+  if ((o.children !== undefined || entry) && !Array.isArray(o.children)) throw new AccountBookError("Hyperliquid sent an unreadable open order");
+  if (entry && o.origSz === undefined) throw new AccountBookError("Hyperliquid sent an unreadable open order");
   return {
     coin: o.coin,
     oid: o.oid as number,
@@ -79,7 +83,7 @@ function order(o: unknown): BookOrder {
     limitPrice: num(o.limitPx, "limit price"),
     reduceOnly: o.reduceOnly,
     positionTpsl: o.isPositionTpsl,
-    // How much has filled (`origSz − sz`; missing: nothing known to have filled; a position TP/SL's size is the position's).
+    // How much has filled (`origSz − sz`; a position TP/SL's size is the position's; a trigger without `origSz`: none).
     filledSize: o.origSz === undefined || o.isPositionTpsl ? 0 : Math.max(0, num(o.origSz, "order size") - size),
     attachedStops: attachedStops(o.children),
   };
