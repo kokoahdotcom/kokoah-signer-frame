@@ -147,7 +147,8 @@ const NOT_SEEN = "This browser can't show that the prompt is in view, so it can'
 const WINDOW_LABEL = "Open the confirmation window";
 const WINDOW_HINT = "This browser confirms this in a separate Kokoah signer window.";
 const WINDOW_OPEN = "Confirm in the Kokoah signer window that opened.";
-const WINDOW_BLOCKED = "The browser blocked the confirmation window. Allow pop-ups for the Kokoah signer, then try again.";
+const WINDOW_BLOCKED =
+  "The browser blocked the confirmation window. Allow pop-ups for the Kokoah signer, then try again. In an app's built-in browser, which can't open it, open Kokoah in Safari or your usual browser.";
 const WINDOW_CLOSED = "The confirmation window was closed. Open it again, or choose Cancel.";
 
 /**
