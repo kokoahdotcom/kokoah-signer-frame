@@ -357,6 +357,24 @@ describe("sub-account limits", () => {
     expect((await h.ok("getStatus")).policy.accountLimits).toEqual({ [SUB]: { maxOrderNotionalUsd: 100 } });
   });
 
+  it("asks before the master gets a daily limit while a sub-account has a daily counter of its own", async () => {
+    const h = await frame();
+    h.hl.subAccounts[USER.toLowerCase()] = [subAccountEntry(SUB), subAccountEntry(SUB2, USER, "Scalp")];
+    await h.activeAgent("device");
+    // No daily limit on the master: a sub-account's own is only a tightening.
+    await h.ok("setLimits", { account: SUB2, maxDailyNotionalUsd: 500 });
+    expect(shownPrompts(h)).toHaveLength(0);
+    // The master's new limit wouldn't count the sub-account's trading: the user confirms that.
+    const master = await asking(h, { maxDailyNotionalUsd: 1_000 });
+    expect(h.promptText()).toContain("Sub-account 0x5ab0…0002 trading per day: $500 of its own, on top of the main account's");
+    await h.clickPrompt("cancel");
+    expect((await master.answer).ok).toBe(false);
+    expect((await h.ok("getStatus")).policy.maxDailyNotionalUsd).not.toBe(1_000);
+    const again = await asking(h, { maxDailyNotionalUsd: 1_000 });
+    await h.clickPrompt();
+    expect((await again.answer).ok).toBe(true);
+  });
+
   it("keeps a sub-account's limits across a reload and in another tab", async () => {
     const h = await ready();
     const b = await frame({ idb: h.idb, clock: h.clock, hl: h.hl });

@@ -318,7 +318,8 @@ function names(items: readonly string[]): string {
  * else the baseline's. Anything that lets the account do more is `looser`: a higher number, a field removed (the
  * baseline or the master's looser value applies again), more markets or action types, spot trading on, the stop-loss
  * requirement off. A sub-account that gets a daily counter of its own while the master has a daily limit is looser
- * too, whatever the number: its trading no longer uses up the master's limit, so the day's total can grow by it.
+ * too, whatever the number: its trading no longer uses up the master's limit, so the day's total can grow by it; and so
+ * is the master getting a daily limit while sub-accounts have counters of their own (one line per sub-account).
  */
 export function limitChanges(baseline: Policy, before: LimitsSet, after: LimitsSet, subAccount?: string): LimitChange[] {
   const sub = subAccount?.toLowerCase();
@@ -341,6 +342,16 @@ export function limitChanges(baseline: Policy, before: LimitsSet, after: LimitsS
     // What is enforced: the stricter of its own and the master's (limitsForAccount).
     add("maxDailyNotionalUsd", "Trading per day", `${usd(sharedDaily)} shared with the main account`, `${usd(a.maxDailyNotionalUsd ?? ownDailyAfter)} of its own, on top of the main account's`, true);
   } else number("maxDailyNotionalUsd", "Trading per day", usd);
+  // The master gets a daily limit while sub-accounts have counters of their own (set while it had none): their trading
+  // doesn't use up the new limit, which the user confirms like a sub-account getting its own counter under one.
+  if (sub === undefined && before.master?.maxDailyNotionalUsd === undefined && after.master?.maxDailyNotionalUsd !== undefined) {
+    for (const [account, own] of after.accounts) {
+      const daily = own.limits.maxDailyNotionalUsd;
+      if (daily === undefined) continue;
+      const shown = `${account.slice(0, 6)}…${account.slice(-4)}`;
+      changes.push({ field: "maxDailyNotionalUsd", text: `Sub-account ${shown} trading per day: ${usd(daily)} of its own, on top of the main account's`, looser: true });
+    }
+  }
   number("maxLeverage", "Leverage", (n) => `up to ${n}x`);
   number("maxOrdersPerMinute", "Orders per minute", String);
   number("priceBandPct", "Price distance from the market", (n) => `${n}%`);
