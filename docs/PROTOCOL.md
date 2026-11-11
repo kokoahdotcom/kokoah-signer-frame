@@ -207,7 +207,7 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
     "confirmsLargeOrders": true,
     "confirmsRecentOrders": true
   },
-  "builder": { "address": "0x…builder", "feeTenthsBps": 25 },
+  "builder": { "address": "0x…builder", "feeTenthsBps": 45 },
   "status": { "hasKey": true, "keyState": "active", "expiringSoon": true, "expired": false, "…": "SignerStatus, see getStatus" },
   "limits": { "maxMessageBytes": 65536, "minValidForDays": 1, "maxValidForDays": 30, "expiresAfterMs": 15000, "maxAgentNameLength": 16, "confirmOrdersAboveUsd": 25000, "confirmRecentOrdersAboveUsd": 100000, "recentOrdersWindowMs": 600000, "confirmDailyOrdersAboveUsd": 250000 }
 }
@@ -875,7 +875,7 @@ their own:
   "allowedActionTypes": ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop", "startFeeTrial", "vaultTransfer"],
   "allowedCoins": "*", "maxOrderNotionalUsd": 250000, "maxDailyNotionalUsd": 25000000, "maxLeverage": 50,
   "maxOrdersPerMinute": 60, "priceBandPct": 5, "requireStopLossForNewEntries": false,
-  "builder": { "address": "0x…builder", "feeTenthsBps": 25 }, "vaultAddressAllowed": false, "ownSubAccountsAllowed": true,
+  "builder": { "address": "0x…builder", "feeTenthsBps": 45 }, "vaultAddressAllowed": false, "ownSubAccountsAllowed": true,
   "expiresAfterMs": 15000, "allowedOrigins": ["manual", "ai_ticket"], "spotCoins": ["@166", "@150"], "spotTrading": false, "spotTradingCoins": ["PURR/USDC", "@1", "…", "@107", "@142"], "referralCode": null,
   "userLimits": null,
   "accountLimits": { "0x…sub": { "maxOrderNotionalUsd": 1000 } }

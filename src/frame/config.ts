@@ -163,7 +163,7 @@ export function parseFrameConfig(env: RawEnv, options: { production: boolean }):
   else builderAddress = builderRaw.toLowerCase() as `0x${string}`;
   const feeRaw = str(env, "VITE_BUILDER_FEE_TENTHS_BPS");
   let feeTenthsBps = 0;
-  if (feeRaw === undefined) problems.push("VITE_BUILDER_FEE_TENTHS_BPS is required (tenths of a basis point, e.g. 25 = 0.025%)");
+  if (feeRaw === undefined) problems.push("VITE_BUILDER_FEE_TENTHS_BPS is required (tenths of a basis point, e.g. 45 = 0.045%)");
   else if (!/^\d{1,3}$/.test(feeRaw) || Number(feeRaw) > 100) problems.push("VITE_BUILDER_FEE_TENTHS_BPS must be an integer between 0 and 100 (the perps cap, 0.1%)");
   else feeTenthsBps = Number(feeRaw);
   let promo: BuilderFeePromo | null = null;
