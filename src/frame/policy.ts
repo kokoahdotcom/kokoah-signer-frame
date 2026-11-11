@@ -611,6 +611,12 @@ export interface FramePolicyInput {
   /** The account's current leverage per coin, when known (only fetched when `maxLeverage` was tightened). */
   leverageByCoin?: Readonly<Record<string, number>>;
   /**
+   * For a leverage change: the account's open isolated positions on the market's dex and their leverage, as the frame
+   * read them from HL itself. Automation (an AI ticket) may lower such a position's leverage, never raise it or switch
+   * it to cross (shared evaluatePolicy); without the read a leverage change is refused.
+   */
+  isolatedPositionLeverage?: Readonly<Record<string, number>>;
+  /**
    * The sub-account the frame itself found in HL's `subAccounts` list of the key's master (never taken from the
    * parent). An action with `vaultAddress` is denied unless it equals this address.
    */
@@ -722,6 +728,8 @@ export function evaluateFramePolicy(input: FramePolicyInput): FramePolicyDecisio
     // Stops required: the stop-losses stay in place after an order is placed, read from HL by the frame itself.
     requireStopCoverage: true,
     ...(input.accountBook !== undefined ? { accountBook: input.accountBook } : {}),
+    requireIsolatedPositions: true,
+    ...(input.isolatedPositionLeverage !== undefined ? { isolatedPositionLeverage: input.isolatedPositionLeverage } : {}),
   };
   const compiledDecision = evaluatePolicy({ kind: "compiled", compiled: input.compiled, expiresAfter: input.expiresAfter }, context);
   for (const v of compiledDecision.violations) add(v);

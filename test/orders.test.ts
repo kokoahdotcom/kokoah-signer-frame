@@ -356,6 +356,70 @@ describe("taking margin out of an isolated position", () => {
   });
 });
 
+describe("raising the leverage of an isolated position", () => {
+  const lev = (leverage: number, o: Record<string, unknown> = {}) => ({ kind: "updateLeverage", coin: "BTC", leverage, marginMode: "isolated", origin: "manual", ...o });
+  const isolatedAt = (value: number) => (h.hl.positions[USER.toLowerCase()] = [{ coin: "BTC", szi: "0.1", entryPx: "100000.0", leverage: { type: "isolated", value } }]);
+
+  it("asks first, since it takes margin out of the position, reading the position itself", async () => {
+    await ready();
+    isolatedAt(5);
+    const pending = h.ok("signAndSubmit", { requestId: "l", intent: lev(10) });
+    await shown();
+    expect(h.promptEvents().at(-1)).toEqual({ visible: true, kind: "margin" });
+    expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Raise the leverage of this position to 10x?");
+    expect(h.promptText()).toContain("raise the leverage of the isolated BTC position from 5x to 10x. This takes margin out of the position and moves it closer to liquidation.");
+    expect(h.root?.querySelector(".ks-primary")?.classList.contains("ks-hold")).toBe(true);
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    await h.clickPrompt();
+    expect((await pending).status).toBe("ok");
+    expect(h.hl.exchangeCalls[0]!.body.action).toEqual({ type: "updateLeverage", asset: 0, isCross: false, leverage: 10 });
+    expect(h.hl.infoCalls.filter((c) => c.type === "clearinghouseState").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("lowers it, or sets leverage without an isolated position, with no prompt; refuses an AI ticket's raise", async () => {
+    await ready();
+    isolatedAt(5);
+    expect((await h.ok("signAndSubmit", { requestId: "down", intent: lev(3) })).status).toBe("ok");
+    expect((await h.ok("signAndSubmit", { requestId: "eth", intent: lev(10, { coin: "ETH" }) })).status).toBe("ok");
+    expect(h.promptEvents().filter((e) => e.visible)).toHaveLength(0);
+    expect(codes(await h.fail("signAndSubmit", { requestId: "ai", intent: lev(10, { origin: "ai_ticket" }) }))).toEqual(["ACTION_TYPE_NOT_ALLOWED"]);
+  });
+
+  it("signs nothing when cancelled, when the position changed meanwhile, or without a user interface", async () => {
+    await ready();
+    isolatedAt(5);
+    const cancelled = h.fail("signAndSubmit", { requestId: "c", intent: lev(10) });
+    await shown();
+    await h.clickPrompt("cancel");
+    expect(await cancelled).toMatchObject({ code: "USER_CANCELLED", details: { prompt: "margin" } });
+    const moved = h.fail("signAndSubmit", { requestId: "m", intent: lev(10) });
+    await shown();
+    isolatedAt(8);
+    await h.clickPrompt();
+    expect((await moved).code).toBe("SIGNER_BUSY");
+    h.hl.infoFailure = (body) => body.type === "clearinghouseState";
+    expect((await h.fail("signAndSubmit", { requestId: "down", intent: lev(10) })).code).toBe("MARKET_DATA_UNAVAILABLE");
+    h.hl.infoFailure = null;
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    h.destroy();
+    await ready({ withUi: false });
+    isolatedAt(5);
+    expect(codes(await h.fail("signAndSubmit", { requestId: "n", intent: lev(10) }))).toEqual(["ACTION_TYPE_NOT_ALLOWED"]);
+  });
+});
+
+describe("market triggers near the mark", () => {
+  it("are compiled within the account's price band, and keep Hyperliquid's 10% away from it", async () => {
+    await ready();
+    const stop = (triggerPrice: string) => ({ kind: "order", coin: "BTC", side: "sell", orderType: "stopMarket", size: "0.01", triggerPrice, reduceOnly: true, origin: "manual" });
+    expect((await h.ok("signAndSubmit", { requestId: "near", intent: stop("98000") })).status).toBe("ok");
+    expect((await h.ok("signAndSubmit", { requestId: "far", intent: stop("80000") })).status).toBe("ok");
+    const prices = h.hl.exchangeCalls.map((c) => (c.body.action as unknown as { orders: Array<{ p: string }> }).orders[0]!.p);
+    // The baseline band is 5%: 98,000 − 5% and 80,000 − 10%.
+    expect(prices).toEqual(["93100", "72000"]);
+  });
+});
+
 describe("describeOrders", () => {
   const registry = MarketRegistry.fromInfo({ meta: META0 });
   const marks = { BTC: 100_000, ETH: 2_000 };

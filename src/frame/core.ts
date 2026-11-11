@@ -84,7 +84,7 @@ import { errorName, HlHttp, type FetchLike } from "./hl.js";
 import { RegionGate } from "./eligibility.js";
 import { silentLogger, type Logger } from "./log.js";
 import { MarketData, MarketDataError, type MarketSnapshot } from "./market-data.js";
-import { type FrameAccountBook, readAccountBook } from "./accountBook.js";
+import { type FrameAccountBook, readAccountBook, readIsolatedPositions } from "./accountBook.js";
 import { classifyMessage } from "./messages.js";
 import {
   ConfirmationNeededError,
@@ -1713,6 +1713,10 @@ export class FrameCore {
     const touchesStops =
       intent.kind === "cancel" || intent.kind === "modify" || (intent.kind === "order" && !intent.reduceOnly && snapshot.registry.get(intent.coin)?.kind !== "spot");
     const bookFor = async (accountPolicy: Policy) => (touchesStops && accountPolicy.requireStopLossForNewEntries ? await this.accountBook(account, intent) : undefined);
+    // 4a'. A leverage change: the account's open isolated positions on that market's dex, read from HL by the frame
+    // itself. Raising an isolated position's leverage takes margin out of it: the user confirms it like removing margin.
+    const isolatedFor = async () => (intent.kind === "updateLeverage" ? await this.isolatedPositions(account, intent.coin) : undefined);
+    let isolatedPositionLeverage = await isolatedFor();
 
     const agent = key.meta.agentAddress;
     const usageKey = this.usageKey(key);
@@ -1744,6 +1748,7 @@ export class FrameCore {
         verifiedSpotCoins: snapshot.verifiedSpotCoins,
         spotDayVolumes: snapshot.spotDayVolumes,
         ...(accountBook !== undefined ? { accountBook } : {}),
+        ...(isolatedPositionLeverage !== undefined ? { isolatedPositionLeverage } : {}),
       });
       if (!decision.allowed) {
         this.metrics.policyDenials++;
@@ -1773,15 +1778,26 @@ export class FrameCore {
             ? { usd: recent.unpromptedDayUsd, windowMs: UNPROMPTED_DAY_MS, at: countedAt }
             : undefined;
     const marginOut = intent.kind === "updateIsolatedMargin" && Number(intent.amountUsd) < 0 ? { coin: intent.coin, usd: -Number(intent.amountUsd) } : undefined;
+    const isolatedNow = intent.kind === "updateLeverage" ? isolatedPositionLeverage?.[intent.coin] : undefined;
+    const leverageUp =
+      intent.kind === "updateLeverage" && intent.marginMode === "isolated" && isolatedNow !== undefined && intent.leverage > isolatedNow
+        ? { coin: intent.coin, from: isolatedNow, to: intent.leverage }
+        : undefined;
     let confirmed = false;
-    if (large || addsUp || marginOut) {
+    if (large || addsUp || marginOut || leverageUp) {
       await evaluate(stored, this.correctedNow());
       if (marginOut) await this.confirmMarginRemoval(marginOut, snapshot, compiled.vaultAddress);
+      else if (leverageUp) await this.confirmLeverageRaise(leverageUp, snapshot, compiled.vaultAddress);
       else await this.confirmOrders(orders, compiled.vaultAddress, addsUp);
       confirmed = true;
       snapshot = await this.marketSnapshot(coins);
       requirePinnedDexes();
       leverageByCoin = undefined;
+      // Read again for the check under the lock: the position may have changed while the prompt was open.
+      isolatedPositionLeverage = await isolatedFor();
+      if (leverageUp && !(isolatedPositionLeverage?.[leverageUp.coin] === leverageUp.from)) {
+        throw new SignerFailure("SIGNER_BUSY", "The position's leverage changed while you were confirming; nothing was signed. Try again.", { retryable: true });
+      }
     }
 
     // 5. Serialize per agent across tabs; policy, nonce, sign and submit under the lock.
@@ -2198,6 +2214,35 @@ export class FrameCore {
   }
 
   /**
+   * The frame's own prompt before the leverage of an open isolated position is raised (`promptChanged` kind `margin`,
+   * fixed styling, press and hold): that takes margin out of the position, moving it toward liquidation, as removing
+   * margin does. Cancel or timeout: USER_CANCELLED / USER_TIMEOUT, and nothing is signed. A frame without a UI can't ask,
+   * so it refuses it.
+   */
+  private async confirmLeverageRaise(raise: { coin: string; from: number; to: number }, snapshot: MarketSnapshot, subAccount: string | undefined): Promise<void> {
+    const market = snapshot.registry.get(raise.coin);
+    const name = printable(market?.displayName ?? market?.coin ?? raise.coin);
+    if (!this.ui) {
+      this.metrics.policyDenials++;
+      const message = "Raising the leverage of an isolated position needs your confirmation in the signer frame, which has no user interface here.";
+      throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: "ACTION_TYPE_NOT_ALLOWED", message }] } });
+    }
+    const sub = subAccount?.toLowerCase();
+    const whose = sub === undefined ? "" : ` of sub-account ${sub.slice(0, 6)}…${sub.slice(-4)}`;
+    await this.prompt(
+      "margin",
+      {
+        title: `Raise the leverage of this position to ${raise.to}x?`,
+        body: `The Kokoah app asks to raise the leverage of the isolated ${name} position${whose} from ${raise.from}x to ${raise.to}x. This takes margin out of the position and moves it closer to liquidation. Confirm only if you asked for this.`,
+        actionLabel: `Raise to ${raise.to}x`,
+        fixedStyle: true,
+        hold: true,
+      },
+      async () => undefined,
+    );
+  }
+
+  /**
    * The frame's own prompt before a key protected with a passkey is deleted (`revoke`) or replaced by one that unlocks
    * without it (`createAgent` / `createLinkedAgent` with `replaceExisting` and another storage mode): `promptChanged`
    * kind `key-remove`, fixed styling, press and hold. Cancel or timeout: USER_CANCELLED / USER_TIMEOUT, and the key
@@ -2246,6 +2291,17 @@ export class FrameCore {
       return await readAccountBook((body) => this.hl.info(body), account, intent);
     } catch {
       throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Could not read your positions and orders from Hyperliquid to check your stop-losses; nothing was signed. Try again shortly.", {
+        retryable: true,
+      });
+    }
+  }
+
+  /** The account's open isolated positions on `coin`'s dex (accountBook.ts); unreadable: nothing is signed (retryable). */
+  private async isolatedPositions(account: Hex, coin: string): Promise<Record<string, number>> {
+    try {
+      return await readIsolatedPositions((body) => this.hl.info(body), account, coin);
+    } catch {
+      throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Could not read your positions from Hyperliquid to check the leverage change; nothing was signed. Try again shortly.", {
         retryable: true,
       });
     }

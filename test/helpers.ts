@@ -167,7 +167,7 @@ export class MockHl {
    * `clearinghouseState` positions and `frontendOpenOrders` per account (lowercase), as HL sends them; the dex is in the
    * coin name (`xyz:SP500`). Default: none.
    */
-  positions: Record<string, Array<{ coin: string; szi: string; entryPx: string }>> = {};
+  positions: Record<string, Array<{ coin: string; szi: string; entryPx: string; leverage?: { type: "cross" | "isolated"; value: number } }>> = {};
   openOrders: Record<string, Array<Record<string, unknown>>> = {};
   /** `orderStatus` answers by oid or lowercase cloid; default: an order in `openOrders` is open, any other unknown. */
   orderStatuses: Record<string, unknown> = {};
@@ -242,7 +242,7 @@ export class MockHl {
       case "clearinghouseState": {
         const onDex = (coin: string) => (body.dex === undefined ? !coin.includes(":") : coin.startsWith(`${String(body.dex)}:`));
         const positions = (this.positions[String(body.user).toLowerCase()] ?? []).filter((p) => onDex(p.coin));
-        return { assetPositions: positions.map((position) => ({ type: "oneWay", position: { ...position, leverage: { type: "cross", value: 3 } } })), marginSummary: { accountValue: "10000.0" }, time: 0 };
+        return { assetPositions: positions.map((position) => ({ type: "oneWay", position: { leverage: { type: "cross", value: 3 }, ...position } })), marginSummary: { accountValue: "10000.0" }, time: 0 };
       }
       case "frontendOpenOrders": {
         const onDex = (coin: string) => (body.dex === undefined ? !coin.includes(":") : coin.startsWith(`${String(body.dex)}:`));
