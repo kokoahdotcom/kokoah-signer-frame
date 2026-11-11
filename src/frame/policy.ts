@@ -22,10 +22,12 @@
  * stop-loss when either requires one), so a sub-account's limits set earlier never escape a later tightening of the
  * master's; a field it leaves out keeps the master's value, and without limits of its own it uses the master's.
  * Orders per minute are counted per agent across accounts. Daily notional is counted per agent for the
- * baseline cap, and for personal limits once for the master and every sub-account without a daily limit of its own
- * (they share the master's), and separately for each sub-account that sets `maxDailyNotionalUsd`. The frame stores
- * them itself (`core.ts`); {@link limitChanges} tells a tightening, applied silently, from a loosening, which needs the
- * user's click in the frame.
+ * baseline cap, and for personal limits once for the master and every sub-account (the master's daily limit), and
+ * also separately for each sub-account that sets `maxDailyNotionalUsd` (its own daily limit, on top of the master's
+ * check). Only a sub-account whose own counter the user confirmed next to the master's daily limit
+ * ({@link AccountLimits.onTop}) is left out of the master's count. The frame stores them itself (`core.ts`);
+ * {@link limitChanges} tells a tightening, applied silently, from a loosening, which needs the user's click in the
+ * frame.
  *
  * Spot, for the master account only:
  * - Convert stablecoins (PHASE3 REV): orders only on the pinned stablecoin/USDC pairs of the frame's network
@@ -208,6 +210,13 @@ export const MAX_ACCOUNT_LIMITS = 64;
  */
 export interface AccountLimits {
   limits: UserLimits;
+  /**
+   * Its own daily counter is on top of the master's daily limit: its trading isn't counted against the master's. Only
+   * after the user confirmed that (the sub-account got a daily limit of its own while the master had one), and only
+   * while both keep a daily limit. Otherwise a sub-account with a daily limit of its own counts against both, so a
+   * daily limit the master gets later holds for it too.
+   */
+  onTop?: true;
 }
 
 const NUMBER_LIMITS = ["maxOrderNotionalUsd", "maxDailyNotionalUsd", "maxLeverage", "maxOrdersPerMinute", "priceBandPct"] as const;
@@ -260,11 +269,13 @@ export function limitsForAccount(masterLimits: UserLimits | null, accountLimits:
 }
 
 /**
- * Sub-accounts whose own limits set `maxDailyNotionalUsd` (lowercase): each has its own daily counter. Every other
- * sub-account shares the master's daily limit and counter, whatever else its own limits set.
+ * The daily counters of the sub-accounts (lowercase). `separate`: those whose own limits set `maxDailyNotionalUsd`,
+ * each with a counter of its own. `onTop`: those of them the master's counter leaves out ({@link AccountLimits.onTop}).
+ * Every other sub-account's trading counts only against the master's daily limit, whatever else its own limits set.
  */
-export function separateDailyAccounts(accountLimits: ReadonlyMap<string, AccountLimits>): string[] {
-  return [...accountLimits].filter(([, a]) => a.limits.maxDailyNotionalUsd !== undefined).map(([account]) => account.toLowerCase());
+export function dailyCounters(accountLimits: ReadonlyMap<string, AccountLimits>): { separate: string[]; onTop: string[] } {
+  const separate = [...accountLimits].filter(([, a]) => a.limits.maxDailyNotionalUsd !== undefined);
+  return { separate: separate.map(([account]) => account.toLowerCase()), onTop: separate.filter(([, a]) => a.onTop === true).map(([account]) => account.toLowerCase()) };
 }
 
 /**
@@ -317,9 +328,10 @@ function names(items: readonly string[]): string {
  * `after` a `setLimits`, compared on effective values: the account's own field, else the master's (for a sub-account),
  * else the baseline's. Anything that lets the account do more is `looser`: a higher number, a field removed (the
  * baseline or the master's looser value applies again), more markets or action types, spot trading on, the stop-loss
- * requirement off. A sub-account that gets a daily counter of its own while the master has a daily limit is looser
- * too, whatever the number: its trading no longer uses up the master's limit, so the day's total can grow by it; and so
- * is the master getting a daily limit while sub-accounts have counters of their own (one line per sub-account).
+ * requirement off. A sub-account whose own daily counter becomes {@link AccountLimits.onTop} (it gets one while the
+ * master has a daily limit) is looser too, whatever the number: its trading no longer uses up the master's limit, so
+ * the day's total can grow by it. The master getting a daily limit is a tightening, also for sub-accounts with counters
+ * of their own: they count against it.
  */
 export function limitChanges(baseline: Policy, before: LimitsSet, after: LimitsSet, subAccount?: string): LimitChange[] {
   const sub = subAccount?.toLowerCase();
@@ -335,25 +347,13 @@ export function limitChanges(baseline: Policy, before: LimitsSet, after: LimitsS
     if (from !== to) add(field, label, show(from), show(to), to > from);
   };
   number("maxOrderNotionalUsd", "Largest order", usd);
-  const ownDailyBefore = sub === undefined ? undefined : before.accounts.get(sub)?.limits.maxDailyNotionalUsd;
-  const ownDailyAfter = sub === undefined ? undefined : after.accounts.get(sub)?.limits.maxDailyNotionalUsd;
+  const onTopBefore = sub !== undefined && before.accounts.get(sub)?.onTop === true;
+  const onTopAfter = sub !== undefined && after.accounts.get(sub)?.onTop === true;
   const sharedDaily = after.master?.maxDailyNotionalUsd;
-  if (ownDailyBefore === undefined && ownDailyAfter !== undefined && sharedDaily !== undefined) {
+  if (!onTopBefore && onTopAfter && sharedDaily !== undefined) {
     // What is enforced: the stricter of its own and the master's (limitsForAccount).
-    add("maxDailyNotionalUsd", "Trading per day", `${usd(sharedDaily)} shared with the main account`, `${usd(a.maxDailyNotionalUsd ?? ownDailyAfter)} of its own, on top of the main account's`, true);
+    add("maxDailyNotionalUsd", "Trading per day", `${usd(sharedDaily)} shared with the main account`, `${usd(a.maxDailyNotionalUsd ?? sharedDaily)} of its own, on top of the main account's`, true);
   } else number("maxDailyNotionalUsd", "Trading per day", usd);
-  // The master gets a daily limit while sub-accounts have counters of their own (set while it had none): their trading
-  // doesn't use up the new limit, which the user confirms like a sub-account getting its own counter under one.
-  if (sub === undefined && before.master?.maxDailyNotionalUsd === undefined && after.master?.maxDailyNotionalUsd !== undefined) {
-    const masterDaily = after.master.maxDailyNotionalUsd;
-    for (const [account, own] of after.accounts) {
-      // What is enforced for it: the stricter of its own and the master's (limitsForAccount).
-      const daily = own.limits.maxDailyNotionalUsd === undefined ? undefined : Math.min(own.limits.maxDailyNotionalUsd, masterDaily);
-      if (daily === undefined) continue;
-      const shown = `${account.slice(0, 6)}…${account.slice(-4)}`;
-      changes.push({ field: "maxDailyNotionalUsd", text: `Sub-account ${shown} trading per day: ${usd(daily)} of its own, on top of the main account's`, looser: true });
-    }
-  }
   number("maxLeverage", "Leverage", (n) => `up to ${n}x`);
   number("maxOrdersPerMinute", "Orders per minute", String);
   number("priceBandPct", "Price distance from the market", (n) => `${n}%`);
@@ -621,6 +621,11 @@ export interface FramePolicyInput {
    * orders over sub-accounts can't multiply it. Omitted: `dailyNotionalUsedUsd` (single account).
    */
   agentDailyNotionalUsedUsd?: number;
+  /**
+   * For a sub-account with a daily counter of its own that isn't {@link AccountLimits.onTop}: the master's counter
+   * today and the master's daily limit, which its trading counts against too.
+   */
+  masterDaily?: { usedUsd: number; limitUsd: number };
   /** The account's current leverage per coin, when known (only fetched when `maxLeverage` was tightened). */
   leverageByCoin?: Readonly<Record<string, number>>;
   /**
@@ -721,6 +726,15 @@ export function evaluateFramePolicy(input: FramePolicyInput): FramePolicyDecisio
     const next = input.agentDailyNotionalUsedUsd + actionNotionalUsd(action, input.registry, input.markPrices);
     if (next > BASELINE_LIMITS.maxDailyNotionalUsd) {
       add({ code: "DAILY_NOTIONAL_EXCEEDED", message: `This device's key would pass the signer's daily limit of $${BASELINE_LIMITS.maxDailyNotionalUsd.toLocaleString("en-US")} across all accounts.` });
+    }
+  }
+  // Frame rule: a sub-account's own daily counter is on top of the master's limit only once the user confirmed it.
+  if (input.masterDaily !== undefined) {
+    const action = input.compiled.action as unknown as Record<string, unknown>;
+    const added = actionNotionalUsd(action, input.registry, input.markPrices);
+    if (added > 0 && input.masterDaily.usedUsd + added > input.masterDaily.limitUsd) {
+      const limit = input.masterDaily.limitUsd.toLocaleString("en-US");
+      add({ code: "DAILY_NOTIONAL_EXCEEDED", message: `This would pass the main account's daily limit of $${limit}, which this sub-account's trading counts against too.` });
     }
   }
   const midPrices: Record<string, number> = {};

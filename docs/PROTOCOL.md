@@ -743,8 +743,11 @@ Loosening means any of:
 - more `allowedCoins` or `allowedActionTypes` (or the list removed);
 - `requireStopLossForNewEntries` dropped while it is required;
 - `{ "account": "0x…sub" }` alone while the master's values are looser than the sub-account's own;
-- a sub-account getting `maxDailyNotionalUsd` of its own while the master has a daily limit: it then has a daily
-  counter of its own on top of the master's, so the day's total can grow.
+- a sub-account getting `maxDailyNotionalUsd` of its own while the master has a daily limit: its counter is then on
+  top of the master's (its trading no longer counts against the master's limit), so the day's total can grow.
+
+The master getting a daily limit is a tightening, also while sub-accounts have daily limits of their own: their trading
+counts against it (see Counting), so it applies at once, as the app's silent step expects (2026-11-11).
 
 Timing and order:
 - While the prompt is open, the stored (stricter) limits keep applying to every signature, in every tab.
@@ -764,9 +767,11 @@ device): a tightening applies, a loosening asks the user. When the user cancels,
 last for this frame load only.
 
 - Counting: orders per minute are counted per key across all accounts. Daily notional is counted per key across all
-  accounts for the baseline $25M. For personal limits, a sub-account whose own limits set `maxDailyNotionalUsd` has a
-  counter of its own against that limit; the master and every other sub-account share one counter against the
-  master's `maxDailyNotionalUsd`.
+  accounts for the baseline $25M. For personal limits, the master and every sub-account count against the master's
+  `maxDailyNotionalUsd`, and a sub-account whose own limits set `maxDailyNotionalUsd` also has a counter of its own
+  against that limit. Only a sub-account whose own counter the user confirmed on top of the master's daily limit (the
+  loosening above) is left out of the master's count, and only while both keep a daily limit: once the master's daily
+  limit is removed, one it gets later counts every sub-account again (2026-11-11).
 - Errors:
   - `LIMIT_LOOSENING_REJECTED`, with `details.fields` listing the fields above the baseline (or, in a frame with no user
     interface, the fields that would loosen the stored limits);

@@ -121,7 +121,7 @@ import {
   type OrdersDescription,
   policyForAccount,
   printable,
-  separateDailyAccounts,
+  dailyCounters,
   storedUserLimits,
   summarizeFramePolicy,
   vaultTransfersAllowed,
@@ -219,7 +219,7 @@ interface LimitsState extends LimitsSet {
 
 /** Compares the limits of two states, whatever their revisions. */
 function limitsKey(s: LimitsSet): string {
-  return stableStringify({ master: s.master, accounts: Object.fromEntries([...s.accounts].map(([a, l]) => [a, l.limits])) });
+  return stableStringify({ master: s.master, accounts: Object.fromEntries([...s.accounts].map(([a, l]) => [a, l.limits])), onTop: dailyCounters(s.accounts).onTop.sort() });
 }
 
 interface RequestEntry {
@@ -1403,13 +1403,18 @@ export class FrameCore {
     const rev = limitsRev(rec);
     const valid = isRecord(rec) && rec.network === this.config.network.name;
     const accounts = new Map<string, AccountLimits>();
+    const master = valid ? storedUserLimits(this.baseline, rec.master) : null;
+    // On top of the master's daily limit only while both have one (see AccountLimits.onTop).
+    const onTop = new Set(valid && Array.isArray(rec.dailyOnTop) ? rec.dailyOnTop.filter((a): a is string => typeof a === "string") : []);
     if (valid && isRecord(rec.accounts)) {
       for (const [address, raw] of Object.entries(rec.accounts)) {
         const limits = /^0x[0-9a-f]{40}$/.test(address) ? storedUserLimits(this.baseline, raw) : null;
-        if (limits !== null && accounts.size < MAX_ACCOUNT_LIMITS) accounts.set(address, { limits });
+        if (limits === null || accounts.size >= MAX_ACCOUNT_LIMITS) continue;
+        const top = onTop.has(address) && limits.maxDailyNotionalUsd !== undefined && master?.maxDailyNotionalUsd !== undefined;
+        accounts.set(address, top ? { limits, onTop: true } : { limits });
       }
     }
-    return this.withPolicy(rev, valid ? storedUserLimits(this.baseline, rec.master) : null, accounts);
+    return this.withPolicy(rev, master, accounts);
   }
 
   private withPolicy(rev: number, master: UserLimits | null, accounts: Map<string, AccountLimits>): LimitsState {
@@ -1536,9 +1541,19 @@ export class FrameCore {
         if (!accounts.has(sub) && accounts.size >= MAX_ACCOUNT_LIMITS) {
           throw new SignerFailure("INVALID_REQUEST", `At most ${MAX_ACCOUNT_LIMITS} sub-accounts can have their own limits.`);
         }
-        // Checked against the baseline; at signing they apply on top of the master's limits of that moment.
-        accounts.set(sub, { limits });
+        // Checked against the baseline; at signing they apply on top of the master's limits of that moment. A daily
+        // counter it gets while the master has a daily limit is on top of it (a loosening the user confirms); one it
+        // already had keeps what it was (one set while the master had none counts against the master's limit too).
+        const was = before.accounts.get(sub);
+        const onTop =
+          limits.maxDailyNotionalUsd !== undefined &&
+          before.master?.maxDailyNotionalUsd !== undefined &&
+          (was?.onTop === true || was?.limits.maxDailyNotionalUsd === undefined);
+        accounts.set(sub, onTop ? { limits, onTop: true } : { limits });
       }
+    } else if (limits?.maxDailyNotionalUsd === undefined) {
+      // The master without a daily limit: nothing to be on top of. One it gets later holds for every sub-account.
+      for (const [address, a] of accounts) if (a.onTop === true) accounts.set(address, { limits: a.limits });
     }
     const after = this.withPolicy(before.rev + 1, sub === undefined ? limits : before.master, accounts);
     if (limitsKey(after) === limitsKey(before)) return { kind: "done" };
@@ -1566,6 +1581,7 @@ export class FrameCore {
       rev: after.rev,
       master: after.master,
       accounts: Object.fromEntries([...after.accounts].map(([a, l]) => [a, l.limits])),
+      dailyOnTop: dailyCounters(after.accounts).onTop,
       updatedAt: this.now(),
     };
     let written: boolean;
@@ -1756,8 +1772,11 @@ export class FrameCore {
     const evaluate = async (limits: LimitsState, now: number) => {
       const accountPolicy = policyForAccount(limits.policy, limits.accounts, vault, this.market.tradingPairCoins);
       const expiresAfter = now + EXPIRES_AFTER_MS;
-      // Sub-accounts without a daily limit of their own share the master's daily limit and counter.
-      const usageAccount = { account, master, separate: separateDailyAccounts(limits.accounts) };
+      // Sub-accounts without a daily limit of their own share the master's daily limit and counter. One with its own
+      // counts against both, unless the user confirmed its counter on top of the master's (AccountLimits.onTop).
+      const counters = dailyCounters(limits.accounts);
+      const usageAccount = { account, master, ...counters };
+      const masterDailyLimitUsd = account !== master && counters.separate.includes(account) && !counters.onTop.includes(account) ? limits.policy.maxDailyNotionalUsd : undefined;
       const usage = await this.coordinator.usage(usageKey, now, usageAccount);
       const accountBook = await bookFor(accountPolicy);
       const decision = evaluateFramePolicy({
@@ -1771,6 +1790,7 @@ export class FrameCore {
         ordersInLastMinute: usage.ordersInLastMinute,
         dailyNotionalUsedUsd: usage.accountDailyNotionalUsd,
         agentDailyNotionalUsedUsd: usage.dailyNotionalUsedUsd,
+        ...(masterDailyLimitUsd !== undefined ? { masterDaily: { usedUsd: usage.masterDailyNotionalUsd, limitUsd: masterDailyLimitUsd } } : {}),
         ...(leverageByCoin !== undefined ? { leverageByCoin } : {}),
         ...(ownedSubAccount !== undefined ? { ownedSubAccount } : {}),
         network: this.config.network.name,
@@ -1784,7 +1804,7 @@ export class FrameCore {
         this.log("sign.denied", { actionType: decision.actionType, codes: decision.violations.map((v) => v.code).join(",") });
         throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: decision.violations } });
       }
-      return { decision, accountPolicy, usageAccount, expiresAfter };
+      return { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter };
     };
 
     // 4b. Orders above CONFIRM_ORDERS_ABOVE_USD in all (reduce-only ones included), or that would take what this account
@@ -1852,7 +1872,7 @@ export class FrameCore {
       if (leverageByCoin === undefined && needsLeverage(limits)) leverageByCoin = await this.accountLeverage(account, coins, snapshot);
       const now = this.correctedNow();
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
-      const { decision, accountPolicy, usageAccount, expiresAfter } = await evaluate(limits, now);
+      const { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter } = await evaluate(limits, now);
 
       let nonce: number;
       try {
@@ -1866,6 +1886,7 @@ export class FrameCore {
             maxActionsPerMinute: BASELINE_LIMITS.maxActionsPerMinute,
             maxDailyNotionalUsd: accountPolicy.maxDailyNotionalUsd,
             maxAgentDailyNotionalUsd: BASELINE_LIMITS.maxDailyNotionalUsd,
+            ...(masterDailyLimitUsd !== undefined ? { maxMasterDailyNotionalUsd: masterDailyLimitUsd } : {}),
           },
           // Checked again in the record's own transaction: another tab may have signed orders since the check above. A
           // confirmation whose prompt showed the unconfirmed total of a window starts that window again (the orders in
