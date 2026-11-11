@@ -345,8 +345,10 @@ export function limitChanges(baseline: Policy, before: LimitsSet, after: LimitsS
   // The master gets a daily limit while sub-accounts have counters of their own (set while it had none): their trading
   // doesn't use up the new limit, which the user confirms like a sub-account getting its own counter under one.
   if (sub === undefined && before.master?.maxDailyNotionalUsd === undefined && after.master?.maxDailyNotionalUsd !== undefined) {
+    const masterDaily = after.master.maxDailyNotionalUsd;
     for (const [account, own] of after.accounts) {
-      const daily = own.limits.maxDailyNotionalUsd;
+      // What is enforced for it: the stricter of its own and the master's (limitsForAccount).
+      const daily = own.limits.maxDailyNotionalUsd === undefined ? undefined : Math.min(own.limits.maxDailyNotionalUsd, masterDaily);
       if (daily === undefined) continue;
       const shown = `${account.slice(0, 6)}…${account.slice(-4)}`;
       changes.push({ field: "maxDailyNotionalUsd", text: `Sub-account ${shown} trading per day: ${usd(daily)} of its own, on top of the main account's`, looser: true });

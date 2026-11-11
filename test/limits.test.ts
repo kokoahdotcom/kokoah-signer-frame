@@ -373,6 +373,32 @@ describe("sub-account limits", () => {
     const again = await asking(h, { maxDailyNotionalUsd: 1_000 });
     await h.clickPrompt();
     expect((await again.answer).ok).toBe(true);
+    // Tightening the master's limit then is silent; the line shows what is enforced (the stricter of the two).
+    await h.ok("setLimits", { maxDailyNotionalUsd: 400 });
+    expect(shownPrompts(h)).toHaveLength(2);
+  });
+
+  it("adds no line for a sub-account without a daily counter of its own, and shows the enforced figure", async () => {
+    const h = await frame();
+    h.hl.subAccounts[USER.toLowerCase()] = [subAccountEntry(SUB), subAccountEntry(SUB2, USER, "Scalp")];
+    await h.activeAgent("device");
+    // Only an order cap of its own: the master's new daily limit counts its trading, nothing loosens.
+    await h.ok("setLimits", { account: SUB, maxOrderNotionalUsd: 100 });
+    await h.ok("setLimits", { maxDailyNotionalUsd: 1_000 });
+    expect(shownPrompts(h)).toHaveLength(0);
+
+    const k = await frame();
+    k.hl.subAccounts[USER.toLowerCase()] = [subAccountEntry(SUB), subAccountEntry(SUB2, USER, "Scalp")];
+    await k.activeAgent("device");
+    await k.ok("setLimits", { account: SUB, maxOrderNotionalUsd: 100 });
+    await k.ok("setLimits", { account: SUB2, maxDailyNotionalUsd: 5_000 });
+    expect(shownPrompts(k)).toHaveLength(0);
+    const master = await asking(k, { maxDailyNotionalUsd: 1_000 });
+    // Its own $5,000 counter is held to the master's $1,000: that is what the line shows.
+    expect(k.promptText()).toContain("Sub-account 0x5ab0…0002 trading per day: $1,000 of its own, on top of the main account's");
+    expect(k.promptText()).not.toContain("0x5ab0…0001");
+    await k.clickPrompt("cancel");
+    expect((await master.answer).ok).toBe(false);
   });
 
   it("keeps a sub-account's limits across a reload and in another tab", async () => {
