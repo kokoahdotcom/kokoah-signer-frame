@@ -29,6 +29,7 @@ import { safeParseActionIntent, type ActionIntent } from "@kokoah/shared/intents
 import { deviceLinkCode } from "@kokoah/shared/link";
 import { isWriteAllowed } from "@kokoah/shared/network";
 import { marketTriggerSlippageFor, type Policy } from "@kokoah/shared/policy";
+import type { MarketTriggerLeg } from "@kokoah/shared/actions";
 import { builderFeeAt } from "@kokoah/shared/risk";
 import { buildApproveAgent, buildRevokeAgent, parseAgentName, prepareL1Request } from "@kokoah/shared/signing";
 import { SubAccountLookupError, SubAccountOwnership } from "@kokoah/shared/subaccounts";
@@ -1666,15 +1667,23 @@ export class FrameCore {
     let snapshot = await this.marketSnapshot(coins);
 
     // 3. Compile with the configured builder and the frame's own mid prices; market triggers within the slippage the
-    // account's price band allows them (near the mark, or entries), at the marks the policy then checks them with.
+    // account's price band allows them (near the mark, or entries), at this snapshot's marks. Each leg's slippage is
+    // kept: after a prompt the marks are read again, and a leg the new marks would allow less is never signed.
+    const compiledPolicy = policyForAccount(stored.policy, stored.accounts, vault, this.market.tradingPairCoins);
+    const triggerLegs: Array<{ leg: MarketTriggerLeg; bps: number }> = [];
     let compiled: CompiledAction;
     try {
+      const slippage = marketTriggerSlippageFor(compiledPolicy, snapshot.markPrices);
       compiled = compileAction(intent, {
         registry: snapshot.registry,
         builder: { address: this.config.builder.address, feeTenthsBps: builderFeeAt(this.config.builder, this.correctedNow()) },
         getMidPrice: (coin) => snapshot.midPrices[coin],
         now: this.correctedNow(),
-        marketTriggerSlippageBps: marketTriggerSlippageFor(policyForAccount(stored.policy, stored.accounts, vault, this.market.tradingPairCoins), snapshot.markPrices),
+        marketTriggerSlippageBps: (leg) => {
+          const bps = slippage(leg);
+          triggerLegs.push({ leg, bps });
+          return bps;
+        },
       });
     } catch (e) {
       if (e instanceof CompileError) {
@@ -1792,6 +1801,14 @@ export class FrameCore {
       confirmed = true;
       snapshot = await this.marketSnapshot(coins);
       requirePinnedDexes();
+      // A market trigger compiled with more slippage than the marks read now allow (the mark moved toward it while the
+      // user confirmed): the confirmed action would be refused, so nothing is signed and the user tries again.
+      const now = marketTriggerSlippageFor(compiledPolicy, snapshot.markPrices);
+      if (triggerLegs.some((t) => now(t.leg) < t.bps)) {
+        throw new SignerFailure("SIGNER_BUSY", "The market moved close to this order's stop or trigger while you were confirming; nothing was signed. Try again.", {
+          retryable: true,
+        });
+      }
       leverageByCoin = undefined;
       // Read again for the check under the lock: the position may have changed while the prompt was open.
       isolatedPositionLeverage = await isolatedFor();
