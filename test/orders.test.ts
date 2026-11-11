@@ -75,7 +75,9 @@ describe("large orders", () => {
     const text = h.promptText();
     expect(text).toContain("Buy 0.1 BTC at $100,000 (limit) · about $10,000");
     expect(text).toContain("Sell 0.1 BTC take-profit at $110,000, then at market (down to $99,000) · reduce-only · about $11,000");
-    expect(text).toContain("Sell 0.1 BTC stop-loss at $95,000, then at market (down to $85,500) · reduce-only · about $10,000");
+    // The stop is within the 5% band of the mark: its market limit stays within 5% of its trigger (the take-profit, 10%
+    // away, keeps Hyperliquid's 10%).
+    expect(text).toContain("Sell 0.1 BTC stop-loss at $95,000, then at market (down to $90,250) · reduce-only · about $10,000");
     await h.clickPrompt();
     expect((await pending).status).toBe("ok");
 
