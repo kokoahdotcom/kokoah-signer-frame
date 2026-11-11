@@ -53,7 +53,9 @@ This repo also ships **`KokoahSignerClient`**, the typed, dependency-free client
 
 ## Commands
 
-Node 24 (`.nvmrc`) and pnpm 10.34.5 through corepack. No global installs.
+Node 24 (`.nvmrc`) and pnpm 10.34.5 through corepack. No global installs. `@kokoah/shared` is the sibling checkout
+`../kokoah-shared`, at the commit in `.kokoah-shared-ref` (CI checks out exactly that commit; bump it to take a newer
+kokoah-shared).
 
 ```sh
 export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
@@ -138,6 +140,8 @@ These aren't in this repo's power; they are for the kokoah-infra owners.
 2. **Mainnet builds (2026-10-05).** `kokoah-infra/vercel/build.sh` builds testnet only and doesn't pass `VITE_ALLOW_MAINNET_WRITES`; a mainnet frame build needs `VITE_HL_NETWORK=mainnet` and `VITE_ALLOW_MAINNET_WRITES=true` (without the second, `vite build` fails by design).
 3. Chrome for Testing 153 logs "Unrecognized feature: 'bluetooth'" and "'browsing-topics'" for the signer `Permissions-Policy`. This is harmless, but noisy in the console.
 3. A staging signer needs its own `_headers` (staging `frame-ancestors`).
+4. **The shared pin (2026-11-11).** `vercel/build.sh` builds the frame against kokoah-shared's main; it should build it
+   against the commit in `.kokoah-shared-ref`, as CI does.
 
 ## Frontend integration (kokoah-frontend)
 

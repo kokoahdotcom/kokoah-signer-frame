@@ -75,7 +75,9 @@ describe("large orders", () => {
     const text = h.promptText();
     expect(text).toContain("Buy 0.1 BTC at $100,000 (limit) · about $10,000");
     expect(text).toContain("Sell 0.1 BTC take-profit at $110,000, then at market (down to $99,000) · reduce-only · about $11,000");
-    expect(text).toContain("Sell 0.1 BTC stop-loss at $95,000, then at market (down to $85,500) · reduce-only · about $10,000");
+    // The stop is within the 5% band of the mark: its market limit stays within 5% of its trigger (the take-profit, 10%
+    // away, keeps Hyperliquid's 10%).
+    expect(text).toContain("Sell 0.1 BTC stop-loss at $95,000, then at market (down to $90,250) · reduce-only · about $10,000");
     await h.clickPrompt();
     expect((await pending).status).toBe("ok");
 
@@ -351,6 +353,150 @@ describe("taking margin out of an isolated position", () => {
     await ready({ withUi: false });
     expect(codes(await h.fail("signAndSubmit", { requestId: "n", intent: out("-5") }))).toEqual(["ACTION_TYPE_NOT_ALLOWED"]);
     expect(h.hl.exchangeCalls).toHaveLength(0);
+  });
+});
+
+describe("raising the leverage of an isolated position", () => {
+  const lev = (leverage: number, o: Record<string, unknown> = {}) => ({ kind: "updateLeverage", coin: "BTC", leverage, marginMode: "isolated", origin: "manual", ...o });
+  const isolatedAt = (value: number) => (h.hl.positions[USER.toLowerCase()] = [{ coin: "BTC", szi: "0.1", entryPx: "100000.0", leverage: { type: "isolated", value } }]);
+
+  it("asks first, since it takes margin out of the position, reading the position itself", async () => {
+    await ready();
+    isolatedAt(5);
+    const pending = h.ok("signAndSubmit", { requestId: "l", intent: lev(10) });
+    await shown();
+    expect(h.promptEvents().at(-1)).toEqual({ visible: true, kind: "margin" });
+    expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Raise the leverage of this position to 10x?");
+    expect(h.promptText()).toContain("raise the leverage of the isolated BTC position from 5x to 10x. This takes margin out of the position and moves it closer to liquidation.");
+    expect(h.root?.querySelector(".ks-primary")?.classList.contains("ks-hold")).toBe(true);
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    await h.clickPrompt();
+    expect((await pending).status).toBe("ok");
+    expect(h.hl.exchangeCalls[0]!.body.action).toEqual({ type: "updateLeverage", asset: 0, isCross: false, leverage: 10 });
+    expect(h.hl.infoCalls.filter((c) => c.type === "clearinghouseState").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("lowers it, or sets leverage without an isolated position, with no prompt; refuses an AI ticket's raise", async () => {
+    await ready();
+    isolatedAt(5);
+    expect((await h.ok("signAndSubmit", { requestId: "down", intent: lev(3) })).status).toBe("ok");
+    expect((await h.ok("signAndSubmit", { requestId: "eth", intent: lev(10, { coin: "ETH" }) })).status).toBe("ok");
+    expect(h.promptEvents().filter((e) => e.visible)).toHaveLength(0);
+    expect(codes(await h.fail("signAndSubmit", { requestId: "ai", intent: lev(10, { origin: "ai_ticket" }) }))).toEqual(["ACTION_TYPE_NOT_ALLOWED"]);
+  });
+
+  it("reads a sub-account's own positions, and signs nothing when a position's leverage is unreadable", async () => {
+    await ready();
+    const sub = "0x5ab0000000000000000000000000000000000001";
+    h.hl.subAccounts[USER.toLowerCase()] = [subAccountEntry(sub)];
+    h.hl.positions[sub] = [{ coin: "BTC", szi: "-0.2", entryPx: "100000.0", leverage: { type: "isolated", value: 4 } }];
+    const pending = h.ok("signAndSubmit", { requestId: "s", intent: lev(6, { vaultAddress: sub }) });
+    await shown();
+    expect(h.promptText()).toContain("of sub-account 0x5ab0…0001 from 4x to 6x");
+    expect(h.hl.infoCalls.some((c) => c.type === "clearinghouseState" && c.user === sub)).toBe(true);
+    await h.clickPrompt();
+    expect((await pending).status).toBe("ok");
+    isolatedAt(5);
+    h.hl.positions[USER.toLowerCase()] = [{ coin: "BTC", szi: "0.1", entryPx: "100000.0", leverage: { type: "weird" as "cross", value: 5 } }];
+    expect((await h.fail("signAndSubmit", { requestId: "u", intent: lev(3) })).code).toBe("MARKET_DATA_UNAVAILABLE");
+  });
+
+  it("signs nothing when cancelled, when the position changed meanwhile, or without a user interface", async () => {
+    await ready();
+    isolatedAt(5);
+    const cancelled = h.fail("signAndSubmit", { requestId: "c", intent: lev(10) });
+    await shown();
+    await h.clickPrompt("cancel");
+    expect(await cancelled).toMatchObject({ code: "USER_CANCELLED", details: { prompt: "margin" } });
+    const moved = h.fail("signAndSubmit", { requestId: "m", intent: lev(10) });
+    await shown();
+    isolatedAt(8);
+    await h.clickPrompt();
+    expect((await moved).code).toBe("SIGNER_BUSY");
+    h.hl.infoFailure = (body) => body.type === "clearinghouseState";
+    expect((await h.fail("signAndSubmit", { requestId: "down", intent: lev(10) })).code).toBe("MARKET_DATA_UNAVAILABLE");
+    h.hl.infoFailure = null;
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    h.destroy();
+    await ready({ withUi: false });
+    isolatedAt(5);
+    expect(codes(await h.fail("signAndSubmit", { requestId: "n", intent: lev(10) }))).toEqual(["ACTION_TYPE_NOT_ALLOWED"]);
+  });
+});
+
+describe("market triggers near the mark", () => {
+  it("are compiled within the account's price band, and keep Hyperliquid's 10% away from it", async () => {
+    await ready();
+    const stop = (triggerPrice: string) => ({ kind: "order", coin: "BTC", side: "sell", orderType: "stopMarket", size: "0.01", triggerPrice, reduceOnly: true, origin: "manual" });
+    expect((await h.ok("signAndSubmit", { requestId: "near", intent: stop("98000") })).status).toBe("ok");
+    expect((await h.ok("signAndSubmit", { requestId: "far", intent: stop("80000") })).status).toBe("ok");
+    const prices = h.hl.exchangeCalls.map((c) => (c.body.action as unknown as { orders: Array<{ p: string }> }).orders[0]!.p);
+    // The baseline band is 5%: 98,000 − 5% and 80,000 − 10%.
+    expect(prices).toEqual(["93100", "72000"]);
+  });
+
+  const sent = () => h.hl.exchangeCalls.map((c) => c.body.action as unknown as { orders?: Array<{ p: string }>; order?: { p: string } });
+  const trigger = (side: "buy" | "sell", triggerPrice: string, o: Record<string, unknown> = {}) => ({
+    kind: "order",
+    coin: "BTC",
+    side,
+    orderType: "stopMarket",
+    size: "0.01",
+    triggerPrice,
+    reduceOnly: true,
+    origin: "manual",
+    ...o,
+  });
+
+  it("bands a short's buy stop and a stop that is already past the mark, and a modify near it", async () => {
+    await ready();
+    expect((await h.ok("signAndSubmit", { requestId: "buy", intent: trigger("buy", "101000") })).status).toBe("ok");
+    // A sell stop above the mark fires at once: banded too.
+    expect((await h.ok("signAndSubmit", { requestId: "crossed", intent: trigger("sell", "100500") })).status).toBe("ok");
+    const modify = { kind: "modify", target: { oid: 77 }, order: { coin: "BTC", side: "sell", orderType: "stopMarket", size: "0.01", triggerPrice: "98000", reduceOnly: true }, origin: "manual" };
+    expect((await h.ok("signAndSubmit", { requestId: "modify", intent: modify })).status).toBe("ok");
+    const [buy, crossed, moved] = sent();
+    expect(buy!.orders![0]!.p).toBe("106050");
+    expect(crossed!.orders![0]!.p).toBe("95475");
+    expect(moved!.order!.p).toBe("93100");
+  });
+
+  it("bands an entry's attached exits 2–3% away, and entry triggers wherever they are", async () => {
+    await ready();
+    const entry = limitOrder({ coin: "BTC", size: "0.01", price: "100000", stopLoss: { triggerPrice: "97500" }, takeProfit: { triggerPrice: "103000" } });
+    expect((await h.ok("signAndSubmit", { requestId: "e", intent: entry })).status).toBe("ok");
+    // Parent, take-profit, stop-loss: 103,000 − 5% and 97,500 − 5%.
+    expect(sent()[0]!.orders!.map((o) => o.p)).toEqual(["100000", "97850", "92625"]);
+    // A stop entry 20% above the mark: an entry gets the band, however far.
+    expect((await h.ok("signAndSubmit", { requestId: "s", intent: trigger("buy", "120000", { reduceOnly: false }) })).status).toBe("ok");
+    expect(sent()[1]!.orders![0]!.p).toBe("126000");
+  });
+
+  it("bands HIP-3 triggers by their own dex's mark", async () => {
+    await ready();
+    expect((await h.ok("signAndSubmit", { requestId: "x", intent: trigger("sell", "5900", { coin: "xyz:SP500", size: "1" }) })).status).toBe("ok");
+    expect(sent()[0]!.orders![0]!.p).toBe("5605");
+  });
+
+  it("signs nothing when the mark moved close to a confirmed order's stop while the user held, and signs it again then", async () => {
+    await ready();
+    // $30,000: a prompt. Its market stop is 5.5% under the mark: compiled with Hyperliquid's 10%.
+    const big = limitOrder({ coin: "BTC", size: "0.3", price: "100000", stopLoss: { triggerPrice: "94500" } });
+    const first = h.fail("signAndSubmit", { requestId: "b1", intent: big });
+    await shown();
+    // The mark falls 0.6% while the user reads and holds (past the frame's 3 s price cache): the stop is now within the
+    // 5% band.
+    h.hl.mark.BTC = "99400";
+    h.clock.advance(5_000);
+    await h.clickPrompt();
+    expect(await first).toMatchObject({ code: "SIGNER_BUSY", retryable: true });
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    // Again: compiled at the new mark, within the band, and signed once confirmed.
+    const again = h.ok("signAndSubmit", { requestId: "b2", intent: big });
+    await waitFor(() => h.promptText() !== "");
+    await h.clickPrompt();
+    expect((await again).status).toBe("ok");
+    expect(sent()[0]!.orders!.map((o) => o.p)).toEqual(["100000", "89775"]);
   });
 });
 

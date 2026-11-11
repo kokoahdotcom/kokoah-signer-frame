@@ -2,9 +2,11 @@
  * The account's positions and resting orders, read by the frame itself from Hyperliquid (never from the parent), for
  * the stop-loss check where the user's limits require a stop-loss (shared `stopCoverage.ts`): `clearinghouseState` and
  * `frontendOpenOrders` on each perp dex the action names, and `orderStatus` for each order it names that isn't among
- * them (at most {@link MAX_ORDER_LOOKUPS}): one that is closed (filled, canceled, never placed), or open but not a perp
- * stop-loss, takes nothing away. Read strictly: anything malformed, or a trigger order of a type the frame doesn't
- * know, throws {@link AccountBookError}, and nothing is signed.
+ * them (at most {@link MAX_ORDER_LOOKUPS}): one that is closed (filled, canceled, never placed), or open but neither a
+ * perp stop-loss nor a partly filled entry with an attached stop-loss, takes nothing away. Read strictly: anything
+ * malformed (an entry without its filled size or attached orders included), or a trigger order of a type the frame
+ * doesn't know, throws {@link AccountBookError}, and nothing is signed. {@link readIsolatedPositions} reads the
+ * account's open isolated positions and their leverage, for a leverage change.
  *
  * @module
  */
@@ -64,19 +66,41 @@ function order(o: unknown): BookOrder {
   if (o.cloid !== undefined && o.cloid !== null && typeof o.cloid !== "string") throw new AccountBookError("Hyperliquid sent an unreadable open order");
   const trigger = o.isTrigger ? TRIGGER_TYPES[o.orderType] : null;
   if (trigger === undefined) throw new AccountBookError("Hyperliquid sent a trigger order of an unknown type");
+  const size = num(o.sz, "order size");
+  // An entry (a plain order that isn't reduce-only) must say how much of it filled and what is attached to it.
+  const entry = !o.isTrigger && !o.reduceOnly;
+  if ((o.children !== undefined || entry) && !Array.isArray(o.children)) throw new AccountBookError("Hyperliquid sent an unreadable open order");
+  if (entry && o.origSz === undefined) throw new AccountBookError("Hyperliquid sent an unreadable open order");
   return {
     coin: o.coin,
     oid: o.oid as number,
     ...(typeof o.cloid === "string" ? { cloid: o.cloid.toLowerCase() } : {}),
     isBuy: o.side === "B",
-    size: num(o.sz, "order size"),
+    size,
     isTrigger: o.isTrigger,
     ...(trigger !== null ? { triggerPrice: num(o.triggerPx, "trigger price"), tpsl: trigger.tpsl } : {}),
     isMarket: trigger?.isMarket ?? false,
     limitPrice: num(o.limitPx, "limit price"),
     reduceOnly: o.reduceOnly,
     positionTpsl: o.isPositionTpsl,
+    // How much has filled (`origSz − sz`; a position TP/SL's size is the position's; a trigger without `origSz`: none).
+    filledSize: o.origSz === undefined || o.isPositionTpsl ? 0 : Math.max(0, num(o.origSz, "order size") - size),
+    attachedStops: attachedStops(o.children),
   };
+}
+
+/**
+ * The oids of an order's attached stop-losses (Hyperliquid `children`, placed only once the order fills completely).
+ * Read cautiously: any child but a recognisable take-profit counts as one, and one without a readable oid as -1.
+ */
+function attachedStops(children: unknown): number[] {
+  const out: number[] = [];
+  for (const c of Array.isArray(children) ? children : []) {
+    const child = isRecord(c) ? c : {};
+    if (typeof child.orderType === "string" && TRIGGER_TYPES[child.orderType]?.tpsl === "tp") continue;
+    out.push(Number.isSafeInteger(child.oid) && (child.oid as number) >= 0 ? (child.oid as number) : -1);
+  }
+  return out;
 }
 
 function positions(state: unknown): AccountPosition[] {
@@ -88,7 +112,10 @@ function positions(state: unknown): AccountPosition[] {
   });
 }
 
-/** Whether the order `ref` names (as `orderStatus` answered for it) is open, and could be a perp stop-loss. */
+/**
+ * Whether the order `ref` names (as `orderStatus` answered for it) is open, and could take stop-loss cover away: a perp
+ * stop-loss, or a partly filled entry whose attached stop-loss a cancel takes with it.
+ */
 function orderState(r: unknown, ref: number | string): { open: boolean; mayBeStop: boolean } {
   if (isRecord(r) && r.status === "unknownOid") return { open: false, mayBeStop: false };
   if (!isRecord(r) || r.status !== "order" || !isRecord(r.order) || typeof r.order.status !== "string") throw new AccountBookError("Hyperliquid sent an unreadable order status");
@@ -98,7 +125,9 @@ function orderState(r: unknown, ref: number | string): { open: boolean; mayBeSto
   const parsed = parseCoin(o.coin);
   // A name the frame can't read might be a perp's.
   const perp = parsed === null || parsed.kind === "perp" || parsed.kind === "hip3";
-  return { open: !isFinalOrderStatus(r.order.status), mayBeStop: perp && o.isTrigger && o.tpsl === "sl" && (o.reduceOnly || o.positionTpsl) };
+  const stop = perp && o.isTrigger && o.tpsl === "sl" && (o.reduceOnly || o.positionTpsl);
+  const partlyFilledWithStop = !o.reduceOnly && o.filledSize > 0 && o.attachedStops.length > 0;
+  return { open: !isFinalOrderStatus(r.order.status), mayBeStop: stop || partlyFilledWithStop };
 }
 
 /** Reads the book of `account` for `intent` (see the module notes) with `info` (the frame's own `POST /info`). */
@@ -134,4 +163,26 @@ export async function readAccountBook(info: (body: Record<string, unknown>) => P
   }
   if (notStops.length > 0) book.notStops = notStops;
   return book;
+}
+
+/**
+ * The account's open isolated positions on `coin`'s dex, by coin, with the leverage each is at (`clearinghouseState`,
+ * read by the frame itself), for a leverage change (shared `isolatedPositionLeverage`). Spot and unknown coins: none.
+ * Read strictly: a position without a readable leverage throws {@link AccountBookError}.
+ */
+export async function readIsolatedPositions(info: (body: Record<string, unknown>) => Promise<unknown>, account: `0x${string}`, coin: string): Promise<Record<string, number>> {
+  const parsed = parseCoin(coin);
+  if (parsed?.kind !== "perp" && parsed?.kind !== "hip3") return {};
+  const state = await info({ type: "clearinghouseState", user: account, ...(parsed.kind === "hip3" ? { dex: parsed.dex } : {}) });
+  if (!isRecord(state) || !Array.isArray(state.assetPositions)) throw new AccountBookError("Hyperliquid sent unreadable positions");
+  const out: Record<string, number> = {};
+  for (const a of state.assetPositions as unknown[]) {
+    const p = isRecord(a) ? a.position : undefined;
+    const lev = isRecord(p) ? p.leverage : undefined;
+    if (!isRecord(p) || typeof p.coin !== "string" || !isRecord(lev) || (lev.type !== "cross" && lev.type !== "isolated") || !Number.isSafeInteger(lev.value) || (lev.value as number) < 1) {
+      throw new AccountBookError("Hyperliquid sent an unreadable position");
+    }
+    if (num(p.szi, "position size") !== 0 && lev.type === "isolated") out[p.coin] = lev.value as number;
+  }
+  return out;
 }

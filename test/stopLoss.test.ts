@@ -95,6 +95,21 @@ describe("stop-losses the user's limits require", () => {
   });
 });
 
+describe("partly filled entries with an attached stop-loss", () => {
+  it("refuses cancelling one while no stop on the book covers the position, which would cancel its stop too", async () => {
+    await ready();
+    // Long 0.07 BTC: a buy of 0.1 (oid 5) filled 0.07; its stop-loss (oid 92) waits for the rest.
+    h.hl.positions[ACCOUNT] = [{ coin: "BTC", szi: "0.07", entryPx: "100000.0" }];
+    const entry = openOrder({ oid: 5, side: "B", isTrigger: false, orderType: "Limit", triggerPx: "0.0", reduceOnly: false, limitPx: "100000.0", sz: "0.03", origSz: "0.1", children: [openOrder({ oid: 92 })] });
+    h.hl.openOrders[ACCOUNT] = [entry];
+    const e = await h.fail("signAndSubmit", { requestId: "c", intent: cancel(5) });
+    expect(codes(e)).toEqual(["STOP_LOSS_REQUIRED"]);
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    h.hl.openOrders[ACCOUNT] = [entry, openOrder({ oid: 77, sz: "0.07", origSz: "0.07" })];
+    expect((await h.ok("signAndSubmit", { requestId: "c2", intent: cancel(5) })).status).toBe("ok");
+  });
+});
+
 describe("readAccountBook", () => {
   const answering = (answers: Record<string, unknown>) => async (body: Record<string, unknown>) => {
     const a = answers[String(body.type)];
@@ -115,10 +130,33 @@ describe("readAccountBook", () => {
     );
     expect(book.positions).toEqual([{ coin: "BTC", size: -0.5, entryPrice: 100_000 }]);
     expect(book.orders).toEqual([
-      { coin: "BTC", oid: 77, cloid: "0x6b6f0101000000000000000000000001", isBuy: true, size: 0, isTrigger: true, triggerPrice: 95_000, tpsl: "sl", isMarket: true, limitPrice: 85_500, reduceOnly: true, positionTpsl: true },
-      { coin: "BTC", oid: 5, isBuy: false, size: 0.1, isTrigger: true, triggerPrice: 95_000, tpsl: "sl", isMarket: false, limitPrice: 94_000, reduceOnly: true, positionTpsl: false },
+      { coin: "BTC", oid: 77, cloid: "0x6b6f0101000000000000000000000001", isBuy: true, size: 0, isTrigger: true, triggerPrice: 95_000, tpsl: "sl", isMarket: true, limitPrice: 85_500, reduceOnly: true, positionTpsl: true, filledSize: 0, attachedStops: [] },
+      { coin: "BTC", oid: 5, isBuy: false, size: 0.1, isTrigger: true, triggerPrice: 95_000, tpsl: "sl", isMarket: false, limitPrice: 94_000, reduceOnly: true, positionTpsl: false, filledSize: 0, attachedStops: [] },
     ]);
     expect(book.notStops).toEqual([6]);
+  });
+
+  it("reads how much of an entry filled and the stop-losses attached to it, and looks those up too", async () => {
+    const children = [openOrder({ oid: 91, orderType: "Take Profit Market" }), openOrder({ oid: 92 }), { oid: "odd" }];
+    const entry = openOrder({ oid: 5, side: "B", isTrigger: false, orderType: "Limit", triggerPx: "0.0", reduceOnly: false, sz: "0.03", origSz: "0.1", children });
+    const book = await readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [entry] }), ACCOUNT, { kind: "cancel", cancels: [{ coin: "BTC", oid: 5 }], origin: "manual" });
+    expect(book.orders[0]).toMatchObject({ oid: 5, size: 0.03, attachedStops: [92, -1] });
+    expect(book.orders[0]!.filledSize).toBeCloseTo(0.07, 12);
+    // Not on the markets read: looked up on its own, it isn't harmless.
+    const status = { status: "order", order: { order: entry, status: "open", statusTimestamp: 0 } };
+    expect((await readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [], orderStatus: status }), ACCOUNT, { kind: "cancel", cancels: [{ coin: "BTC", oid: 5 }], origin: "manual" })).notStops).toBeUndefined();
+    const unfilled = { status: "order", order: { order: { ...entry, sz: "0.1" }, status: "open", statusTimestamp: 0 } };
+    expect((await readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [], orderStatus: unfilled }), ACCOUNT, { kind: "cancel", cancels: [{ coin: "BTC", oid: 5 }], origin: "manual" })).notStops).toEqual([5]);
+    const named = { kind: "cancel" as const, cancels: [{ coin: "BTC", oid: 5 }], origin: "manual" as const };
+    await expect(readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [{ ...entry, origSz: "x" }] }), ACCOUNT, named)).rejects.toThrow();
+    await expect(readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [{ ...entry, children: "x" }] }), ACCOUNT, named)).rejects.toThrow();
+    // An entry that doesn't say how much filled, or what is attached to it, is unreadable; a stop may leave them out.
+    const { origSz: _o, ...noOrigSz } = entry;
+    const { children: _c, ...noChildren } = entry;
+    await expect(readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [noOrigSz] }), ACCOUNT, named)).rejects.toThrow();
+    await expect(readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [noChildren] }), ACCOUNT, named)).rejects.toThrow();
+    const { origSz: _s, children: _k, ...bareStop } = openOrder();
+    expect((await readAccountBook(answering({ clearinghouseState: state, frontendOpenOrders: [bareStop] }), ACCOUNT, { kind: "cancel" as const, cancels: [{ coin: "BTC", oid: 77 }], origin: "manual" as const })).orders[0]).toMatchObject({ filledSize: 0, attachedStops: [] });
   });
 
   it("keeps an open stop on another market out of notStops, and looks up at most 10 orders", async () => {
