@@ -40,6 +40,8 @@ import {
   type RequestMessage,
   type RevokeParams,
   type RevokeResult,
+  type SetConfirmLimitParams,
+  type SetConfirmLimitResult,
   type SetLimitsParams,
   type SetLimitsResult,
   type SetStorageModeParams,
@@ -145,7 +147,7 @@ interface Pending {
 }
 
 /** Methods without effects outside the frame's memory: after a reload the client sends them again to the new frame. */
-const RESEND_AFTER_RELOAD: ReadonlySet<MethodName> = new Set<MethodName>(["getStatus", "setLimits", "setTheme", "lock", "confirmAgent"]);
+const RESEND_AFTER_RELOAD: ReadonlySet<MethodName> = new Set<MethodName>(["getStatus", "setLimits", "setConfirmLimit", "setTheme", "lock", "confirmAgent"]);
 
 type Listener<E extends ClientEventName> = (data: ClientEventData[E]) => void;
 
@@ -318,6 +320,17 @@ export class KokoahSignerClient {
    */
   setLimits(params: SetLimitsParams): Promise<SetLimitsResult> {
     return this.request("setLimits", params, this.options.interactiveTimeoutMs);
+  }
+
+  /**
+   * Sets the key's master's order confirmation limit (`hello.capabilities.setsConfirmLimit`; see
+   * `SetConfirmLimitParams`). Lower or identical answers at once; higher waits for the user's click on the frame's
+   * prompt, and above `CONFIRM_LIMIT.defaultUsd` needs the master wallet's signature of `confirmLimitMessage` too:
+   * keep the iframe visible while `promptChanged.visible`. The result (and `status.confirmLimit`) gives the limit in
+   * force and a raise still waiting.
+   */
+  setConfirmLimit(params: SetConfirmLimitParams): Promise<SetConfirmLimitResult> {
+    return this.request("setConfirmLimit", params, this.options.interactiveTimeoutMs);
   }
 
   /**

@@ -9,6 +9,7 @@ import { LINK_PAIRING_ID_PATTERN, LINK_SECRET_PATTERN } from "@kokoah/shared/lin
 import * as v from "valibot";
 import {
   BASELINE_ACTION_TYPES,
+  CONFIRM_LIMIT,
   ID_PATTERN,
   MAX_AGENT_NAME_LENGTH,
   MAX_CONFIRM_TIMEOUT_MS,
@@ -99,6 +100,16 @@ export const PARAMS_SCHEMAS = {
   }),
   setStorageMode: v.strictObject({
     to: v.picklist(["passkey", "device"]),
+  }),
+  setConfirmLimit: v.strictObject({
+    usd: v.pipe(v.number(), v.integer(), v.minValue(CONFIRM_LIMIT.minUsd), v.maxValue(CONFIRM_LIMIT.maxUsd)),
+    authorization: v.optional(
+      v.strictObject({
+        usd: v.pipe(v.number(), v.integer(), v.minValue(CONFIRM_LIMIT.minUsd), v.maxValue(CONFIRM_LIMIT.maxUsd)),
+        issuedAt: v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(Number.MAX_SAFE_INTEGER)),
+        signature: v.pipe(v.string(), v.regex(/^0x[0-9a-fA-F]{130}$/, "signature must be a 65-byte hex signature")),
+      }),
+    ),
   }),
   setTheme: v.strictObject({
     variables: v.optional(v.record(v.picklist(THEME_VARIABLES), v.pipe(v.string(), v.maxLength(120)))),

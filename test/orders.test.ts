@@ -52,7 +52,7 @@ describe("large orders", () => {
     expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Confirm: Buy 0.3 BTC, $30,000");
     expect(h.root?.querySelector(".ks-primary")?.textContent).toBe("Buy 0.3 BTC");
     const text = h.promptText();
-    expect(text).toContain("The Kokoah app asks to send this order to Hyperliquid. Confirm only if you placed it.");
+    expect(text).toContain("The Kokoah app asks to send this order to Hyperliquid. Orders above $25,000 need your confirmation. Confirm only if you placed it.");
     expect(text).toContain("Buy 0.3 BTC at $100,000 (limit) · about $30,000");
     expect(h.root?.querySelector(".ks-prompt")?.classList.contains("ks-prompt--fixed")).toBe(true);
     expect(h.root?.querySelector(".ks-primary")?.classList.contains("ks-hold")).toBe(true);

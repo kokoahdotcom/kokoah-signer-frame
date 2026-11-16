@@ -70,7 +70,30 @@ export interface StoredLimitsRecord {
    * sub-account's trading counts against the master's daily limit too.
    */
   dailyOnTop?: string[];
+  /**
+   * The order confirmation limit of one master (setConfirmLimit, 2026-11-16): `usd` in force (above the default only
+   * with `granted`, the master wallet's signature that allowed it), `since` the last time it was lowered or set on this
+   * device (a raise signed before that is stale), and `raise`, a raise the user confirmed, in force from `effectiveAt`.
+   * Every signature is checked again whenever the record is read. Missing: the default for every master.
+   */
+  confirm?: StoredConfirmLimit;
   updatedAt: number;
+}
+
+/** The master wallet's signature of a confirmation limit (`signedUsd`), made at `issuedAt`. */
+export interface ConfirmLimitSignature {
+  signedUsd: number;
+  issuedAt: number;
+  signature: `0x${string}`;
+}
+
+/** See {@link StoredLimitsRecord.confirm}. */
+export interface StoredConfirmLimit {
+  master: `0x${string}`;
+  usd: number;
+  since: number;
+  granted?: ConfirmLimitSignature;
+  raise?: ConfirmLimitSignature & { usd: number; effectiveAt: number };
 }
 
 /** Slot of a network's limits record in the `keys` store. */
