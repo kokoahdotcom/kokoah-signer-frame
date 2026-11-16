@@ -810,7 +810,7 @@ export function isFrameToParentMessage(x: unknown): x is FrameToParentMessage {
  * The bounds of the order confirmation limit. `defaultUsd` is the frame's own (`hello.limits.confirmOrdersAboveUsd`);
  * the rolling totals follow from the limit in force: `recentFactor` times it in the last 10 minutes, `dailyFactor`
  * times it in 24 hours. A raise above the default takes effect `delayMs` after the user confirms it in the frame's
- * prompt (on the frame's clock; never sooner than `delayMs` after the wallet signed), and a signature older than
+ * prompt (from HL's time read then; never sooner than `delayMs` after the wallet signed), and a signature older than
  * `signatureMaxAgeMs` (or more than `signatureFutureMs` ahead of the frame's clock) is refused.
  */
 export const CONFIRM_LIMIT = Object.freeze({
@@ -838,8 +838,8 @@ export interface ConfirmLimitStatus {
 
 /**
  * Sets the order confirmation limit of the key's master. Needs an active key, one HL lists for that master (`NO_KEY`,
- * `KEY_PENDING`, `KEY_EXPIRED`), and the frame's clock checked with HL in this load (`HL_UNAVAILABLE`, retryable). An
- * integer from `CONFIRM_LIMIT.minUsd` to `CONFIRM_LIMIT.maxUsd`.
+ * `KEY_PENDING`, `KEY_EXPIRED`); a raise above the default also HL's time (`HL_UNAVAILABLE`, retryable). An integer
+ * from `CONFIRM_LIMIT.minUsd` to `CONFIRM_LIMIT.maxUsd`, compared with the limit stored for this master.
  * - Lower than the limit in force: applied at once, no prompt; it also drops a raise still waiting.
  * - The same limit (and the same waiting raise): nothing changes (send it again at every handshake).
  * - Higher, up to `CONFIRM_LIMIT.defaultUsd`: the frame's own prompt (`promptChanged` kind `limits`), then at once.

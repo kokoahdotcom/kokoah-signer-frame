@@ -789,21 +789,19 @@ export class FrameCore {
     this.clockSync = (async () => {
       try {
         const t0 = this.now();
-        const m0 = this.monotonicNow();
         const r = await this.hl.info({ type: "exchangeStatus" });
         const t1 = this.now();
         const m1 = this.monotonicNow();
         if (isRecord(r) && typeof r.time === "number" && Number.isFinite(r.time) && r.time > 0) {
-          const first = this.clockSyncedMono === null;
+          const shown = stableStringify(this.confirmLimitNow());
           this.clockOffsetMs = Math.round(r.time - (t0 + t1) / 2);
           this.clockSyncedAt = t1;
+          // HL's time is at least r.time when the answer arrives: anchored there, the monotonic clock never runs ahead.
           this.clockSyncedHl = r.time;
-          this.clockSyncedMono = (m0 + m1) / 2;
+          this.clockSyncedMono = m1;
           this.log("clock.synced", { offsetMs: this.clockOffsetMs });
-          // A raise of the confirmation limit can count from now on (confirmEarliest): tell the parent.
-          const k = this.key;
-          const own = k === null ? undefined : this.confirm.masters.get(k.meta.userAddress.toLowerCase());
-          if (first && (own?.raise !== undefined || own?.granted !== undefined)) this.confirmStatusChanged();
+          // The confirmation limit in force may change with the new check (a raise whose time came): tell the parent.
+          if (stableStringify(this.confirmLimitNow()) !== shown) this.confirmStatusChanged();
           else this.scheduleConfirmTimer();
         }
       } catch {
@@ -1866,14 +1864,16 @@ export class FrameCore {
   /**
    * Sets the order confirmation limit of the key's master (protocol `SetConfirmLimitParams`). Needs an active key (HL
    * lists it for that master). Stored per master in its own record, compare-and-set like the limits and in the same
-   * queues, so every tab sees it at its next signature:
-   * - lower than the limit in force, or equal to it while a raise waits: at once (a waiting raise is dropped, and no
-   *   signature made before this change can raise the limit again on this device);
-   * - the limit in force, or the same waiting raise again: nothing changes;
+   * queues, so every tab sees it at its next signature. Compared with what is stored, so a change answered as done is
+   * always stored:
+   * - the stored limit with no raise waiting, or the same waiting raise again: nothing changes;
+   * - at most the stored limit or the limit in force: at once, no prompt (a waiting raise is dropped, and no signature
+   *   made before this change can raise the limit again on this device);
    * - higher, up to the default: the frame's own prompt, then at once;
    * - higher than the default: the master wallet's signature is checked first (this master's, at most a week old, not
-   *   ahead of the clock, not older than the last change on this device), then the frame's own prompt; the raise takes
-   *   effect a day after the user confirms it, on the frame's own clock, and the limit in force stays until then.
+   *   ahead of the clock, not older than the last change on this device), then the frame's own prompt; right after it
+   *   the frame reads HL's time, and the raise takes effect a day after that (`HL_UNAVAILABLE`, nothing stored, when
+   *   it can't), the limit in force staying until then.
    */
   private async setConfirmLimit(p: SetConfirmLimitParams): Promise<SetConfirmLimitResult> {
     await this.ensureClock();
@@ -1882,23 +1882,19 @@ export class FrameCore {
     const state = this.keyStateOf(key);
     if (state === "expired") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; create a new one to set your confirmation limit.");
     if (state !== "active") throw new SignerFailure("KEY_PENDING", "The trading key is not confirmed yet; approve it with the main wallet and call confirmAgent first.");
-    // Every change is judged and dated on a clock checked with HL in this load (confirmEarliest), checked again when old.
-    if (this.clockSyncedMono !== null && this.monotonicNow() - this.clockSyncedMono > CLOCK_RESYNC_MS) await this.syncClock();
-    if (this.clockSyncedMono === null) {
-      throw new SignerFailure("HL_UNAVAILABLE", "The signer couldn't check the time with Hyperliquid, so nothing was changed. Try again shortly.", { retryable: true });
-    }
     const agent = key.meta.agentAddress;
     const master = key.meta.userAddress.toLowerCase();
-    let confirmedRev: number | undefined;
+    let confirmed: { rev: number; hlTime?: number } | undefined;
     for (let attempt = 0; attempt < MAX_LIMITS_ATTEMPTS; attempt++) {
-      let step = await this.serialized("limits", () => this.confirmLimitStep(agent, master, p, confirmedRev));
+      let step = await this.serialized("limits", () => this.confirmLimitStep(agent, master, p, confirmed));
       if (step.kind === "confirm") {
-        const { before, title, body } = step;
+        const { before, title, body, dated } = step;
         step = await this.serialized("limitsPrompt", async () => {
           if ((await this.readConfirm()).rev !== before.rev) return { kind: "retry" as const };
           await this.prompt("limits", { title, body, actionLabel: "Raise limit", confirmText: "raise limit", fixedStyle: true, hold: true }, async () => undefined);
-          confirmedRev = before.rev;
-          return await this.serialized("limits", () => this.confirmLimitStep(agent, master, p, confirmedRev));
+          // A raise's day counts from HL's own time, read after the user confirmed (no local clock is trusted with it).
+          confirmed = dated ? { rev: before.rev, hlTime: await this.hlTimeNow() } : { rev: before.rev };
+          return await this.serialized("limits", () => this.confirmLimitStep(agent, master, p, confirmed));
         });
       }
       if (step.kind === "done") return { confirmLimit: confirmLimitOf(this.confirm.masters.get(master), this.confirmEarliest()) };
@@ -1907,17 +1903,29 @@ export class FrameCore {
     throw new SignerFailure("SIGNER_BUSY", "Your limits kept changing in another tab; nothing was changed. Try again.", { retryable: true, details: { reason: "limitsChanged" } });
   }
 
+  /** HL's time from a request made now (never one already under way), or HL_UNAVAILABLE. */
+  private async hlTimeNow(): Promise<number> {
+    try {
+      const r = await this.hl.info({ type: "exchangeStatus" });
+      if (isRecord(r) && typeof r.time === "number" && Number.isFinite(r.time) && r.time > 0) return Math.floor(r.time);
+    } catch {
+      // Below.
+    }
+    throw new SignerFailure("HL_UNAVAILABLE", "The signer couldn't read the time from Hyperliquid after you confirmed, so nothing was changed. Try again shortly.", { retryable: true });
+  }
+
   /**
    * One attempt of `setConfirmLimit`, in this tab's limits queue: compares with the stored limit, then writes it, or
-   * asks for the user's confirmation (`confirm`, with the prompt's text). `retry`: another tab wrote first.
-   * `confirmedRev`: the revision the user confirmed a raise against (any other one is SIGNER_BUSY).
+   * asks for the user's confirmation (`confirm`, with the prompt's text; `dated`: a raise whose day needs HL's time).
+   * `retry`: another tab wrote first. `confirmed`: the revision the user confirmed a raise against (any other one is
+   * SIGNER_BUSY), with HL's time read after that.
    */
   private async confirmLimitStep(
     agent: Hex,
     master: string,
     p: SetConfirmLimitParams,
-    confirmedRev: number | undefined,
-  ): Promise<{ kind: "done" | "retry" } | { kind: "confirm"; before: ConfirmState; title: string; body: string }> {
+    confirmed: { rev: number; hlTime?: number } | undefined,
+  ): Promise<{ kind: "done" | "retry" } | { kind: "confirm"; before: ConfirmState; title: string; body: string; dated: boolean }> {
     const k = this.key;
     if (!k || k.meta.agentAddress !== agent || this.keyStateOf(k) !== "active") {
       throw new SignerFailure("SIGNER_BUSY", "The trading key changed; nothing was changed. Try again.", { retryable: true, details: { reason: "keyChanged" } });
@@ -1926,29 +1934,32 @@ export class FrameCore {
     const now = this.correctedNow();
     const network = this.config.network.name;
     const own = before.masters.get(master);
-    // In force by the earlier clock; dated with the later (confirmEarliest).
+    // In force by the earlier clock; changes dated with the later (confirmEarliest).
     const early = this.confirmEarliest(now);
     const late = this.confirmLatest(now);
     const inForce = confirmLimitOf(own, early);
     const grant = confirmGrantOf(own, early);
+    const stored = own?.usd ?? CONFIRM_LIMIT.defaultUsd;
     const target = p.usd;
-    // The limit in force with no raise waiting: nothing to change (the app sends the user's setting at every handshake).
-    if (target === inForce.usd && inForce.pending === undefined) return { kind: "done" };
+    // The stored limit with no raise waiting: nothing to change (the app sends the user's setting at every handshake).
+    if (target === stored && own?.raise === undefined) return { kind: "done" };
     // A change that isn't a new raise: no signature made before it raises the limit again on this device, including a
     // waiting raise's own (dated up to five minutes ahead).
     const since = Math.max(own?.since ?? 0, late, own?.raise ? own.raise.issuedAt + 1 : 0);
     let next: StoredConfirmLimit;
-    let ask: { title: string; body: string } | undefined;
-    if (target <= inForce.usd) {
-      // Lower, or the limit in force while a raise waits (which drops it): at once, no prompt. Above the default it
-      // keeps the signature that allows it.
-      next = { usd: target, since, at: now, ...(target > CONFIRM_LIMIT.defaultUsd && grant ? { granted: grant } : {}) };
+    let ask: { title: string; body: string; dated: boolean } | undefined;
+    if (target <= stored || target <= inForce.usd) {
+      // No higher than what is stored or in force (a waiting raise is dropped): at once, no prompt. Above the default it
+      // keeps the signature that allows it: the stored limit's, or the raise's in force.
+      const allows = target <= stored ? own?.granted : grant;
+      next = { usd: target, since, at: now, ...(target > CONFIRM_LIMIT.defaultUsd && allows ? { granted: allows } : {}) };
     } else if (target <= CONFIRM_LIMIT.defaultUsd) {
       // Back up toward the default: the frame's own prompt, as for the other limits.
       next = { usd: target, since, at: now };
       ask = {
         title: "Raise your confirmation limit?",
         body: `The Kokoah app asks to raise your confirmation limit on this device. Confirm only if you asked for this.\n\nOrders that need your confirmation: above ${dollars(inForce.usd)} → above ${dollars(target)}`,
+        dated: false,
       };
     } else {
       const auth = p.authorization;
@@ -1962,6 +1973,10 @@ export class FrameCore {
       if (r !== undefined && r.usd === target && r.signedUsd === signedUsd && r.issuedAt === issuedAt && r.signature.toLowerCase() === signature.toLowerCase()) {
         return { kind: "done" };
       }
+      // The signature's age is judged on a clock checked with HL in this load.
+      if (this.clockSyncedMono === null) {
+        throw new SignerFailure("HL_UNAVAILABLE", "The signer couldn't check the time with Hyperliquid, so nothing was changed. Try again shortly.", { retryable: true });
+      }
       if (late - issuedAt > CONFIRM_LIMIT.signatureMaxAgeMs || issuedAt - now > CONFIRM_LIMIT.signatureFutureMs) {
         refuse("expired", "Your wallet's signature for this limit is too old (or dated ahead); sign it again.");
       }
@@ -1969,15 +1984,17 @@ export class FrameCore {
       if (!(await this.confirmSignatureValid(master as Hex, signedUsd, issuedAt, signature))) {
         refuse("signature", "The signature for this limit is not your wallet's; nothing was changed.");
       }
-      // A day from now, when the user confirms (this step runs again then), on the frame's own clock: never less, however
-      // long ago the wallet signed.
-      const effectiveAt = Math.max(issuedAt, late) + CONFIRM_LIMIT.delayMs;
-      // The limit in force (and what allows it) stays until then; an older signature can't replace this raise.
+      // A day after HL's time read once the user confirmed (this step runs again then), never sooner than a day after the
+      // wallet signed. Before the prompt, for its text: about a day from now.
+      const effectiveAt = Math.max(issuedAt, confirmed?.hlTime ?? late) + CONFIRM_LIMIT.delayMs;
+      // What counts until then stays: the stored limit (and the signature that allows it), or a raise in force above it.
+      const base = inForce.usd > stored ? { usd: inForce.usd, granted: grant } : { usd: stored, granted: own?.granted };
       next = {
-        usd: inForce.usd,
+        usd: base.usd,
+        // An older signature can't replace this raise.
         since: Math.max(own?.since ?? 0, issuedAt),
         at: now,
-        ...(inForce.usd > CONFIRM_LIMIT.defaultUsd && grant ? { granted: grant } : {}),
+        ...(base.usd > CONFIRM_LIMIT.defaultUsd && base.granted ? { granted: base.granted } : {}),
         raise: { usd: target, signedUsd, issuedAt, signature, effectiveAt },
       };
       ask = {
@@ -1987,10 +2004,11 @@ export class FrameCore {
           `Orders that need your confirmation: above ${dollars(inForce.usd)} → above ${dollars(target)}\n` +
           `Your wallet signed it: ${utcMinute(issuedAt)}\n` +
           `It takes effect 24 hours after you confirm (about ${utcMinute(effectiveAt)}). Until then orders above ${dollars(inForce.usd)} keep asking; you can cancel it in your Kokoah settings.`,
+        dated: true,
       };
     }
-    if (ask !== undefined && confirmedRev !== before.rev) {
-      if (confirmedRev !== undefined) {
+    if (ask !== undefined && (confirmed === undefined || confirmed.rev !== before.rev || (ask.dated && confirmed.hlTime === undefined))) {
+      if (confirmed !== undefined) {
         throw new SignerFailure("SIGNER_BUSY", "Your limits changed in another tab while you were confirming; nothing was changed. Try again.", {
           retryable: true,
           details: { reason: "limitsChanged" },

@@ -451,7 +451,7 @@ describe("the order confirmation limit", () => {
     expect((await status())?.usd).toBe(150_000);
   });
 
-  it("changes nothing at all before the clock is checked, so a lowering is never answered without being stored", async () => {
+  it("lowers before the clock is checked, compared with what is stored, and stores every change it answers", async () => {
     const clock = new Clock();
     const hl = new MockHl(clock);
     await ready({ clock, hl });
@@ -465,10 +465,78 @@ describe("the order confirmation limit", () => {
     h = await FrameHarness.create({ clock, hl, idb });
     await h.ok("hello", { protocolVersion: 1 });
     expect((await status())?.usd).toBe(25_000); // nothing above the default counts yet
-    for (const usd of [25_000, 50_000, 10_000]) expect((await h.fail("setConfirmLimit", { usd })).code).toBe("HL_UNAVAILABLE");
+    // The stored $100,000 again: nothing to change. Lower ones: stored at once.
+    await h.ok("setConfirmLimit", { usd: 100_000, authorization: raise });
+    await h.ok("setConfirmLimit", { usd: 50_000, authorization: raise });
+    await h.ok("setConfirmLimit", { usd: 25_000 });
+    // A raise above the default needs HL's time.
+    expect((await h.fail("setConfirmLimit", { usd: 150_000, authorization: await signed(150_000) })).code).toBe("HL_UNAVAILABLE");
     hl.infoFailure = null;
-    expect((await h.ok("setConfirmLimit", { usd: 25_000 })).confirmLimit).toEqual({ usd: 25_000, recentUsd: 100_000, dailyUsd: 250_000 });
-    expect(await asked("lowered", "0.9")).toBe(true); // $90,000 asks
+    expect(await asked("lowered", "0.9")).toBe(true); // $90,000 asks: the $25,000 was stored
+    expect((await status())?.usd).toBe(25_000);
+  });
+
+  it("compares a change with what is stored even when a clock is behind, so a lowering is never answered without being stored", async () => {
+    const clock = new Clock();
+    const hl = new MockHl(clock);
+    let mono = 0;
+    await ready({ clock, hl, monotonic: () => mono });
+    const raise = await signed(150_000);
+    await confirmed({ usd: 150_000, authorization: raise });
+    clock.advance(DAY + MINUTE);
+    mono += DAY + MINUTE;
+    await h.ok("setConfirmLimit", { usd: 100_000, authorization: raise });
+    // The monotonic clock stops for a day (the device slept), and HL's time can't be read again.
+    hl.infoFailure = (body) => body.type === "exchangeStatus";
+    clock.advance(DAY);
+    expect((await status())?.usd).toBe(100_000);
+    await h.ok("setConfirmLimit", { usd: 25_000 });
+    mono += DAY;
+    expect((await status())?.usd).toBe(25_000);
+    hl.infoFailure = null;
+    expect(await asked("x", "0.9")).toBe(true);
+  });
+
+  it("dates a raise with HL's time read after the user confirms, whatever the local clocks say", async () => {
+    const clock = new Clock();
+    const hl = new MockHl(clock);
+    let mono = 0;
+    await ready({ clock, hl, monotonic: () => mono });
+    // Both local clocks fall 16 hours behind HL (a sleep that stopped both, with no check since).
+    hl.serverOffsetMs += 16 * HOUR;
+    // The app dates the wallet's signature with the same local clock.
+    const pending = h.request("setConfirmLimit", { usd: 150_000, authorization: await signed(150_000, clock.now()) });
+    await h.clickPrompt();
+    expect((await pending).ok).toBe(true);
+    expect((await status())?.pending?.effectiveAt).toBe(clock.now() + hl.serverOffsetMs + DAY);
+    // HL's time can't be read after the confirmation: nothing is stored.
+    await h.ok("setConfirmLimit", { usd: 25_000 });
+    clock.advance(MINUTE);
+    mono += MINUTE;
+    const again = h.request("setConfirmLimit", { usd: 150_000, authorization: await signed(150_000, clock.now()) });
+    await waitFor(() => h.promptText() !== "");
+    hl.infoFailure = (body) => body.type === "exchangeStatus";
+    await h.clickPrompt();
+    const r = await again;
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatchObject({ code: "HL_UNAVAILABLE", retryable: true });
+    expect((await status())?.pending).toBeUndefined();
+  });
+
+  it("tells the parent when a new clock check puts a waiting raise in force", async () => {
+    const clock = new Clock();
+    const hl = new MockHl(clock);
+    let mono = 0;
+    await ready({ clock, hl, monotonic: () => mono });
+    await confirmed({ usd: 150_000, authorization: await signed(150_000) });
+    // A day passes while the monotonic clock stops: still waiting by it.
+    clock.advance(DAY + MINUTE);
+    expect((await status())?.pending).toBeDefined();
+    const before = h.events("statusChanged").length;
+    await h.core.syncClock();
+    expect(h.events("statusChanged").length).toBeGreaterThan(before);
+    expect(h.events("statusChanged").at(-1)?.confirmLimit?.usd).toBe(150_000);
+    expect(idleText()).toContain("confirms orders above $150,000");
   });
 
   it("doesn't wake up again and again before the clock is checked", async () => {
