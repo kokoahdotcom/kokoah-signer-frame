@@ -148,6 +148,12 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 /** setTimeout's maximum delay. */
 const MAX_TIMER_MS = 2 ** 31 - 1;
 const CLOCK_RESYNC_MS = 5 * 60 * 1000;
+/**
+ * A first clock check that failed (HL didn't answer) is tried again after this, doubling up to CLOCK_RETRY_MAX_MS:
+ * until it succeeds, nothing above the default confirmation limit counts and the parent can't raise it.
+ */
+const CLOCK_RETRY_FIRST_MS = 1_000;
+const CLOCK_RETRY_MAX_MS = 60_000;
 /** The two clocks (confirmEarliest) apart by more than this: the clock is checked with HL again. */
 const CLOCK_DISAGREE_MS = 60 * 1000;
 const CONFIRM_POLL_MS = 1_000;
@@ -397,6 +403,9 @@ export class FrameCore {
   private expiryTimer: ReturnType<typeof setTimeout> | undefined;
   /** Emits statusChanged when a waiting raise of the key's master's confirmation limit takes effect. */
   private confirmTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The next try of a first clock check that failed, and how many tries came before it (retryClockLater). */
+  private clockRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  private clockRetries = 0;
   /** Confirmation limit signatures already checked, by master, limit, time, network and signature. */
   private readonly confirmSignatures = new Map<string, boolean>();
   private notifiedExpiringFor: string | null = null;
@@ -464,6 +473,7 @@ export class FrameCore {
     this.destroyed = true;
     clearTimeout(this.expiryTimer);
     clearTimeout(this.confirmTimer);
+    clearTimeout(this.clockRetryTimer);
     if (this.deps.broadcast) {
       this.deps.broadcast.onmessage = null;
       this.deps.broadcast.close();
@@ -829,9 +839,24 @@ export class FrameCore {
         // Keep the previous offset.
       } finally {
         this.clockSync = null;
+        // The first check didn't succeed: tried again later by itself, so the status settles without waiting for the
+        // next action (an order, a limit change).
+        if (this.clockSyncedMono === null) this.retryClockLater();
+        else this.clockRetries = 0;
       }
     })();
     return this.clockSync;
+  }
+
+  /** Schedules the next try of a first clock check that failed, with a growing pause (one at a time). */
+  private retryClockLater(): void {
+    if (this.destroyed || this.clockRetryTimer !== undefined) return;
+    const wait = Math.min(CLOCK_RETRY_MAX_MS, CLOCK_RETRY_FIRST_MS * 2 ** this.clockRetries);
+    this.clockRetries++;
+    this.clockRetryTimer = setTimeout(() => {
+      this.clockRetryTimer = undefined;
+      if (!this.destroyed && this.clockSyncedMono === null) void this.syncClock();
+    }, wait);
   }
 
   /** Refuses with REGION_BLOCKED when Kokoah's region check doesn't allow this visitor to add risk. */
