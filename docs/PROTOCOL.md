@@ -641,13 +641,16 @@ list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE`
 Sizes and prices must already be valid for the market (shared `formatSize`, `checkPrice`). The frame rejects them rather than sign a different number than the user saw.
 
 **Large orders** (`hello.capabilities.confirmsLargeOrders`). When the orders of one action come to more than
-`hello.limits.confirmOrdersAboveUsd` ($25,000) in all, each counted as size × max(limit price, trigger price, mark) and
+`hello.limits.confirmOrdersAboveUsd` ($25,000) in all (with `hello.capabilities.setsConfirmLimit`, the key's master's
+own limit, `status.confirmLimit.usd`: see `setConfirmLimit`), each counted as size × max(limit price, trigger price, mark) and
 reduce-only orders included (a $10,000 entry with a take-profit and a stop-loss counts about $30,000), the frame signs
 them only after the user confirms its own prompt (`promptChanged` kind `order`, fixed styling, press and hold). The
 prompt lists each order as it will be signed, for example `Buy 0.3 BTC at $100,000 (limit) · about $30,000` or
 `Sell 0.3 BTC at market, down to $99,010 · reduce-only · about $30,000`, with the sub-account if any; its title gives
 the first order's side, size and market and the total (`Confirm: Buy 0.3 BTC + 2 more, $93,000`) and its button the
-same order (`Buy 0.3 BTC + 2`), so they show even when the parent leaves the prompt little room (2026-10-30).
+same order (`Buy 0.3 BTC + 2`), so they show even when the parent leaves the prompt little room (2026-10-30). Its
+text gives the reason that applies: the size (`Orders above $25,000 need your confirmation.`, with what went out
+without a confirmation lately when there was any), else the rolling total below (2026-11-16).
 - It asks only about orders its rules allow (checked first) and doesn't hold up other requests meanwhile (a smaller
   order or a cancel signs at once; a second large order while one is asked about is `PROMPT_BUSY`).
 - After the user confirms, it reads prices, dexes and leverage again and checks everything again under the agent lock:
@@ -664,7 +667,8 @@ same order (`Buy 0.3 BTC + 2`), so they show even when the parent leaves the pro
 totals of the orders it signed without a prompt in the last `hello.limits.recentOrdersWindowMs` (10 minutes) and the
 last 24 hours, counted as above, across every account of the key's master, in every tab and across reloads and new
 keys. Orders that would take the first above `hello.limits.confirmRecentOrdersAboveUsd` ($100,000), or the second above
-`hello.limits.confirmDailyOrdersAboveUsd` ($250,000), wait for the same `order` prompt, which then also says how much
+`hello.limits.confirmDailyOrdersAboveUsd` ($250,000) (with `setsConfirmLimit`: `status.confirmLimit.recentUsd` and
+`dailyUsd`, 4 and 10 times the master's limit), wait for the same `order` prompt, which then also says how much
 went out without a confirmation in that time; confirming it starts both totals again (confirming a large order whose
 prompt didn't show them leaves them). Confirmed orders never count. So a hijacked page can't trade large amounts as
 many orders just under $25,000, however it spreads them out: at most $250,000 a day without the user. A frame without a UI refuses them (`POLICY_DENIED`,
@@ -779,6 +783,48 @@ last for this frame load only.
   - `SIGNER_BUSY` (retryable): the stored limits changed while the user was confirming, or kept changing in other tabs;
   - `STORAGE_FAILED` (retryable): the stored limits could not be read or written; nothing changed;
   - `NO_KEY` (a sub-account's limits without a key), `INVALID_REQUEST`.
+
+### `setConfirmLimit`
+
+The order confirmation limit (`hello.capabilities.setsConfirmLimit`, 2026-11-16): the size above which one
+`signAndSubmit`'s orders wait for the `order` prompt, for the key's master (needs a key: `NO_KEY`). The rolling totals
+follow it: 4 times it in the last 10 minutes, 10 times it in 24 hours.
+
+→ `{ "usd": 150000, "authorization": { "usd": 150000, "issuedAt": 1794830400000, "signature": "0x…" } }`
+← `{ "confirmLimit": { "usd": 25000, "recentUsd": 100000, "dailyUsd": 250000, "pending": { "usd": 150000, "effectiveAt": 1794916800000 } } }`
+
+`usd` is a whole number of dollars from `CONFIRM_LIMIT.minUsd` ($100) to `CONFIRM_LIMIT.maxUsd` ($1,000,000); the
+default is `CONFIRM_LIMIT.defaultUsd` ($25,000). Compared with the limit in force for this master:
+
+| Change | What happens |
+|---|---|
+| Lower, or the limit in force while a raise waits | Stored and applied at once, no prompt; a waiting raise is dropped |
+| The limit in force (no raise waiting), or the same waiting raise again | Nothing: no write, no `statusChanged`, no prompt (send the user's setting at every handshake) |
+| Higher, up to the default | The frame's own prompt (`promptChanged` kind `limits`, fixed styling, press and hold), then applied |
+| Higher than the default | `authorization` is checked first, then the frame's own prompt; the raise takes effect `CONFIRM_LIMIT.delayMs` (24 hours) after `issuedAt`, the limit in force applying until then (`confirmLimit.pending`) |
+
+`authorization` is the master wallet's EIP-191 `personal_sign` of `confirmLimitMessage({ account, usd, issuedAt, network })`
+(exported by the client, so the app shows the wallet the exact text the frame checks): `usd` is the limit signed, at
+least the `usd` set, so a limit lowered after a raise but still above the default is sent with the raise's signature
+and needs no new one. Refused with `LIMIT_LOOSENING_REJECTED` and `details.reason`, nothing changed:
+- `signature`: none, or not the master wallet's signature of that text (another wallet, another limit, another network);
+- `expired`: `issuedAt` more than `CONFIRM_LIMIT.signatureMaxAgeMs` (7 days) ago, or more than 5 minutes ahead of the
+  frame's clock;
+- `stale`: older than the last change of this limit on this device (a lowering stops an older signature from raising
+  it again).
+
+The app should then ask the user to sign again. A raise the wallet signed more than a day before it reaches a frame
+(another device, say) applies there at once, after that frame's prompt.
+
+Stored with the limits (the same record, revision and compare-and-set, so it binds every tab and survives reloads),
+per network, and **per master**: a key of another wallet in this browser has the default. Every signature is checked
+again whenever the record is read; a stored limit above the default without the signature that allowed it, or a raise
+whose signature doesn't check out, counts for nothing. `setLimits` leaves it as it is. When a waiting raise takes
+effect, the frame emits `statusChanged`. A frame without a user interface refuses every raise.
+
+Errors: `NO_KEY`, `LIMIT_LOOSENING_REJECTED` (above), `USER_CANCELLED` / `USER_TIMEOUT` (nothing changed), `PROMPT_BUSY`,
+`SIGNER_BUSY` (retryable: the stored limits changed in another tab while the user was confirming, or the key changed),
+`STORAGE_FAILED` (retryable), `INVALID_REQUEST`.
 
 ### `revoke`
 
