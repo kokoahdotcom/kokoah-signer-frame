@@ -320,8 +320,11 @@ describe("the order confirmation limit", () => {
     // Order B: $20,000, below the $25,000 in force when it was read; it then waits for the lock.
     const b = h.request("signAndSubmit", { requestId: "b", intent: btc("0.2") });
     await waitFor(() => locks.requests.filter((n) => n.includes("/sign/")).length >= 2);
-    expect((await h.ok("setConfirmLimit", { usd: 5_000 })).confirmLimit.usd).toBe(5_000);
+    // The lowering is stored at once, and answered once the order under way is sent.
+    const lowering = h.ok("setConfirmLimit", { usd: 5_000 });
+    await waitFor(() => locks.requests.filter((n) => n.includes("/sign/")).length >= 3);
     releaseA();
+    expect((await lowering).confirmLimit.usd).toBe(5_000);
     expect((await a).ok).toBe(true);
     const rb = await b;
     expect(rb.ok).toBe(false);
@@ -577,6 +580,31 @@ describe("the order confirmation limit", () => {
     clock.advance(10 * HOUR);
     mono += 10 * HOUR;
     expect((await status())?.usd).toBe(150_000);
+  });
+
+  it("reports a stored limit whose grant this clock hasn't reached yet as waiting", async () => {
+    await ready();
+    const issuedAt = h.clock.now();
+    const { signature } = await signed(150_000, issuedAt);
+    await tampered((m) => (m[ownerKey] = { usd: 150_000, since: 0, at: 0, granted: { signedUsd: 150_000, issuedAt, signature, effectiveAt: issuedAt + DAY } }));
+    expect(await status()).toEqual({ usd: 25_000, recentUsd: 100_000, dailyUsd: 250_000, pending: { usd: 150_000, effectiveAt: issuedAt + DAY } });
+    expect(idleText()).toContain("(above $150,000 from");
+    h.clock.advance(DAY);
+    expect(await status()).toEqual({ usd: 150_000, recentUsd: 600_000, dailyUsd: 1_500_000 });
+  });
+
+  it("checks the clock with HL again when the device clock is set back, and then takes a fresh signature", async () => {
+    const clock = new Clock();
+    const hl = new MockHl(clock);
+    let mono = 0;
+    await ready({ clock, hl, monotonic: () => mono });
+    clock.advance(-2 * HOUR); // the system sets the wall clock back; HL's time and the monotonic clock go on
+    hl.serverOffsetMs = 2 * HOUR;
+    await h.ok("setConfirmLimit", { usd: 25_000 });
+    await waitFor(() => h.core.status().clockOffsetMs === 2 * HOUR);
+    // The app dates the signature with the frame's clock, as it reports it.
+    await confirmed({ usd: 150_000, authorization: await signed(150_000, h.core.correctedNow()) });
+    expect((await status())?.pending?.usd).toBe(150_000);
   });
 
   it("signs nothing when the stored confirmation limits can't be read", async () => {

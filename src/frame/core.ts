@@ -148,6 +148,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 /** setTimeout's maximum delay. */
 const MAX_TIMER_MS = 2 ** 31 - 1;
 const CLOCK_RESYNC_MS = 5 * 60 * 1000;
+/** The two clocks (confirmEarliest) apart by more than this: the clock is checked with HL again. */
+const CLOCK_DISAGREE_MS = 60 * 1000;
 const CONFIRM_POLL_MS = 1_000;
 const MAX_REMEMBERED_REQUESTS = 1_000;
 /** Hyperliquid's app refuses a referral code after this much traded volume (USD). */
@@ -272,9 +274,23 @@ function confirmNumbers(usd: number, pending?: ConfirmLimitStatus["pending"]): C
 function confirmLimitOf(entry: StoredConfirmLimit | undefined, now: number): ConfirmLimitStatus {
   if (entry === undefined) return confirmNumbers(CONFIRM_LIMIT.defaultUsd);
   if (entry.raise && now >= entry.raise.effectiveAt) return confirmNumbers(entry.raise.usd);
-  const granted = entry.granted !== undefined && now >= entry.granted.effectiveAt;
-  const usd = entry.usd > CONFIRM_LIMIT.defaultUsd && !granted ? CONFIRM_LIMIT.defaultUsd : entry.usd;
-  return confirmNumbers(usd, entry.raise ? { usd: entry.raise.usd, effectiveAt: entry.raise.effectiveAt } : undefined);
+  // A stored limit above the default whose grant this clock hasn't reached yet (another tab's clock may have): the
+  // default until then, reported as waiting.
+  const waits = entry.usd > CONFIRM_LIMIT.defaultUsd && !(entry.granted !== undefined && now >= entry.granted.effectiveAt);
+  const usd = waits ? CONFIRM_LIMIT.defaultUsd : entry.usd;
+  const pending = entry.raise
+    ? { usd: entry.raise.usd, effectiveAt: entry.raise.effectiveAt }
+    : waits && entry.granted !== undefined
+      ? { usd: entry.usd, effectiveAt: entry.granted.effectiveAt }
+      : undefined;
+  return confirmNumbers(usd, pending);
+}
+
+/** When one master's limit in force next changes by itself after `now` (a raise's or a grant's time), if ever. */
+function confirmNextChange(entry: StoredConfirmLimit | undefined, now: number): number | undefined {
+  const times = [entry?.raise?.effectiveAt, entry && entry.usd > CONFIRM_LIMIT.defaultUsd ? entry.granted?.effectiveAt : undefined];
+  const later = times.filter((t): t is number => t !== undefined && t > now);
+  return later.length > 0 ? Math.min(...later) : undefined;
 }
 
 /** The signature that allows the limit in force when it is above the default: a raise in force, else `granted`. */
@@ -619,19 +635,19 @@ export class FrameCore {
   }
 
   /**
-   * The confirmation limit's day is judged on HL's time, from two clocks: the wall clock with the offset checked with HL
-   * (`now`), and HL's time at that check plus the monotonic clock since (a wall clock set back or forward after the
-   * check doesn't move it; one that stops while the device sleeps falls behind). Whether a raise has come into force is
-   * judged at the earlier of the two, and changes are dated with the later: so either clock being off only delays a
-   * raise. Before a check in this load nothing above the default counts (the device's own clock may be off by hours,
-   * and a page can keep HL from answering), and setConfirmLimit refuses every change.
+   * The confirmation limit's day is judged on HL's time. A raise is dated with HL's time read right after the user
+   * confirms it (setConfirmLimit). Whether it has come into force is judged at the earlier of two clocks: the wall clock
+   * with the offset checked with HL (`now`), and HL's time at that check plus the monotonic clock since, which never
+   * runs ahead of HL (a wall clock changed after the check doesn't move it; one that stops while the device sleeps
+   * falls behind). So a clock that is off only delays a raise. Before a check in this load nothing above the default
+   * counts (the device's own clock may be off by hours, and a page can keep HL from answering).
    */
   private confirmEarliest(now: number = this.correctedNow()): number {
     const byMonotonic = this.hlTimeByMonotonic();
     return byMonotonic === null ? 0 : Math.min(now, byMonotonic);
   }
 
-  /** The later of the two clocks (see {@link confirmEarliest}). */
+  /** The later of the two clocks (see {@link confirmEarliest}): what changes and signatures' ages are judged with. */
   private confirmLatest(now: number = this.correctedNow()): number {
     const byMonotonic = this.hlTimeByMonotonic();
     return byMonotonic === null ? now : Math.max(now, byMonotonic);
@@ -646,11 +662,13 @@ export class FrameCore {
   private scheduleConfirmTimer(): void {
     clearTimeout(this.confirmTimer);
     if (this.destroyed || this.clockSyncedMono === null) return;
-    const now = this.correctedNow();
-    const pending = this.confirmLimitNow(now).pending;
-    if (!pending) return;
+    const k = this.key;
+    if (k === null) return;
+    const early = this.confirmEarliest();
     // In force once the earlier clock reaches it (both keep running until then).
-    const wait = pending.effectiveAt - this.confirmEarliest(now);
+    const next = confirmNextChange(this.confirm.masters.get(k.meta.userAddress.toLowerCase()), early);
+    if (next === undefined) return;
+    const wait = next - early;
     this.confirmTimer = setTimeout(() => this.statusChanged(), Math.min(MAX_TIMER_MS, Math.max(0, wait) + 50));
   }
 
@@ -822,8 +840,14 @@ export class FrameCore {
   }
 
   private async ensureClock(): Promise<void> {
-    if (this.clockSyncedAt === null) await this.syncClock();
-    else if (this.now() - this.clockSyncedAt > CLOCK_RESYNC_MS) void this.syncClock();
+    if (this.clockSyncedAt === null || this.clockSyncedMono === null) {
+      await this.syncClock();
+      return;
+    }
+    // Checked again after a while on the monotonic clock (a wall clock set back doesn't put it off), and whenever the
+    // two clocks disagree (one of them was changed or stopped since the check).
+    const byMonotonic = this.hlTimeByMonotonic() ?? 0;
+    if (this.monotonicNow() - this.clockSyncedMono > CLOCK_RESYNC_MS || Math.abs(this.correctedNow() - byMonotonic) > CLOCK_DISAGREE_MS) void this.syncClock();
   }
 
   // -------------------------------------------------------------------------------------------
@@ -1897,7 +1921,12 @@ export class FrameCore {
           return await this.serialized("limits", () => this.confirmLimitStep(agent, master, p, confirmed));
         });
       }
-      if (step.kind === "done") return { confirmLimit: confirmLimitOf(this.confirm.masters.get(master), this.confirmEarliest()) };
+      if (step.kind === "done") {
+        // Answered once signing already under way for this key (past its last check) is over, so every order signed after
+        // this answer has the new limit; it is stored either way, so a lock held too long doesn't make it an error.
+        await this.coordinator.withAgentLock(agent, async () => undefined).catch(() => undefined);
+        return { confirmLimit: confirmLimitOf(this.confirm.masters.get(master), this.confirmEarliest()) };
+      }
       // Otherwise another tab wrote first, or changed the limit while this prompt waited: compare again.
     }
     throw new SignerFailure("SIGNER_BUSY", "Your limits kept changing in another tab; nothing was changed. Try again.", { retryable: true, details: { reason: "limitsChanged" } });
@@ -1943,6 +1972,12 @@ export class FrameCore {
     const target = p.usd;
     // The stored limit with no raise waiting: nothing to change (the app sends the user's setting at every handshake).
     if (target === stored && own?.raise === undefined) return { kind: "done" };
+    // The same raise again (waiting or in force): nothing to change either.
+    const a = p.authorization;
+    const r0 = own?.raise;
+    if (r0 !== undefined && a !== undefined && r0.usd === target && r0.signedUsd === a.usd && r0.issuedAt === a.issuedAt && r0.signature.toLowerCase() === a.signature.toLowerCase()) {
+      return { kind: "done" };
+    }
     // A change that isn't a new raise: no signature made before it raises the limit again on this device, including a
     // waiting raise's own (dated up to five minutes ahead).
     const since = Math.max(own?.since ?? 0, late, own?.raise ? own.raise.issuedAt + 1 : 0);
@@ -1977,7 +2012,7 @@ export class FrameCore {
       if (this.clockSyncedMono === null) {
         throw new SignerFailure("HL_UNAVAILABLE", "The signer couldn't check the time with Hyperliquid, so nothing was changed. Try again shortly.", { retryable: true });
       }
-      if (late - issuedAt > CONFIRM_LIMIT.signatureMaxAgeMs || issuedAt - now > CONFIRM_LIMIT.signatureFutureMs) {
+      if (late - issuedAt > CONFIRM_LIMIT.signatureMaxAgeMs || issuedAt - late > CONFIRM_LIMIT.signatureFutureMs) {
         refuse("expired", "Your wallet's signature for this limit is too old (or dated ahead); sign it again.");
       }
       if (own !== undefined && issuedAt < own.since) refuse("stale", "This limit changed on this device after your wallet signed this raise; sign it again.");
