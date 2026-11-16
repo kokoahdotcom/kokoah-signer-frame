@@ -409,6 +409,8 @@ export interface HarnessOptions {
   generatePrivateKey?: () => `0x${string}`;
   logger?: FrameDeps["logger"];
   withUi?: boolean;
+  /** The frame's monotonic clock (default: the test clock). */
+  monotonic?: () => number;
   promptTimeoutMs?: number;
   /** Prompt arming delay (default 0 here, so tests don't wait; test/prompt.test.ts covers the real delay). */
   promptArmMs?: number;
@@ -472,6 +474,7 @@ export class FrameHarness {
       passkeys: o.passkeys ?? new MockPasskeys(),
       broadcast: o.bus ? o.bus.channel() : null,
       now: clock.now,
+      ...(o.monotonic ? { monotonicNow: o.monotonic } : {}),
       generatePrivateKey: () => {
         const k = gen();
         generatedKeys.push(k);

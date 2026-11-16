@@ -824,17 +824,20 @@ tab, survives reloads and is left alone by builds that don't know it), **per mas
 full, the oldest at or above the default go first; a lowered one is never dropped, and a new wallet is then refused
 with `STORAGE_FAILED`, not retryable). A key of another wallet in this
 browser has its own, the default until it sets one. A stored limit above the default, and a waiting raise, count only
-with a valid signature of the master's wallet for at least that much, from no sooner than a day after it, and only
-once the frame checked its clock with HL in this load (until then, and for raises refused with `HL_UNAVAILABLE`, the
-device's own clock is never trusted with the day); otherwise the default applies. The rest of the record (such as whether the user confirmed it) is trusted as the frame's storage
+with a valid signature of the master's wallet for at least that much, and from no sooner than a day after it;
+otherwise the default applies. The day runs on HL's time, from two clocks: the clock the frame checked with HL in this
+load, and HL's time at that check plus the browser's monotonic clock since. A raise counts once both say its time has
+come and is dated with the later of the two, so a device clock that is off, or changed after the check, only delays
+it. Before the frame could check its clock in this load nothing above the default counts, and every `setConfirmLimit`
+is refused with `HL_UNAVAILABLE` (retryable). The rest of the record (such as whether the user confirmed it) is trusted as the frame's storage
 is for the other limits. `setLimits` leaves it as it is. Signing reads it again under the agent lock: orders a lowering
 made since now asks about are refused with `SIGNER_BUSY` (`limitsChanged`), and sent again they ask. The frame's own
 status line shows a limit of the user's own and a raise still waiting. When a waiting raise takes effect, the frame
 emits `statusChanged`. A frame without a user interface refuses every raise.
 
 Errors: `NO_KEY`, `LIMIT_LOOSENING_REJECTED` (above), `USER_CANCELLED` / `USER_TIMEOUT` (nothing changed), `PROMPT_BUSY`,
-`KEY_PENDING`, `KEY_EXPIRED`, `HL_UNAVAILABLE` (retryable: a raise above the default before the frame could check its
-clock with HL), `SIGNER_BUSY` (retryable: the stored limit changed in another tab while the user was confirming,
+`KEY_PENDING`, `KEY_EXPIRED`, `HL_UNAVAILABLE` (retryable: the frame couldn't check its clock with HL yet; nothing
+changed), `SIGNER_BUSY` (retryable: the stored limit changed in another tab while the user was confirming,
 `limitsChanged`, or the key changed, `keyChanged`),
 `STORAGE_FAILED` (retryable), `INVALID_REQUEST`.
 

@@ -838,7 +838,8 @@ export interface ConfirmLimitStatus {
 
 /**
  * Sets the order confirmation limit of the key's master. Needs an active key, one HL lists for that master (`NO_KEY`,
- * `KEY_PENDING`, `KEY_EXPIRED`). An integer from `CONFIRM_LIMIT.minUsd` to `CONFIRM_LIMIT.maxUsd`.
+ * `KEY_PENDING`, `KEY_EXPIRED`), and the frame's clock checked with HL in this load (`HL_UNAVAILABLE`, retryable). An
+ * integer from `CONFIRM_LIMIT.minUsd` to `CONFIRM_LIMIT.maxUsd`.
  * - Lower than the limit in force: applied at once, no prompt; it also drops a raise still waiting.
  * - The same limit (and the same waiting raise): nothing changes (send it again at every handshake).
  * - Higher, up to `CONFIRM_LIMIT.defaultUsd`: the frame's own prompt (`promptChanged` kind `limits`), then at once.

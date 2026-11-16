@@ -451,6 +451,66 @@ describe("the order confirmation limit", () => {
     expect((await status())?.usd).toBe(150_000);
   });
 
+  it("changes nothing at all before the clock is checked, so a lowering is never answered without being stored", async () => {
+    const clock = new Clock();
+    const hl = new MockHl(clock);
+    await ready({ clock, hl });
+    const raise = await signed(150_000);
+    await confirmed({ usd: 150_000, authorization: raise });
+    clock.advance(DAY);
+    await h.ok("setConfirmLimit", { usd: 100_000, authorization: raise });
+    const idb = h.idb;
+    h.destroy();
+    hl.infoFailure = (body) => body.type === "exchangeStatus";
+    h = await FrameHarness.create({ clock, hl, idb });
+    await h.ok("hello", { protocolVersion: 1 });
+    expect((await status())?.usd).toBe(25_000); // nothing above the default counts yet
+    for (const usd of [25_000, 50_000, 10_000]) expect((await h.fail("setConfirmLimit", { usd })).code).toBe("HL_UNAVAILABLE");
+    hl.infoFailure = null;
+    expect((await h.ok("setConfirmLimit", { usd: 25_000 })).confirmLimit).toEqual({ usd: 25_000, recentUsd: 100_000, dailyUsd: 250_000 });
+    expect(await asked("lowered", "0.9")).toBe(true); // $90,000 asks
+  });
+
+  it("doesn't wake up again and again before the clock is checked", async () => {
+    const clock = new Clock();
+    const hl = new MockHl(clock);
+    await ready({ clock, hl });
+    await confirmed({ usd: 150_000, authorization: await signed(150_000) });
+    clock.advance(DAY + MINUTE); // due by the device clock
+    const idb = h.idb;
+    h.destroy();
+    hl.infoFailure = (body) => body.type === "exchangeStatus";
+    h = await FrameHarness.create({ clock, hl, idb });
+    await h.ok("hello", { protocolVersion: 1 });
+    const before = h.events("statusChanged").length;
+    await new Promise((r) => setTimeout(r, 300));
+    expect(h.events("statusChanged").length - before).toBeLessThanOrEqual(1);
+  });
+
+  it("keeps the day when the device clock is changed after the check", async () => {
+    // The device clock is 10 hours behind HL at load; the system sets it right later, while HL's time can't be read.
+    const clock = new Clock();
+    const hl = new MockHl(clock);
+    hl.serverOffsetMs = 10 * HOUR;
+    let mono = 0;
+    const monotonic = () => mono;
+    await ready({ clock, hl, monotonic });
+    await waitFor(() => h.core.status().clockOffsetMs === 10 * HOUR);
+    await confirmed({ usd: 150_000, authorization: await signed(150_000, clock.now() + hl.serverOffsetMs) });
+    const pending = (await status())?.pending;
+    expect(pending?.effectiveAt).toBe(clock.now() + 10 * HOUR + DAY);
+    hl.infoFailure = (body) => body.type === "exchangeStatus";
+    clock.advance(10 * HOUR); // the device clock jumps to the right time; no time passed
+    hl.serverOffsetMs = 0;
+    // 14 real hours later: by the wall clock with the old offset it would be due; by the monotonic clock it isn't.
+    clock.advance(14 * HOUR + MINUTE);
+    mono += 14 * HOUR + MINUTE;
+    expect((await status())?.usd).toBe(25_000);
+    clock.advance(10 * HOUR);
+    mono += 10 * HOUR;
+    expect((await status())?.usd).toBe(150_000);
+  });
+
   it("signs nothing when the stored confirmation limits can't be read", async () => {
     const idb = new IDBFactory();
     const real = await IdbSignerStore.open(idb);
