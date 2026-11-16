@@ -35,7 +35,7 @@ This repo also ships **`KokoahSignerClient`**, the typed, dependency-free client
   - price band against HL's mark: 5% for orders that execute now (market, IOC, marketable limits), 50% for resting limits and untriggered triggers;
   - leverage up to 50x, never above the market's maximum;
   - $250,000 per order and $25,000,000 a day per key (reduce-only orders exempt);
-  - more than $25,000 of orders in one action (reduce-only included) only after the user presses and holds the button of the frame's own prompt, which names every order;
+  - more than the user's confirmation limit of orders in one action (reduce-only included) only after the user presses and holds the button of the frame's own prompt, which names every order: $25,000 unless the user set one (`setConfirmLimit`: lower at once, higher only with the main wallet's signature, the frame's prompt and a day's wait, at most $1,000,000);
   - 60 orders a minute (persisted);
   - `expiresAfter` = now + 15 s.
 - **Keys.**
@@ -203,7 +203,7 @@ These aren't in this repo's power; they are for the kokoah-infra owners.
    const r = await signer.signAndSubmit({ requestId: crypto.randomUUID(), intent });
    if (r.status === "unknown") pollOrderStatusByCloid(r.cloids[0]);  // never resubmit with a new requestId
    ```
-   Show `r.marketOrder` (mid and IOC price signed) for market orders, `r.outcome.statuses` for `ok`, and `r.error` for `rejected`. The final state comes from the WebSocket. With `hello.capabilities.confirmsLargeOrders`, orders above `hello.limits.confirmOrdersAboveUsd` ($25,000 in all, reduce-only included) wait for the user's press and hold in the frame (`promptChanged` kind `order`): tell the user to confirm in the signer window, keep the iframe reachable, and treat `USER_CANCELLED` / `USER_TIMEOUT` as "nothing was sent". See [PROTOCOL `signAndSubmit`](docs/PROTOCOL.md#signandsubmit).
+   Show `r.marketOrder` (mid and IOC price signed) for market orders, `r.outcome.statuses` for `ok`, and `r.error` for `rejected`. The final state comes from the WebSocket. With `hello.capabilities.confirmsLargeOrders`, orders above `hello.limits.confirmOrdersAboveUsd` ($25,000 in all, reduce-only included; with `setsConfirmLimit`, `status.confirmLimit.usd`) wait for the user's press and hold in the frame (`promptChanged` kind `order`): tell the user to confirm in the signer window, keep the iframe reachable, and treat `USER_CANCELLED` / `USER_TIMEOUT` as "nothing was sent". See [PROTOCOL `signAndSubmit`](docs/PROTOCOL.md#signandsubmit).
 7. **Security center (J11):** `revoke()` → sign `revokeAgent.typedData` → post it like step 5. If the result has `wipeError` (`wiped: false`), the stored copy couldn't be deleted: still post `revokeAgent`, tell the user, and call `revoke()` again.
 8. **Link phone:** on the phone, after claiming the pairing, `createLinkedAgent({ userAddress, agentName, validForDays: 30, storageMode: "device", link: { pairingId, secret } })` returns the pending key's address, expiry and the 6-digit `matchCode` to show; the computer approves the key with its main wallet, then the phone calls `confirmAgent`. See [PROTOCOL §12](docs/PROTOCOL.md#12-link-phone).
 9. **Settings (§B11.4):** `setLimits({...})` after every `hello` and on every `reconnected`; the frame stores the limits, so identical ones change nothing. Tightening applies at once. With `hello.capabilities.confirmsLooserLimits`, anything looser (a higher number, `{}`, spot trading on, …) waits for the user's click on the frame's prompt (`promptChanged` kind `limits`; tell the user to confirm in the signer window), and cancel or timeout leave the limits as they were (`USER_CANCELLED` / `USER_TIMEOUT`). Above the baseline: `LIMIT_LOOSENING_REJECTED`. See [PROTOCOL `setLimits`](docs/PROTOCOL.md#setlimits).
@@ -287,7 +287,7 @@ Two more suites run on demand:
 
 ## Known gaps / TODO
 
-- **Out-of-policy orders are denied, not confirmed** (SECURITY_BASELINE §3 asks for a confirmation). Orders above $25,000 in one action already need the user's press and hold in the frame.
+- **Out-of-policy orders are denied, not confirmed** (SECURITY_BASELINE §3 asks for a confirmation). Orders above the confirmation limit ($25,000 by default) in one action already need the user's press and hold in the frame.
 - **Tune the baseline limits.** $250,000 per order and a 5% band (since 2026-10-14) are still wide backstops, and $25M per day is unchanged.
 - **Clickjacking of the in-frame prompt is harder, not impossible.** The button needs the user's own pointer movement (from the keyboard: Tab onto it inside the frame, then Enter or Space held) and, for loosening, vault transfers, large orders and taking out margin, a press and hold; every prompt arms only while IntersectionObserver reports it wholly in view, and without IntersectionObserver v2 (Firefox, Safari, iOS), where a transparent frame under a decoy can't be detected, those prompts are confirmed in a top-level window of the signer's origin, by typing what they do (THREAT_MODEL §5 item 2).
 - **Loosening limits relies on the user reading the frame's prompt**; the clickjacking caveat above applies (THREAT_MODEL A23).

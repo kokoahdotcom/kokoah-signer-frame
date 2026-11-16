@@ -34,11 +34,16 @@ import { builderFeeAt } from "@kokoah/shared/risk";
 import { buildApproveAgent, buildRevokeAgent, parseAgentName, prepareL1Request } from "@kokoah/shared/signing";
 import { SubAccountLookupError, SubAccountOwnership } from "@kokoah/shared/subaccounts";
 import { HLP_LOCKUP_DAYS, HLP_VAULT_ADDRESSES, vaultDepositsSince, vaultUnitsToUsd } from "@kokoah/shared/vaults";
-import { bytesToHex, hexToBytes } from "viem";
+import { bytesToHex, hexToBytes, recoverMessageAddress } from "viem";
 import { generatePrivateKey as viemGeneratePrivateKey, privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import {
   AGENT_APPROVAL_PANEL_MS,
   agentAddressCheckCode,
+  CONFIRM_LIMIT,
+  confirmLimitMessage,
+  type ConfirmLimitStatus,
+  type SetConfirmLimitParams,
+  type SetConfirmLimitResult,
   EXPIRES_AFTER_MS,
   EXPIRING_SOON_MS,
   MAX_AGENT_NAME_LENGTH,
@@ -127,12 +132,24 @@ import {
   vaultTransfersAllowed,
 } from "./policy.js";
 import { applyTheme, invalidThemeVariables, PromptError, PromptUi, type ActionFailure, type PromptKind, type PromptTimers } from "./prompt.js";
-import { limitsRev, limitsSlot, type SignerStore, type StoredKeyRecord, type StoredLimitsRecord } from "./storage.js";
+import {
+  confirmSlot,
+  limitsRev,
+  limitsSlot,
+  type ConfirmLimitGrant,
+  type SignerStore,
+  type StoredConfirmLimit,
+  type StoredConfirmRecord,
+  type StoredKeyRecord,
+  type StoredLimitsRecord,
+} from "./storage.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** setTimeout's maximum delay. */
 const MAX_TIMER_MS = 2 ** 31 - 1;
 const CLOCK_RESYNC_MS = 5 * 60 * 1000;
+/** The two clocks (confirmEarliest) apart by more than this: the clock is checked with HL again. */
+const CLOCK_DISAGREE_MS = 60 * 1000;
 const CONFIRM_POLL_MS = 1_000;
 const MAX_REMEMBERED_REQUESTS = 1_000;
 /** Hyperliquid's app refuses a referral code after this much traded volume (USD). */
@@ -174,6 +191,11 @@ export interface FrameDeps {
   passkeys: PasskeyProvider;
   broadcast?: BroadcastLike | null;
   now?: () => number;
+  /**
+   * A monotonic clock in ms (default `performance.now`, or `now` when that is given): with the HL-checked wall clock it
+   * judges the confirmation limit's day, so a wall clock changed after the check can't shorten it.
+   */
+  monotonicNow?: () => number;
   /** Test seam: key generator (default viem `generatePrivateKey`, i.e. `crypto.getRandomValues`). */
   generatePrivateKey?: () => Hex;
   /** How long a prompt waits for the user. Default 120 s. */
@@ -222,6 +244,70 @@ function limitsKey(s: LimitsSet): string {
   return stableStringify({ master: s.master, accounts: Object.fromEntries([...s.accounts].map(([a, l]) => [a, l.limits])), onTop: dailyCounters(s.accounts).onTop.sort() });
 }
 
+/** The order confirmation limits of each master (storage.ts `StoredConfirmRecord`), every signature in them checked. */
+interface ConfirmState {
+  /** The stored record's revision (0: none stored). */
+  rev: number;
+  /** By lowercase master address. */
+  masters: Map<string, StoredConfirmLimit>;
+}
+
+/**
+ * The most masters the confirmation limits record keeps (one for each wallet used with this browser). Large, so a page
+ * can't fill it with wallets of its own (each needs a key HL lists for it) before the user's wallet sets one.
+ */
+const MAX_CONFIRM_MASTERS = 256;
+/** Stored times are dates before 2100 (anything else is a malformed entry). */
+const MAX_STORED_TIME = Date.UTC(2100, 0, 1);
+
+const dollars = (n: number) => `$${Math.round(n).toLocaleString("en-US")}`;
+const utcMinute = (t: number) => `${new Date(t).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+
+function confirmNumbers(usd: number, pending?: ConfirmLimitStatus["pending"]): ConfirmLimitStatus {
+  return { usd, recentUsd: usd * CONFIRM_LIMIT.recentFactor, dailyUsd: usd * CONFIRM_LIMIT.dailyFactor, ...(pending ? { pending } : {}) };
+}
+
+/**
+ * The confirmation limit in force for one master at `now` (no entry: the default). A raise counts from its
+ * `effectiveAt` and is reported as pending until then; a limit above the default counts only from its grant's.
+ */
+function confirmLimitOf(entry: StoredConfirmLimit | undefined, now: number): ConfirmLimitStatus {
+  if (entry === undefined) return confirmNumbers(CONFIRM_LIMIT.defaultUsd);
+  if (entry.raise && now >= entry.raise.effectiveAt) return confirmNumbers(entry.raise.usd);
+  // A stored limit above the default whose grant this clock hasn't reached yet (another tab's clock may have): the
+  // default until then, reported as waiting.
+  const waits = entry.usd > CONFIRM_LIMIT.defaultUsd && !(entry.granted !== undefined && now >= entry.granted.effectiveAt);
+  const usd = waits ? CONFIRM_LIMIT.defaultUsd : entry.usd;
+  const pending = entry.raise
+    ? { usd: entry.raise.usd, effectiveAt: entry.raise.effectiveAt }
+    : waits && entry.granted !== undefined
+      ? { usd: entry.usd, effectiveAt: entry.granted.effectiveAt }
+      : undefined;
+  return confirmNumbers(usd, pending);
+}
+
+/** When one master's limit in force next changes by itself after `now` (a raise's or a grant's time), if ever. */
+function confirmNextChange(entry: StoredConfirmLimit | undefined, now: number): number | undefined {
+  const times = [entry?.raise?.effectiveAt, entry && entry.usd > CONFIRM_LIMIT.defaultUsd ? entry.granted?.effectiveAt : undefined];
+  const later = times.filter((t): t is number => t !== undefined && t > now);
+  return later.length > 0 ? Math.min(...later) : undefined;
+}
+
+/** The signature that allows the limit in force when it is above the default: a raise in force, else `granted`. */
+function confirmGrantOf(entry: StoredConfirmLimit | undefined, now: number): ConfirmLimitGrant | undefined {
+  if (entry === undefined) return undefined;
+  if (entry.raise && now >= entry.raise.effectiveAt) {
+    const { signedUsd, issuedAt, signature, effectiveAt } = entry.raise;
+    return { signedUsd, issuedAt, signature, effectiveAt };
+  }
+  return entry.usd > CONFIRM_LIMIT.defaultUsd && entry.granted !== undefined && now >= entry.granted.effectiveAt ? entry.granted : undefined;
+}
+
+/** Compares two confirmation states, whatever their revisions. */
+function confirmKey(s: ConfirmState): string {
+  return stableStringify(Object.fromEntries(s.masters));
+}
+
 interface RequestEntry {
   fingerprint: string;
   promise: Promise<SignAndSubmitResult>;
@@ -266,6 +352,7 @@ export class FrameCore {
   private readonly deps: FrameDeps;
   private readonly config: FrameConfig;
   private readonly now: () => number;
+  private readonly monotonicNow: () => number;
   private readonly log: Logger;
   private readonly hl: HlHttp;
   private readonly market: MarketData;
@@ -281,6 +368,13 @@ export class FrameCore {
   /** Orders reads and writes of the limits, so an older read that finishes late can't replace a newer state. */
   private limitsOrder = 0;
   private limitsShownOrder = 0;
+  /**
+   * The order confirmation limits as last read from or written to storage (`status().confirmLimit`). Signing reads them
+   * again under the agent lock, like the limits.
+   */
+  private confirm: ConfirmState = { rev: 0, masters: new Map() };
+  private confirmOrder = 0;
+  private confirmShownOrder = 0;
   /** The master's sub-accounts, read from HL by the frame itself (never from the parent). */
   private readonly subAccounts: SubAccountOwnership;
   /** Kokoah's region check, asked before anything that adds risk is signed (eligibility.ts). */
@@ -290,14 +384,21 @@ export class FrameCore {
   private boundOrigin: string | null = null;
   private clockOffsetMs = 0;
   private clockSyncedAt: number | null = null;
+  /** HL's time at the last clock check and the monotonic clock then (null: no check in this load). */
+  private clockSyncedHl: number | null = null;
+  private clockSyncedMono: number | null = null;
   private clockSync: Promise<void> | null = null;
   /**
-   * Run one at a time: key-management operations (`state`); the compare-and-write steps of this tab's `setLimits`
-   * calls (`limits`, which every read of the limits waits for); their prompts (`limitsPrompt`).
+   * Run one at a time: key-management operations (`state`); the compare-and-write steps of this tab's `setLimits` and
+   * `setConfirmLimit` calls (`limits`, which every read of either waits for); their prompts (`limitsPrompt`).
    */
   private readonly tails: Record<"state" | "limits" | "limitsPrompt", Promise<void>> = { state: Promise.resolve(), limits: Promise.resolve(), limitsPrompt: Promise.resolve() };
   private readonly requests = new Map<string, RequestEntry>();
   private expiryTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Emits statusChanged when a waiting raise of the key's master's confirmation limit takes effect. */
+  private confirmTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Confirmation limit signatures already checked, by master, limit, time, network and signature. */
+  private readonly confirmSignatures = new Map<string, boolean>();
   private notifiedExpiringFor: string | null = null;
   private notifiedExpiredFor: string | null = null;
   private passkeySupportCache: Promise<PasskeySupport> | null = null;
@@ -310,6 +411,7 @@ export class FrameCore {
     this.deps = deps;
     this.config = deps.config;
     this.now = deps.now ?? (() => Date.now());
+    this.monotonicNow = deps.monotonicNow ?? deps.now ?? (() => performance.now());
     this.log = deps.logger ?? silentLogger;
     this.hl = new HlHttp({ fetch: deps.fetch, infoUrl: this.config.network.infoUrl, exchangeUrl: this.config.network.exchangeUrl });
     this.market = new MarketData({ hl: this.hl, now: this.now, network: this.config.network.name });
@@ -361,6 +463,7 @@ export class FrameCore {
   destroy(): void {
     this.destroyed = true;
     clearTimeout(this.expiryTimer);
+    clearTimeout(this.confirmTimer);
     if (this.deps.broadcast) {
       this.deps.broadcast.onmessage = null;
       this.deps.broadcast.close();
@@ -428,6 +531,8 @@ export class FrameCore {
         return this.setTheme(params as SetThemeParams) as MethodResults[M];
       case "setStorageMode":
         return (await this.setStorageMode(params as SetStorageModeParams)) as MethodResults[M];
+      case "setConfirmLimit":
+        return (await this.setConfirmLimit(params as SetConfirmLimitParams)) as MethodResults[M];
       default:
         throw new SignerFailure("UNKNOWN_METHOD", `Unknown method "${String(method)}"`);
     }
@@ -511,6 +616,7 @@ export class FrameCore {
       mainnetWritesEnabled: this.config.network.name === "mainnet" && this.config.network.allowMainnetWrites,
       clockOffsetMs: this.clockOffsetMs,
       policy: summarizeFramePolicy(this.limits.policy, this.limits.master, this.limits.accounts, this.market.tradingPairCoins),
+      confirmLimit: this.clockSyncedMono === null ? { ...this.confirmLimitNow(now), clockUnchecked: true } : this.confirmLimitNow(now),
       metrics: { ...this.metrics },
     };
   }
@@ -518,7 +624,53 @@ export class FrameCore {
   private statusChanged(): void {
     this.refreshIdleText();
     this.scheduleExpiryTimer();
+    this.scheduleConfirmTimer();
     this.emit("statusChanged", this.status());
+  }
+
+  /** The key's master's confirmation limit at `now` (without a key: the default). */
+  private confirmLimitNow(now: number = this.correctedNow()): ConfirmLimitStatus {
+    const k = this.key;
+    return confirmLimitOf(k === null ? undefined : this.confirm.masters.get(k.meta.userAddress.toLowerCase()), this.confirmEarliest(now));
+  }
+
+  /**
+   * The confirmation limit's day is judged on HL's time. A raise is dated with HL's time read right after the user
+   * confirms it (setConfirmLimit). Whether it has come into force is judged at the earlier of two clocks: the wall clock
+   * with the offset checked with HL (`now`), and HL's time at that check plus the monotonic clock since, which never
+   * runs ahead of HL (a wall clock changed after the check doesn't move it; one that stops while the device sleeps
+   * falls behind). So a clock that is off only delays a raise. Before a check in this load nothing above the default
+   * counts (the device's own clock may be off by hours, and a page can keep HL from answering).
+   */
+  private confirmEarliest(now: number = this.correctedNow()): number {
+    const byMonotonic = this.hlTimeByMonotonic();
+    return byMonotonic === null ? 0 : Math.min(now, byMonotonic);
+  }
+
+  /** The later of the two clocks (see {@link confirmEarliest}): what changes and signatures' ages are judged with. */
+  private confirmLatest(now: number = this.correctedNow()): number {
+    const byMonotonic = this.hlTimeByMonotonic();
+    return byMonotonic === null ? now : Math.max(now, byMonotonic);
+  }
+
+  private hlTimeByMonotonic(): number | null {
+    if (this.clockSyncedHl === null || this.clockSyncedMono === null) return null;
+    return Math.floor(this.clockSyncedHl + (this.monotonicNow() - this.clockSyncedMono));
+  }
+
+  /** Tells the parent when a waiting raise of the confirmation limit takes effect (the status then reports it). */
+  private scheduleConfirmTimer(): void {
+    clearTimeout(this.confirmTimer);
+    if (this.destroyed || this.clockSyncedMono === null) return;
+    const k = this.key;
+    if (k === null) return;
+    const early = this.confirmEarliest();
+    // In force once the earlier clock reaches it (both keep running until then).
+    const next = confirmNextChange(this.confirm.masters.get(k.meta.userAddress.toLowerCase()), early);
+    if (next === undefined) return;
+    const wait = next - early;
+    // The clock is checked again then, so a clock that stopped meanwhile doesn't keep it waiting.
+    this.confirmTimer = setTimeout(() => void this.syncClock().then(() => this.statusChanged()), Math.min(MAX_TIMER_MS, Math.max(0, wait) + 50));
   }
 
   private refreshIdleText(): void {
@@ -526,7 +678,13 @@ export class FrameCore {
     const k = this.key;
     const state = this.keyStateOf(k);
     const keyText = k === null ? "no trading key" : `trading key ${state}${k.account === null ? ", locked" : ""}`;
-    this.ui.setIdleText(`Kokoah signer · ${this.config.network.name} · ${keyText}`);
+    // The user's own confirmation limit and a raise still waiting, in the frame's own text (the app could hide them).
+    const limit = k === null ? undefined : this.confirmLimitNow();
+    const confirmText =
+      limit === undefined || (limit.usd === CONFIRM_LIMIT.defaultUsd && !limit.pending)
+        ? ""
+        : ` · confirms orders above ${dollars(limit.usd)}${limit.pending ? ` (above ${dollars(limit.pending.usd)} from ${utcMinute(limit.pending.effectiveAt)})` : ""}`;
+    this.ui.setIdleText(`Kokoah signer · ${this.config.network.name} · ${keyText}${confirmText}`);
   }
 
   /** Serializes key-management operations. */
@@ -652,10 +810,20 @@ export class FrameCore {
         const t0 = this.now();
         const r = await this.hl.info({ type: "exchangeStatus" });
         const t1 = this.now();
+        const m1 = this.monotonicNow();
         if (isRecord(r) && typeof r.time === "number" && Number.isFinite(r.time) && r.time > 0) {
+          const first = this.clockSyncedMono === null;
+          const shown = stableStringify(this.confirmLimitNow());
           this.clockOffsetMs = Math.round(r.time - (t0 + t1) / 2);
           this.clockSyncedAt = t1;
+          // HL's time is at least r.time when the answer arrives: anchored there, the monotonic clock never runs ahead.
+          this.clockSyncedHl = r.time;
+          this.clockSyncedMono = m1;
           this.log("clock.synced", { offsetMs: this.clockOffsetMs });
+          // The confirmation limit in force may change with the new check (a raise whose time came), and the first check
+          // settles what the status reports (`clockUnchecked`): tell the parent.
+          if (stableStringify(this.confirmLimitNow()) !== shown || (first && this.key !== null)) this.confirmStatusChanged();
+          else this.scheduleConfirmTimer();
         }
       } catch {
         // Keep the previous offset.
@@ -675,8 +843,19 @@ export class FrameCore {
   }
 
   private async ensureClock(): Promise<void> {
-    if (this.clockSyncedAt === null) await this.syncClock();
-    else if (this.now() - this.clockSyncedAt > CLOCK_RESYNC_MS) void this.syncClock();
+    if (this.clockSyncedAt === null || this.clockSyncedMono === null) {
+      await this.syncClock();
+      return;
+    }
+    // Checked again after a while on the monotonic clock (a wall clock set back doesn't put it off), and whenever the
+    // two clocks disagree (one of them was changed or stopped since the check).
+    if (this.monotonicNow() - this.clockSyncedMono > CLOCK_RESYNC_MS || this.clocksDisagree()) void this.syncClock();
+  }
+
+  /** Whether the two clocks of {@link confirmEarliest} are apart (one was changed or stopped since the check). */
+  private clocksDisagree(): boolean {
+    const byMonotonic = this.hlTimeByMonotonic();
+    return byMonotonic !== null && Math.abs(this.correctedNow() - byMonotonic) > CLOCK_DISAGREE_MS;
   }
 
   // -------------------------------------------------------------------------------------------
@@ -758,6 +937,7 @@ export class FrameCore {
         confirmsLargeOrders: true,
         confirmsRecentOrders: true,
         showsAgentApproval: true,
+        setsConfirmLimit: true,
       },
       builder: { address: this.config.builder.address, feeTenthsBps: this.config.builder.feeTenthsBps, promo: this.config.builder.promo },
       status: this.status(),
@@ -1453,13 +1633,122 @@ export class FrameCore {
     return state;
   }
 
-  /** `readLimits` for `status()` only: when the read fails, the status keeps the limits last read. */
+  /** `readLimits` and `readConfirm` for `status()` only: when a read fails, the status keeps what it last read. */
   private async refreshLimits(): Promise<void> {
     try {
       await this.readLimits();
     } catch {
       // Signing reads them again and fails closed.
     }
+    try {
+      await this.readConfirm();
+    } catch {
+      // The same.
+    }
+  }
+
+  /**
+   * Reads the order confirmation limits from storage, like `readLimits` (after this tab's `setLimits` and
+   * `setConfirmLimit` writes received so far; a failed read throws STORAGE_FAILED).
+   */
+  private async readConfirm(): Promise<ConfirmState> {
+    await this.tails.limits;
+    return await this.readStoredConfirm();
+  }
+
+  /** `readConfirm` without waiting for this tab's writes (used inside them). */
+  private async readStoredConfirm(): Promise<ConfirmState> {
+    const order = ++this.confirmOrder;
+    let rec: StoredConfirmRecord | undefined;
+    try {
+      rec = await this.deps.store.getConfirm(this.config.network.name);
+    } catch {
+      throw new SignerFailure("STORAGE_FAILED", "Your limits could not be read on this device; nothing was changed or signed.", { retryable: true });
+    }
+    const state = await this.confirmState(rec);
+    this.showConfirm(state, order);
+    return state;
+  }
+
+  /** Makes `state` what `status()` reports, unless a newer read or write already did; statusChanged on a change. */
+  private showConfirm(state: ConfirmState, order: number): void {
+    if (order <= this.confirmShownOrder) return;
+    this.confirmShownOrder = order;
+    const changed = confirmKey(state) !== confirmKey(this.confirm);
+    this.confirm = state;
+    if (changed) this.confirmStatusChanged();
+  }
+
+  /** statusChanged for a change of the confirmation limits (the key's expiry timers stay as they are). */
+  private confirmStatusChanged(): void {
+    this.refreshIdleText();
+    this.scheduleConfirmTimer();
+    this.emit("statusChanged", this.status());
+  }
+
+  /**
+   * The state for a stored record, each entry checked: a malformed one is dropped (its master has the default), a limit
+   * above the default counts only with a valid signature of its master's wallet for at least that much (else the
+   * default), and so does a waiting raise (else it is dropped). The storage of the signer origin is trusted for the
+   * rest, like the other limits.
+   */
+  private async confirmState(rec: StoredConfirmRecord | undefined): Promise<ConfirmState> {
+    const rev = limitsRev(rec);
+    const masters = new Map<string, StoredConfirmLimit>();
+    if (!isRecord(rec) || rec.network !== this.config.network.name || !isRecord(rec.masters)) return { rev, masters };
+    for (const [master, raw] of Object.entries(rec.masters as Record<string, unknown>)) {
+      if (!/^0x[0-9a-f]{40}$/.test(master) || !isRecord(raw)) continue;
+      const entry = await this.storedConfirmLimit(master as Hex, raw);
+      if (entry !== undefined) masters.set(master, entry);
+    }
+    return { rev, masters };
+  }
+
+  private async storedConfirmLimit(master: Hex, raw: Record<string, unknown>): Promise<StoredConfirmLimit | undefined> {
+    const amount = (x: unknown): x is number => typeof x === "number" && Number.isInteger(x) && x >= CONFIRM_LIMIT.minUsd && x <= CONFIRM_LIMIT.maxUsd;
+    const time = (x: unknown): x is number => typeof x === "number" && Number.isSafeInteger(x) && x >= 0 && x <= MAX_STORED_TIME;
+    const grant = async (x: unknown): Promise<ConfirmLimitGrant | undefined> => {
+      if (!isRecord(x)) return undefined;
+      const { signedUsd, issuedAt, signature, effectiveAt } = x;
+      if (!amount(signedUsd) || signedUsd <= CONFIRM_LIMIT.defaultUsd || !time(issuedAt) || !time(effectiveAt) || typeof signature !== "string") return undefined;
+      // Never before a day after the wallet signed it.
+      if (effectiveAt < issuedAt + CONFIRM_LIMIT.delayMs) return undefined;
+      if (!(await this.confirmSignatureValid(master, signedUsd, issuedAt, signature as Hex))) return undefined;
+      return { signedUsd, issuedAt, signature: signature as Hex, effectiveAt };
+    };
+    const { usd, since, at, granted, raise } = raw;
+    if (!amount(usd)) return undefined;
+    // Unreadable times don't drop the limit itself (a lowered one stays).
+    const out: StoredConfirmLimit = { usd, since: time(since) ? since : 0, at: time(at) ? at : 0 };
+    if (usd > CONFIRM_LIMIT.defaultUsd) {
+      const g = await grant(granted);
+      if (g === undefined || usd > g.signedUsd) out.usd = CONFIRM_LIMIT.defaultUsd;
+      else out.granted = g;
+    }
+    if (isRecord(raise)) {
+      const g = await grant(raise);
+      if (g !== undefined && amount(raise.usd) && raise.usd > CONFIRM_LIMIT.defaultUsd && raise.usd <= g.signedUsd) out.raise = { ...g, usd: raise.usd };
+    }
+    return out;
+  }
+
+  /** Whether `signature` is `master`'s personal_sign of the confirmation limit's text on this network (remembered). */
+  private async confirmSignatureValid(master: Hex, usd: number, issuedAt: number, signature: Hex): Promise<boolean> {
+    if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) return false;
+    const network = this.config.network.name;
+    const id = `${master.toLowerCase()}|${usd}|${issuedAt}|${network}|${signature.toLowerCase()}`;
+    const known = this.confirmSignatures.get(id);
+    if (known !== undefined) return known;
+    let valid = false;
+    try {
+      const signer = await recoverMessageAddress({ message: confirmLimitMessage({ account: master, usd, issuedAt, network }), signature });
+      valid = signer.toLowerCase() === master.toLowerCase();
+    } catch {
+      valid = false;
+    }
+    if (this.confirmSignatures.size >= 1024) this.confirmSignatures.clear();
+    this.confirmSignatures.set(id, valid);
+    return valid;
   }
 
   /** Makes `state` what `status()` reports, unless a newer read or write already did; emits statusChanged on a change. */
@@ -1602,6 +1891,212 @@ export class FrameCore {
   }
 
   // -------------------------------------------------------------------------------------------
+  // setConfirmLimit
+  // -------------------------------------------------------------------------------------------
+
+  /**
+   * Sets the order confirmation limit of the key's master (protocol `SetConfirmLimitParams`). Needs an active key (HL
+   * lists it for that master). Stored per master in its own record, compare-and-set like the limits and in the same
+   * queues, so every tab sees it at its next signature. Compared with what is stored, so a change answered as done is
+   * always stored:
+   * - the stored limit with no raise waiting, or the same waiting raise again: nothing changes;
+   * - at most the stored limit or the limit in force: at once, no prompt (a waiting raise is dropped, and no signature
+   *   made before this change can raise the limit again on this device);
+   * - higher, up to the default: the frame's own prompt, then at once;
+   * - higher than the default: the master wallet's signature is checked first (this master's, at most a week old, not
+   *   ahead of the clock, not older than the last change on this device), then the frame's own prompt; right after it
+   *   the frame reads HL's time, and the raise takes effect a day after that (`HL_UNAVAILABLE`, nothing stored, when
+   *   it can't), the limit in force staying until then.
+   */
+  private async setConfirmLimit(p: SetConfirmLimitParams): Promise<SetConfirmLimitResult> {
+    await this.ensureClock();
+    // A change is dated with the clock: checked again first when the two clocks disagree.
+    if (this.clocksDisagree()) await this.syncClock();
+    const key = this.key;
+    if (!key) throw new SignerFailure("NO_KEY", "Create a trading key before setting your confirmation limit.");
+    const state = this.keyStateOf(key);
+    if (state === "expired") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; create a new one to set your confirmation limit.");
+    if (state !== "active") throw new SignerFailure("KEY_PENDING", "The trading key is not confirmed yet; approve it with the main wallet and call confirmAgent first.");
+    const agent = key.meta.agentAddress;
+    const master = key.meta.userAddress.toLowerCase();
+    let confirmed: { rev: number; hlTime?: number } | undefined;
+    for (let attempt = 0; attempt < MAX_LIMITS_ATTEMPTS; attempt++) {
+      let step = await this.serialized("limits", () => this.confirmLimitStep(agent, master, p, confirmed));
+      if (step.kind === "confirm") {
+        const { before, title, body, dated } = step;
+        step = await this.serialized("limitsPrompt", async () => {
+          if ((await this.readConfirm()).rev !== before.rev) return { kind: "retry" as const };
+          await this.prompt("limits", { title, body, actionLabel: "Raise limit", confirmText: "raise limit", fixedStyle: true, hold: true }, async () => undefined);
+          // A raise's day counts from HL's own time, read after the user confirmed (no local clock is trusted with it).
+          confirmed = dated ? { rev: before.rev, hlTime: await this.hlTimeNow() } : { rev: before.rev };
+          return await this.serialized("limits", () => this.confirmLimitStep(agent, master, p, confirmed));
+        });
+      }
+      if (step.kind === "done") {
+        // Answered once signing already under way for this key (past its last check) is over, so every order signed after
+        // this answer has the new limit; it is stored either way, so a lock held too long doesn't make it an error.
+        await this.coordinator.withAgentLock(agent, async () => undefined).catch(() => undefined);
+        return { confirmLimit: confirmLimitOf(this.confirm.masters.get(master), this.confirmEarliest()) };
+      }
+      // Otherwise another tab wrote first, or changed the limit while this prompt waited: compare again.
+    }
+    throw new SignerFailure("SIGNER_BUSY", "Your limits kept changing in another tab; nothing was changed. Try again.", { retryable: true, details: { reason: "limitsChanged" } });
+  }
+
+  /** HL's time from a request made now (never one already under way), or HL_UNAVAILABLE. */
+  private async hlTimeNow(): Promise<number> {
+    try {
+      const r = await this.hl.info({ type: "exchangeStatus" });
+      if (isRecord(r) && typeof r.time === "number" && Number.isFinite(r.time) && r.time > 0) return Math.floor(r.time);
+    } catch {
+      // Below.
+    }
+    throw new SignerFailure("HL_UNAVAILABLE", "The signer couldn't read the time from Hyperliquid after you confirmed, so nothing was changed. Try again shortly.", { retryable: true });
+  }
+
+  /**
+   * One attempt of `setConfirmLimit`, in this tab's limits queue: compares with the stored limit, then writes it, or
+   * asks for the user's confirmation (`confirm`, with the prompt's text; `dated`: a raise whose day needs HL's time).
+   * `retry`: another tab wrote first. `confirmed`: the revision the user confirmed a raise against (any other one is
+   * SIGNER_BUSY), with HL's time read after that.
+   */
+  private async confirmLimitStep(
+    agent: Hex,
+    master: string,
+    p: SetConfirmLimitParams,
+    confirmed: { rev: number; hlTime?: number } | undefined,
+  ): Promise<{ kind: "done" | "retry" } | { kind: "confirm"; before: ConfirmState; title: string; body: string; dated: boolean }> {
+    const k = this.key;
+    if (!k || k.meta.agentAddress !== agent || this.keyStateOf(k) !== "active") {
+      throw new SignerFailure("SIGNER_BUSY", "The trading key changed; nothing was changed. Try again.", { retryable: true, details: { reason: "keyChanged" } });
+    }
+    const before = await this.readStoredConfirm();
+    const now = this.correctedNow();
+    const network = this.config.network.name;
+    const own = before.masters.get(master);
+    // In force by the earlier clock; changes dated with the later (confirmEarliest).
+    const early = this.confirmEarliest(now);
+    const late = this.confirmLatest(now);
+    const inForce = confirmLimitOf(own, early);
+    const grant = confirmGrantOf(own, early);
+    const stored = own?.usd ?? CONFIRM_LIMIT.defaultUsd;
+    const target = p.usd;
+    // The stored limit with no raise waiting: nothing to change (the app sends the user's setting at every handshake).
+    if (target === stored && own?.raise === undefined) return { kind: "done" };
+    // The same raise again (waiting or in force): nothing to change either.
+    const a = p.authorization;
+    const r0 = own?.raise;
+    if (r0 !== undefined && a !== undefined && r0.usd === target && r0.signedUsd === a.usd && r0.issuedAt === a.issuedAt && r0.signature.toLowerCase() === a.signature.toLowerCase()) {
+      return { kind: "done" };
+    }
+    // A change that isn't a new raise: no signature made before it raises the limit again on this device, including a
+    // waiting raise's own (dated up to five minutes ahead).
+    // Dated with the earlier clock, which never runs ahead of HL (a date ahead would lock out fresh signatures), and
+    // only once checked in this load.
+    const since = Math.max(own?.since ?? 0, this.clockSyncedMono === null ? 0 : early, own?.raise ? own.raise.issuedAt + 1 : 0);
+    let next: StoredConfirmLimit;
+    let ask: { title: string; body: string; dated: boolean } | undefined;
+    if (target <= stored || target <= inForce.usd) {
+      // No higher than what is stored or in force (a waiting raise is dropped): at once, no prompt. Above the default it
+      // keeps the signature that allows it: the stored limit's, or the raise's in force.
+      const allows = target <= stored ? own?.granted : grant;
+      next = { usd: target, since, at: now, ...(target > CONFIRM_LIMIT.defaultUsd && allows ? { granted: allows } : {}) };
+    } else if (target <= CONFIRM_LIMIT.defaultUsd) {
+      // Back up toward the default: the frame's own prompt, as for the other limits.
+      next = { usd: target, since, at: now };
+      ask = {
+        title: "Raise your confirmation limit?",
+        body: `The Kokoah app asks to raise your confirmation limit on this device. Confirm only if you asked for this.\n\nOrders that need your confirmation: above ${dollars(inForce.usd)} → above ${dollars(target)}`,
+        dated: false,
+      };
+    } else {
+      const auth = p.authorization;
+      const refuse = (reason: "signature" | "expired" | "stale", message: string): never => {
+        throw new SignerFailure("LIMIT_LOOSENING_REJECTED", message, { details: { fields: ["usd"], reason } });
+      };
+      if (auth === undefined || auth.usd < target) return refuse("signature", `A limit above ${dollars(CONFIRM_LIMIT.defaultUsd)} needs your wallet's signature of it.`);
+      const { usd: signedUsd, issuedAt, signature } = auth;
+      // The signature's age is judged on a clock checked with HL in this load.
+      if (this.clockSyncedMono === null) {
+        throw new SignerFailure("HL_UNAVAILABLE", "The signer couldn't check the time with Hyperliquid, so nothing was changed. Try again shortly.", { retryable: true });
+      }
+      // After the prompt, on HL's time read then.
+      const judged = confirmed?.hlTime ?? late;
+      if (judged - issuedAt > CONFIRM_LIMIT.signatureMaxAgeMs || issuedAt - judged > CONFIRM_LIMIT.signatureFutureMs) {
+        refuse("expired", "Your wallet's signature for this limit is too old (or dated ahead); sign it again.");
+      }
+      if (own !== undefined && issuedAt < own.since) refuse("stale", "This limit changed on this device after your wallet signed this raise; sign it again.");
+      if (!(await this.confirmSignatureValid(master as Hex, signedUsd, issuedAt, signature))) {
+        refuse("signature", "The signature for this limit is not your wallet's; nothing was changed.");
+      }
+      // A day after HL's time read once the user confirmed (this step runs again then), never sooner than a day after the
+      // wallet signed. Before the prompt, for its text: about a day from now.
+      const effectiveAt = Math.max(issuedAt, confirmed?.hlTime ?? late) + CONFIRM_LIMIT.delayMs;
+      // What counts until then stays: the stored limit (and the signature that allows it), or a raise in force above it.
+      const base = inForce.usd > stored ? { usd: inForce.usd, granted: grant } : { usd: stored, granted: own?.granted };
+      next = {
+        usd: base.usd,
+        // An older signature can't replace this raise.
+        since: Math.max(own?.since ?? 0, issuedAt),
+        at: now,
+        ...(base.usd > CONFIRM_LIMIT.defaultUsd && base.granted ? { granted: base.granted } : {}),
+        raise: { usd: target, signedUsd, issuedAt, signature, effectiveAt },
+      };
+      ask = {
+        title: "Raise your confirmation limit?",
+        body:
+          `The Kokoah app asks to raise your confirmation limit on this device, with your wallet's signature. Confirm only if you asked for this.\n\n` +
+          `Orders that need your confirmation: above ${dollars(inForce.usd)} → above ${dollars(target)}\n` +
+          `Your wallet signed it: ${utcMinute(issuedAt)}\n` +
+          `It takes effect 24 hours after you confirm (about ${utcMinute(effectiveAt)}). Until then orders above ${dollars(inForce.usd)} keep asking; you can cancel it in your Kokoah settings.`,
+        dated: true,
+      };
+    }
+    if (ask !== undefined && (confirmed === undefined || confirmed.rev !== before.rev || (ask.dated && confirmed.hlTime === undefined))) {
+      if (confirmed !== undefined) {
+        throw new SignerFailure("SIGNER_BUSY", "Your limits changed in another tab while you were confirming; nothing was changed. Try again.", {
+          retryable: true,
+          details: { reason: "limitsChanged" },
+        });
+      }
+      if (!this.ui) {
+        throw new SignerFailure("LIMIT_LOOSENING_REJECTED", "Raising your confirmation limit needs a click in the signer frame, which has no user interface here.", {
+          details: { fields: ["usd"] },
+        });
+      }
+      return { kind: "confirm", before, ...ask };
+    }
+    const masters = new Map(before.masters);
+    masters.set(master, next);
+    if (masters.size > MAX_CONFIRM_MASTERS) {
+      // Full: the oldest at or above the default go first (their masters then have the default, which only asks more);
+      // a lowered one is never dropped.
+      const evictable = [...masters]
+        .filter(([m, e]) => m !== master && e.usd >= CONFIRM_LIMIT.defaultUsd && confirmLimitOf(e, early).usd >= CONFIRM_LIMIT.defaultUsd)
+        .sort((a, b) => a[1].at - b[1].at);
+      for (const [m] of evictable) {
+        if (masters.size <= MAX_CONFIRM_MASTERS) break;
+        masters.delete(m);
+      }
+      if (masters.size > MAX_CONFIRM_MASTERS) {
+        throw new SignerFailure("STORAGE_FAILED", `This device already keeps lowered confirmation limits for ${MAX_CONFIRM_MASTERS} wallets; nothing was changed.`);
+      }
+    }
+    const record: StoredConfirmRecord = { slot: confirmSlot(network), v: 1, network, rev: before.rev + 1, masters: Object.fromEntries(masters), updatedAt: this.now() };
+    let written: boolean;
+    try {
+      written = await this.deps.store.replaceConfirm(record, before.rev);
+    } catch {
+      throw new SignerFailure("STORAGE_FAILED", "Your confirmation limit could not be stored on this device; nothing was changed.", { retryable: true });
+    }
+    if (!written) return { kind: "retry" };
+    this.showConfirm({ rev: record.rev, masters }, ++this.confirmOrder);
+    this.log("limits.confirmLimit", { reason: ask === undefined ? "lowered" : next.raise ? "raise" : "confirmed" });
+    this.notifyOtherTabs("limitsChanged");
+    return { kind: "done" };
+  }
+
+  // -------------------------------------------------------------------------------------------
   // setTheme
   // -------------------------------------------------------------------------------------------
 
@@ -1698,8 +2193,9 @@ export class FrameCore {
       }
     }
     const account = vault ?? master;
-    // The user's limits as stored now; read again under the agent lock below.
+    // The user's limits and the master's confirmation limit as stored now; read again under the agent lock below.
     const stored = await this.readLimits();
+    const storedConfirm = (await this.readConfirm()).masters.get(master);
 
     // 2. The frame's own clock, market metadata and prices.
     await this.ensureClock();
@@ -1811,23 +2307,24 @@ export class FrameCore {
       return { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter };
     };
 
-    // 4b. Orders above CONFIRM_ORDERS_ABOVE_USD in all (reduce-only ones included), or that would take what this account
-    // signed without a prompt above CONFIRM_UNPROMPTED_ABOVE_USD in the last 10 minutes or
-    // CONFIRM_UNPROMPTED_DAY_ABOVE_USD in the last 24 hours, wait for the user's confirmation of the frame's own
+    // 4b. Orders above the master's confirmation limit in all (reduce-only ones included; CONFIRM_ORDERS_ABOVE_USD
+    // unless the user set one), or that would take what this account signed without a prompt above 4 times it in the
+    // last 10 minutes or 10 times it in the last 24 hours, wait for the user's confirmation of the frame's own
     // description of them; so does taking margin out of an isolated position. Checked first, so the user is never asked
     // to confirm something the rules refuse; after the prompt (up to two minutes) the prices, dexes and leverage are read
     // again for the check under the lock.
     const orders = describeOrders(action, snapshot.registry, snapshot.markPrices, compiled.marketOrder !== undefined);
     const countedAt = this.correctedNow();
     const recent = orders.totalUsd > 0 ? await this.coordinator.usage(usageKey, countedAt) : undefined;
-    const large = orders.totalUsd > CONFIRM_ORDERS_ABOVE_USD;
+    const confirmLimit = confirmLimitOf(storedConfirm, this.confirmEarliest(countedAt));
+    const large = orders.totalUsd > confirmLimit.usd;
     // The total the prompt shows: the 10 minutes' when they pass their limit, else the day's when it does.
     const addsUp =
       recent === undefined
         ? undefined
-        : recent.unpromptedUsd + orders.totalUsd > CONFIRM_UNPROMPTED_ABOVE_USD
+        : recent.unpromptedUsd + orders.totalUsd > confirmLimit.recentUsd
           ? { usd: recent.unpromptedUsd, windowMs: UNPROMPTED_WINDOW_MS, at: countedAt }
-          : recent.unpromptedDayUsd + orders.totalUsd > CONFIRM_UNPROMPTED_DAY_ABOVE_USD
+          : recent.unpromptedDayUsd + orders.totalUsd > confirmLimit.dailyUsd
             ? { usd: recent.unpromptedDayUsd, windowMs: UNPROMPTED_DAY_MS, at: countedAt }
             : undefined;
     const marginOut = intent.kind === "updateIsolatedMargin" && Number(intent.amountUsd) < 0 ? { coin: intent.coin, usd: -Number(intent.amountUsd) } : undefined;
@@ -1841,7 +2338,7 @@ export class FrameCore {
       await evaluate(stored, this.correctedNow());
       if (marginOut) await this.confirmMarginRemoval(marginOut, snapshot, compiled.vaultAddress);
       else if (leverageUp) await this.confirmLeverageRaise(leverageUp, snapshot, compiled.vaultAddress);
-      else await this.confirmOrders(orders, compiled.vaultAddress, addsUp);
+      else await this.confirmOrders(orders, compiled.vaultAddress, confirmLimit, large, addsUp);
       confirmed = true;
       snapshot = await this.marketSnapshot(coins);
       requirePinnedDexes();
@@ -1877,6 +2374,15 @@ export class FrameCore {
       const now = this.correctedNow();
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
       const { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter } = await evaluate(limits, now);
+      // The confirmation limit too: lowered since (in another tab, or while this waited for the lock), orders it now
+      // asks about aren't signed without the user, and the rolling totals below take the lower of the two.
+      const confirmNow = confirmLimitOf((await this.readConfirm()).masters.get(master), this.confirmEarliest(now));
+      if (!confirmed && orders.totalUsd > confirmNow.usd) {
+        throw new SignerFailure("SIGNER_BUSY", "Your confirmation limit changed before this was signed; nothing was signed. Send it again to confirm it in the signer window.", {
+          retryable: true,
+          details: { reason: "limitsChanged" },
+        });
+      }
 
       let nonce: number;
       try {
@@ -1899,8 +2405,8 @@ export class FrameCore {
             usd: orders.totalUsd,
             confirmed,
             clears: confirmed && addsUp !== undefined ? { windowMs: addsUp.windowMs, at: addsUp.at } : false,
-            maxUsd: CONFIRM_UNPROMPTED_ABOVE_USD,
-            maxDayUsd: CONFIRM_UNPROMPTED_DAY_ABOVE_USD,
+            maxUsd: Math.min(confirmLimit.recentUsd, confirmNow.recentUsd),
+            maxDayUsd: Math.min(confirmLimit.dailyUsd, confirmNow.dailyUsd),
           },
         });
       } catch (e) {
@@ -2216,24 +2722,36 @@ export class FrameCore {
    * holding. Cancel or timeout: USER_CANCELLED / USER_TIMEOUT, and nothing is signed. A frame without a UI can't ask,
    * so it refuses them.
    */
-  private async confirmOrders(orders: OrdersDescription, subAccount: string | undefined, recent?: { usd: number; windowMs: number }): Promise<void> {
-    const dollars = (n: number) => `$${Math.round(n).toLocaleString("en-US")}`;
+  private async confirmOrders(
+    orders: OrdersDescription,
+    subAccount: string | undefined,
+    limits: ConfirmLimitStatus,
+    large: boolean,
+    recent?: { usd: number; windowMs: number },
+  ): Promise<void> {
     const total = dollars(orders.totalUsd);
     const day = recent !== undefined && recent.windowMs >= UNPROMPTED_DAY_MS;
     const window = day ? "24 hours" : `${Math.round(UNPROMPTED_WINDOW_MS / 60_000)} minutes`;
-    const limit = day ? CONFIRM_UNPROMPTED_DAY_ABOVE_USD : CONFIRM_UNPROMPTED_ABOVE_USD;
+    const limit = day ? limits.dailyUsd : limits.recentUsd;
     if (!this.ui) {
       this.metrics.policyDenials++;
       const message =
-        recent === undefined
-          ? `Orders of more than $${CONFIRM_ORDERS_ABOVE_USD.toLocaleString("en-US")} (${total} here) need your confirmation in the signer frame, which has no user interface here.`
-          : `Orders past $${limit.toLocaleString("en-US")} in ${window} without a confirmation (${dollars(recent.usd)} so far, ${total} here) need your confirmation in the signer frame, which has no user interface here.`;
+        large || recent === undefined
+          ? `Orders of more than ${dollars(limits.usd)} (${total} here) need your confirmation in the signer frame, which has no user interface here.`
+          : `Orders past ${dollars(limit)} in ${window} without a confirmation (${dollars(recent.usd)} so far, ${total} here) need your confirmation in the signer frame, which has no user interface here.`;
       throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: "ORDER_NOTIONAL_EXCEEDED", message }] } });
     }
     const one = orders.lines.length === 1;
     const sub = subAccount?.toLowerCase();
     const whose = sub === undefined ? "" : ` for sub-account ${sub.slice(0, 6)}…${sub.slice(-4)}`;
-    const why = recent === undefined ? "" : ` Orders of about ${dollars(recent.usd)} went out without a confirmation in the last ${window}, so ${one ? "this one needs" : "these need"} yours.`;
+    // The reason that applies: the size itself (with what went out unconfirmed lately, when there was any), else the
+    // total of the last 10 minutes or 24 hours.
+    const lately = recent !== undefined && recent.usd >= 1 ? ` About ${dollars(recent.usd)} went out without a confirmation in the last ${window}.` : "";
+    const why = large
+      ? ` Orders above ${dollars(limits.usd)} need your confirmation.${lately}`
+      : recent === undefined
+        ? ""
+        : ` Orders of about ${dollars(recent.usd)} went out without a confirmation in the last ${window}, so ${one ? "this one needs" : "these need"} yours.`;
     // Side, size and market of the first order, and the total, in the title and on the button too, which always show
     // whole: a parent that leaves the prompt little room can't hide what is confirmed.
     const first = orders.heads[0] ?? "";

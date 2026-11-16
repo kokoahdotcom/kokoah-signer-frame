@@ -82,6 +82,7 @@ export const METHODS = [
   "revoke",
   "setTheme",
   "setStorageMode",
+  "setConfirmLimit",
 ] as const;
 export type MethodName = (typeof METHODS)[number];
 
@@ -225,6 +226,11 @@ export interface PolicySummary {
 
 /** Status of the frame and its key (`getStatus`, `statusChanged`). */
 export interface SignerStatus {
+  /**
+   * The order sizes the frame signs without asking, for the key's master (frames with `capabilities.setsConfirmLimit`;
+   * see `setConfirmLimit`). Without a key, or for a master that set nothing: the defaults.
+   */
+  confirmLimit?: ConfirmLimitStatus;
   hasKey: boolean;
   keyState: KeyState;
   agentAddress: Hex | null;
@@ -318,6 +324,13 @@ export interface HelloResult {
      * (`promptChanged` kind `agent-approval`; see `CreateAgentResult.approveAgent`). Absent in older frames.
      */
     showsAgentApproval?: boolean;
+    /**
+     * The user may set the size above which orders wait for the `order` prompt (`setConfirmLimit`, 2026-11-16): lower at
+     * once, higher only with the master wallet's signature, the frame's own prompt and a delay. `status.confirmLimit`
+     * then gives the numbers in force for the key's master, and `limits` keeps the defaults. Absent in older frames,
+     * which use `limits` for everyone.
+     */
+    setsConfirmLimit?: boolean;
   };
   /**
    * The builder code on every order. `feeTenthsBps` is the standard fee (the most an order pays; the policy's cap).
@@ -603,6 +616,7 @@ export interface MethodParams {
   revoke: RevokeParams;
   setTheme: SetThemeParams;
   setStorageMode: SetStorageModeParams;
+  setConfirmLimit: SetConfirmLimitParams;
 }
 /** Result of every method. */
 export interface MethodResults {
@@ -618,6 +632,7 @@ export interface MethodResults {
   revoke: RevokeResult;
   setTheme: SetThemeResult;
   setStorageMode: SetStorageModeResult;
+  setConfirmLimit: SetConfirmLimitResult;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -681,9 +696,12 @@ export interface SignerError {
      * another tab signed orders in between, so this one now needs the `order` prompt. `limitsChanged`: the stored limits
      * changed while the user confirmed. `marketMoved`: the mark moved toward a confirmed order's market trigger, so its
      * slippage would now be refused. `leverageChanged`: the position's leverage changed while the user confirmed raising
-     * it. Each time, sending the request again shows the current state.
+     * it. `keyChanged`: the trading key changed during `setConfirmLimit`. Each time, sending the request again shows the
+     * current state. LIMIT_LOOSENING_REJECTED from `setConfirmLimit`: `signature` (none, or not the master wallet's),
+     * `expired` (older than a week, or ahead of the clock), `stale` (older than the last change on this device): ask the
+     * user to sign again. `keyChanged` and `limitsChanged` there: send it again.
      */
-    reason?: "lock" | "ordersSigned" | "limitsChanged" | "marketMoved" | "leverageChanged";
+    reason?: "lock" | "ordersSigned" | "limitsChanged" | "marketMoved" | "leverageChanged" | "keyChanged" | "signature" | "expired" | "stale";
     /** Anything else worth showing (never secrets). */
     [key: string]: unknown;
   };
@@ -782,4 +800,89 @@ export function isFrameToParentMessage(x: unknown): x is FrameToParentMessage {
   }
   if (x.kind === "event") return typeof x.event === "string" && (EVENTS as readonly string[]).includes(x.event) && "data" in x;
   return false;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The order confirmation limit (setConfirmLimit, 2026-11-16)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The bounds of the order confirmation limit. `defaultUsd` is the frame's own (`hello.limits.confirmOrdersAboveUsd`);
+ * the rolling totals follow from the limit in force: `recentFactor` times it in the last 10 minutes, `dailyFactor`
+ * times it in 24 hours. A raise above the default takes effect `delayMs` after the user confirms it in the frame's
+ * prompt (from HL's time read then; never sooner than `delayMs` after the wallet signed), and a signature older than
+ * `signatureMaxAgeMs` (or more than `signatureFutureMs` ahead of the frame's clock) is refused.
+ */
+export const CONFIRM_LIMIT = Object.freeze({
+  defaultUsd: 25_000,
+  minUsd: 100,
+  maxUsd: 1_000_000,
+  recentFactor: 4,
+  dailyFactor: 10,
+  delayMs: 24 * 60 * 60 * 1000,
+  signatureMaxAgeMs: 7 * 24 * 60 * 60 * 1000,
+  signatureFutureMs: 5 * 60 * 1000,
+});
+
+/** The order sizes in force for the key's master. */
+export interface ConfirmLimitStatus {
+  /** One `signAndSubmit` whose orders come to more than this in all waits for the user's confirmation. */
+  usd: number;
+  /** Orders signed without a prompt may add up to this in the last `limits.recentOrdersWindowMs`... */
+  recentUsd: number;
+  /** ...and to this in 24 hours; past either, the next order waits for the user too. */
+  dailyUsd: number;
+  /** A raise the user confirmed, in force from `effectiveAt` (ms since the epoch): until then `usd` applies. */
+  pending?: { usd: number; effectiveAt: number };
+  /**
+   * The frame hasn't checked its clock with HL in this load yet: nothing above the default counts until it has, so
+   * `usd` and `pending` aren't final (a statusChanged follows the check). Don't change the limit from them meanwhile.
+   */
+  clockUnchecked?: true;
+}
+
+/**
+ * Sets the order confirmation limit of the key's master. Needs an active key, one HL lists for that master (`NO_KEY`,
+ * `KEY_PENDING`, `KEY_EXPIRED`); a raise above the default also HL's time (`HL_UNAVAILABLE`, retryable). An integer
+ * from `CONFIRM_LIMIT.minUsd` to `CONFIRM_LIMIT.maxUsd`, compared with the limit stored for this master.
+ * - Lower than the limit in force: applied at once, no prompt; it also drops a raise still waiting.
+ * - The same limit (and the same waiting raise): nothing changes (send it again at every handshake).
+ * - Higher, up to `CONFIRM_LIMIT.defaultUsd`: the frame's own prompt (`promptChanged` kind `limits`), then at once.
+ * - Higher than the default: also `authorization`, the master wallet's signature (EIP-191 `personal_sign`) of
+ *   {@link confirmLimitMessage} for this account, a limit at least `usd`, the network and `issuedAt` (ms since the
+ *   epoch). The frame checks it, shows its prompt, and the raise takes effect `CONFIRM_LIMIT.delayMs` after the user
+ *   confirms it there (on another device too: each frame waits its own day); the limit in force stays until then
+ *   (`status.confirmLimit.pending`). A limit lowered after a raise but still above the default needs no new signature:
+ *   send it with the raise's. Refused (`LIMIT_LOOSENING_REJECTED`, `details.reason`): no or a wrong signature
+ *   (`signature`), one older than a week or ahead of the clock (`expired`), or one older than the last change of this
+ *   limit on this device or than the raise it accepted last (`stale`).
+ * The limit is kept per network and per master on the signer origin, in its own record; another wallet's key in this
+ * browser has its own (the default until it sets one).
+ */
+export interface SetConfirmLimitParams {
+  usd: number;
+  /**
+   * The master wallet's signature of {@link confirmLimitMessage} for `usd` (the limit signed, at least the `usd` set:
+   * a limit lowered after a raise is sent with the raise's signature) and `issuedAt`.
+   */
+  authorization?: { usd: number; issuedAt: number; signature: Hex };
+}
+export interface SetConfirmLimitResult {
+  confirmLimit: ConfirmLimitStatus;
+}
+
+/** The text the master wallet signs to raise the limit above the default (the frame rebuilds it to check). */
+export function confirmLimitMessage(p: { account: Hex; usd: number; issuedAt: number; network: NetworkName }): string {
+  const network = p.network === "mainnet" ? "Hyperliquid mainnet" : "Hyperliquid testnet";
+  return [
+    "Kokoah: raise the order confirmation limit",
+    "",
+    `Account: ${p.account.toLowerCase()}`,
+    `Network: ${network}`,
+    `New limit: orders above $${p.usd.toLocaleString("en-US")} need my confirmation in the Kokoah signer`,
+    `Signed at: ${new Date(p.issuedAt).toISOString()}`,
+    "Takes effect: 24 hours after I confirm it in the Kokoah signer",
+    "",
+    "Sign this only if you are raising this limit yourself.",
+  ].join("\n");
 }

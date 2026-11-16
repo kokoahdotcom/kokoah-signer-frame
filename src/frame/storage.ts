@@ -4,7 +4,8 @@
  *
  * Object stores:
  * - `keys` (key `slot`): the encrypted agent key record (`device` and `passkey` modes; slot `current`). Never
- *   plaintext. Also the user's limits for each network (slot `limits/<network>`, see {@link StoredLimitsRecord}): kept
+ *   plaintext. Also the user's limits for each network (slot `limits/<network>`, see {@link StoredLimitsRecord}) and
+ *   the order confirmation limits (slot `confirm/<network>`, see {@link StoredConfirmRecord}): kept
  *   in this store so the schema version stays 1 and an older frame build still opens the database.
  * - `usage` (key `agent`): last nonce, recent order times, today's notional, recent HLP deposits and recent orders
  *   signed without a prompt, per master account (`account/<network>/<master>`, so a new key for the account keeps
@@ -71,6 +72,51 @@ export interface StoredLimitsRecord {
    */
   dailyOnTop?: string[];
   updatedAt: number;
+}
+
+/**
+ * The order confirmation limits of each master on one network (setConfirmLimit, 2026-11-16), in their own slot and
+ * revision: a build that doesn't know them rewrites the limits record and leaves this one alone.
+ */
+export interface StoredConfirmRecord {
+  slot: `confirm/${NetworkName}`;
+  v: 1;
+  network: NetworkName;
+  /** Bumped by every write; a write based on an older read is refused (see {@link SignerStore.replaceConfirm}). */
+  rev: number;
+  /** By lowercase master address. */
+  masters: Record<string, StoredConfirmLimit>;
+  updatedAt: number;
+}
+
+/**
+ * The master wallet's signature of a confirmation limit up to `signedUsd`, made at `issuedAt`, and the time it counts
+ * from: a day after HL's time read right after the user confirmed it in the frame, so never less than a day after
+ * `issuedAt`.
+ */
+export interface ConfirmLimitGrant {
+  signedUsd: number;
+  issuedAt: number;
+  signature: `0x${string}`;
+  effectiveAt: number;
+}
+
+/**
+ * One master's confirmation limit: `usd` in force (above the default only with `granted`, the signature that allowed
+ * it), `since` the last change on this device (a raise the wallet signed before it is stale), `raise` a raise the user
+ * confirmed, in force from its `effectiveAt`, and `at` the last write (the record keeps a bounded number of masters).
+ */
+export interface StoredConfirmLimit {
+  usd: number;
+  since: number;
+  at: number;
+  granted?: ConfirmLimitGrant;
+  raise?: ConfirmLimitGrant & { usd: number };
+}
+
+/** Slot of a network's confirmation limits in the `keys` store. */
+export function confirmSlot(network: NetworkName): StoredConfirmRecord["slot"] {
+  return `confirm/${network}`;
 }
 
 /** Slot of a network's limits record in the `keys` store. */
@@ -155,6 +201,9 @@ export interface SignerStore {
    * transaction (serialized across tabs). Returns false, writing nothing, when another write came first.
    */
   replaceLimits(record: StoredLimitsRecord, expectedRev: number): Promise<boolean>;
+  getConfirm(network: NetworkName): Promise<StoredConfirmRecord | undefined>;
+  /** Like {@link replaceLimits}, for the confirmation limits. */
+  replaceConfirm(record: StoredConfirmRecord, expectedRev: number): Promise<boolean>;
   getRegion(network: NetworkName): Promise<StoredRegionRecord | undefined>;
   putRegion(record: StoredRegionRecord): Promise<void>;
 }
@@ -283,6 +332,25 @@ export class IdbSignerStore implements SignerStore {
     return written;
   }
 
+  async getConfirm(network: NetworkName): Promise<StoredConfirmRecord | undefined> {
+    const tx = this.db.transaction(KEYS, "readonly");
+    return (await req(tx.objectStore(KEYS).get(confirmSlot(network)))) as StoredConfirmRecord | undefined;
+  }
+
+  async replaceConfirm(record: StoredConfirmRecord, expectedRev: number): Promise<boolean> {
+    const tx = this.db.transaction(KEYS, "readwrite");
+    const store = tx.objectStore(KEYS);
+    let written = false;
+    const get = store.get(record.slot);
+    get.onsuccess = () => {
+      if (limitsRev(get.result) !== expectedRev) return;
+      store.put(record);
+      written = true;
+    };
+    await done(tx);
+    return written;
+  }
+
   async getRegion(network: NetworkName): Promise<StoredRegionRecord | undefined> {
     const tx = this.db.transaction(KEYS, "readonly");
     return (await req(tx.objectStore(KEYS).get(regionSlot(network)))) as StoredRegionRecord | undefined;
@@ -295,7 +363,7 @@ export class IdbSignerStore implements SignerStore {
   }
 }
 
-/** A stored limits record's revision (0: none, or unreadable). */
+/** A stored limits (or confirmation limits) record's revision (0: none, or unreadable). */
 export function limitsRev(record: unknown): number {
   const rev = (record as { rev?: unknown } | undefined)?.rev;
   return typeof rev === "number" && Number.isSafeInteger(rev) && rev > 0 ? rev : 0;
@@ -308,6 +376,7 @@ export class MemorySignerStore implements SignerStore {
   private readonly usage = new Map<string, UsageRecord>();
   private readonly agents = new Set<string>();
   private readonly limits = new Map<string, StoredLimitsRecord>();
+  private readonly confirm = new Map<string, StoredConfirmRecord>();
   private readonly regions = new Map<string, StoredRegionRecord>();
 
   async getKeyRecord(): Promise<StoredKeyRecord | undefined> {
@@ -342,6 +411,15 @@ export class MemorySignerStore implements SignerStore {
   async replaceLimits(record: StoredLimitsRecord, expectedRev: number): Promise<boolean> {
     if (limitsRev(this.limits.get(record.network)) !== expectedRev) return false;
     this.limits.set(record.network, structuredClone(record));
+    return true;
+  }
+  async getConfirm(network: NetworkName): Promise<StoredConfirmRecord | undefined> {
+    const r = this.confirm.get(network);
+    return r === undefined ? undefined : structuredClone(r);
+  }
+  async replaceConfirm(record: StoredConfirmRecord, expectedRev: number): Promise<boolean> {
+    if (limitsRev(this.confirm.get(record.network)) !== expectedRev) return false;
+    this.confirm.set(record.network, structuredClone(record));
     return true;
   }
   async getRegion(network: NetworkName): Promise<StoredRegionRecord | undefined> {
