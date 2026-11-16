@@ -91,7 +91,7 @@ export interface StoredConfirmRecord {
 
 /**
  * The master wallet's signature of a confirmation limit up to `signedUsd`, made at `issuedAt`, and the time it counts
- * from: a day after the user confirmed it in the frame (on the frame's clock), so never less than a day after
+ * from: a day after HL's time read right after the user confirmed it in the frame, so never less than a day after
  * `issuedAt`.
  */
 export interface ConfirmLimitGrant {

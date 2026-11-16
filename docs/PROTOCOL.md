@@ -828,8 +828,9 @@ with a valid signature of the master's wallet for at least that much, and from n
 otherwise the default applies. The day runs on HL's time: a raise is dated with HL's time read right after the user
 confirms it, and counts once two clocks say its time has come: the frame's clock checked with HL, and HL's time at the
 last check plus the browser's monotonic clock since. So a device clock that is off, changed or stopped only delays it.
-Before the frame could check its clock in this load nothing above the default counts. Lowerings never depend on a
-clock: every change is compared with what is stored, so one answered as done is stored. The rest of the record (such as whether the user confirmed it) is trusted as the frame's storage
+Before the frame could check its clock in this load nothing above the default counts. A lowering to at most the stored
+limit never depends on a clock, and every change is compared with what is stored, so one answered as done is stored.
+A change is answered once signing already under way for the key is over (at most the agent lock's wait). The rest of the record (such as whether the user confirmed it) is trusted as the frame's storage
 is for the other limits. `setLimits` leaves it as it is. Signing reads it again under the agent lock: orders a lowering
 made since now asks about are refused with `SIGNER_BUSY` (`limitsChanged`), and sent again they ask. The frame's own
 status line shows a limit of the user's own and a raise still waiting. When a waiting raise takes effect, the frame

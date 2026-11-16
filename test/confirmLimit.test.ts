@@ -396,8 +396,10 @@ describe("the order confirmation limit", () => {
     // The same grant for what it allows: counted.
     await tampered((m) => (m[ownerKey] = { usd: 150_000, since: 0, at: 0, granted: { signedUsd, issuedAt, signature, effectiveAt } }));
     expect((await status())?.usd).toBe(150_000);
-    // A malformed entry: dropped.
+    // An entry with unreadable times keeps its (lower) limit; one with an unreadable limit is dropped.
     await tampered((m) => (m[ownerKey] = { usd: 1_000, since: -1, at: 0 }));
+    expect((await status())?.usd).toBe(1_000);
+    await tampered((m) => (m[ownerKey] = { usd: 7, since: 0, at: 0 }));
     expect((await status())?.usd).toBe(25_000);
   });
 
@@ -604,6 +606,29 @@ describe("the order confirmation limit", () => {
     await waitFor(() => h.core.status().clockOffsetMs === 2 * HOUR);
     // The app dates the signature with the frame's clock, as it reports it.
     await confirmed({ usd: 150_000, authorization: await signed(150_000, h.core.correctedNow()) });
+    expect((await status())?.pending?.usd).toBe(150_000);
+  });
+
+  it("dates a lowering with a clock that never runs ahead of HL, so fresh signatures still work after the clock is set right", async () => {
+    // The device clock is a day ahead at load and HL's time can't be read; the user lowers the limit.
+    const clock = new Clock();
+    const hl = new MockHl(clock);
+    hl.serverOffsetMs = -DAY;
+    hl.infoFailure = (body) => body.type === "exchangeStatus";
+    let mono = 0;
+    h = await FrameHarness.create({ clock, hl, monotonic: () => mono });
+    await h.ok("hello", { protocolVersion: 1 });
+    const created = await h.createAgent({ userAddress: owner.address, validForDays: 30, storageMode: "device" });
+    h.hl.approve(owner.address, created.agentAddress, created.agentName, created.validUntil);
+    await h.ok("confirmAgent", {});
+    await h.ok("setConfirmLimit", { usd: 10_000 });
+    // HL answers again: a raise signed on HL's time is taken.
+    hl.infoFailure = null;
+    clock.advance(MINUTE);
+    mono += MINUTE;
+    await h.ok("getStatus", {});
+    await h.core.syncClock();
+    await confirmed({ usd: 150_000, authorization: await signed(150_000, clock.now() + hl.serverOffsetMs) });
     expect((await status())?.pending?.usd).toBe(150_000);
   });
 
