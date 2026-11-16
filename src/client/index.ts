@@ -146,7 +146,10 @@ interface Pending {
   timer: ReturnType<typeof setTimeout> | undefined;
 }
 
-/** Methods without effects outside the frame's memory: after a reload the client sends them again to the new frame. */
+/**
+ * Methods safe to send again to a reloaded frame (the client does): without effects outside the frame's memory, or
+ * compared first with what the frame stored, so the same request again changes nothing.
+ */
 const RESEND_AFTER_RELOAD: ReadonlySet<MethodName> = new Set<MethodName>(["getStatus", "setLimits", "setConfirmLimit", "setTheme", "lock", "confirmAgent"]);
 
 type Listener<E extends ClientEventName> = (data: ClientEventData[E]) => void;

@@ -6,9 +6,10 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { generatePrivateKey, privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
+import { IDBFactory } from "fake-indexeddb";
 import { CONFIRM_LIMIT, confirmLimitMessage, type NetworkName } from "../src/protocol/index.js";
 import { confirmSlot, IdbSignerStore, limitsSlot, type StoredConfirmLimit, type StoredConfirmRecord } from "../src/frame/storage.js";
-import { DAY, FakeBus, FakeLocks, FrameHarness, limitOrder, waitFor, type HarnessOptions } from "./helpers.js";
+import { Clock, DAY, FakeBus, FakeLocks, FrameHarness, limitOrder, MockHl, waitFor, type HarnessOptions } from "./helpers.js";
 
 let h: FrameHarness;
 const others: FrameHarness[] = [];
@@ -20,6 +21,7 @@ afterEach(() => {
 const owner = privateKeyToAccount(generatePrivateKey());
 const stranger = privateKeyToAccount(generatePrivateKey());
 const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
 
 /** An active key whose master is `master` in `frame`. */
 async function activeKey(frame: FrameHarness, master: PrivateKeyAccount, replaceExisting = false) {
@@ -396,10 +398,10 @@ describe("the order confirmation limit", () => {
     expect((await status())?.usd).toBe(25_000);
   });
 
-  it("keeps at most 32 wallets, never dropping a lowered one", async () => {
+  it("keeps at most 256 wallets, never dropping a lowered one", async () => {
     await ready();
     const filler = (m: Record<string, StoredConfirmLimit>) => {
-      for (let i = 0; i < 32; i++) m[`0x${i.toString(16).padStart(40, "0")}`] = { usd: 1_000, since: 0, at: i };
+      for (let i = 0; i < 256; i++) m[`0x${i.toString(16).padStart(40, "0")}`] = { usd: 1_000, since: 0, at: i };
     };
     await tampered(filler);
     expect((await h.fail("setConfirmLimit", { usd: 10_000 })).code).toBe("STORAGE_FAILED");
@@ -410,9 +412,82 @@ describe("the order confirmation limit", () => {
     });
     await h.ok("setConfirmLimit", { usd: 10_000 });
     const rec = await (await IdbSignerStore.open(h.idb)).getConfirm(await network());
-    expect(Object.keys(rec!.masters)).toHaveLength(32);
+    expect(Object.keys(rec!.masters)).toHaveLength(256);
     expect(rec!.masters[atDefault]).toBeUndefined();
     expect(rec!.masters[ownerKey]?.usd).toBe(10_000);
+  });
+
+  it("judges the day only on a clock checked with HL in this load, never on the device's alone", async () => {
+    // The device clock is 12 hours behind HL.
+    const clock = new Clock();
+    const hl = new MockHl(clock);
+    hl.serverOffsetMs = 12 * HOUR;
+    await ready({ clock, hl });
+    await waitFor(() => h.core.status().clockOffsetMs === 12 * HOUR);
+    const idb = h.idb;
+    // Reloaded while the page keeps HL's time from answering: no raise.
+    h.destroy();
+    hl.infoFailure = (body) => body.type === "exchangeStatus";
+    h = await FrameHarness.create({ clock, hl, idb });
+    await h.ok("hello", { protocolVersion: 1 });
+    const authorization = await signed(150_000, clock.now() + hl.serverOffsetMs);
+    const refused = await h.fail("setConfirmLimit", { usd: 150_000, authorization });
+    expect(refused).toMatchObject({ code: "HL_UNAVAILABLE", retryable: true });
+    expect(prompts("limits")).toHaveLength(0);
+    // HL answers: the raise, a day from the confirmation on HL's time.
+    hl.infoFailure = null;
+    await confirmed({ usd: 150_000, authorization });
+    const confirmedAt = clock.now() + hl.serverOffsetMs;
+    expect((await status())?.pending).toEqual({ usd: 150_000, effectiveAt: confirmedAt + DAY });
+    // A day later, a reload whose clock check fails: the raise doesn't count until it succeeds.
+    clock.advance(DAY);
+    h.destroy();
+    hl.infoFailure = (body) => body.type === "exchangeStatus";
+    h = await FrameHarness.create({ clock, hl, idb });
+    await h.ok("hello", { protocolVersion: 1 });
+    expect((await status())?.usd).toBe(25_000);
+    hl.infoFailure = null;
+    expect(await asked("checked", "1.4")).toBe(false); // the order's own clock check succeeds: $140,000 without a prompt
+    expect((await status())?.usd).toBe(150_000);
+  });
+
+  it("signs nothing when the stored confirmation limits can't be read", async () => {
+    const idb = new IDBFactory();
+    const real = await IdbSignerStore.open(idb);
+    let broken = false;
+    const store = new Proxy(real, {
+      get(target, prop, receiver) {
+        if (prop === "getConfirm" && broken) return async () => Promise.reject(new Error("unreadable"));
+        const value = Reflect.get(target, prop, receiver) as unknown;
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    await ready({ idb, store });
+    await h.ok("setConfirmLimit", { usd: 10_000 });
+    broken = true;
+    const calls = h.hl.exchangeCalls.length;
+    expect((await h.fail("signAndSubmit", { requestId: "x", intent: btc("0.01") })).code).toBe("STORAGE_FAILED");
+    expect(h.hl.exchangeCalls).toHaveLength(calls);
+  });
+
+  it("drops a waiting raise when the user sets a limit up to the default", async () => {
+    await ready();
+    await h.ok("setConfirmLimit", { usd: 10_000 });
+    await confirmed({ usd: 150_000, authorization: await signed(150_000) });
+    expect((await status())?.pending?.usd).toBe(150_000);
+    await confirmed({ usd: 20_000 });
+    expect(await status()).toEqual({ usd: 20_000, recentUsd: 80_000, dailyUsd: 200_000 });
+  });
+
+  it("scales the 24-hour total with it: ten times it", async () => {
+    await ready();
+    await h.ok("setConfirmLimit", { usd: 1_000 });
+    // $900 every 11 minutes: never $4,000 in 10 minutes, but $9,900 after eleven orders.
+    for (let i = 0; i < 11; i++) {
+      expect(await asked(`d${i}`, "0.009")).toBe(false);
+      h.clock.advance(11 * MINUTE);
+    }
+    expect(await asked("d11", "0.009")).toBe(true); // $10,800 would pass $10,000
   });
 
   it("can't be raised in a frame with no user interface, which refuses orders above it in the user's numbers", async () => {

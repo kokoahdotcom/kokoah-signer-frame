@@ -227,12 +227,13 @@ In the examples, `→` is the `params` the parent sends and `←` is the `result
   Absent in older frames: they keep limits in memory, apply anything within the baseline at once, and the app must
   re-apply limits after every load.
 - `confirmsLargeOrders` is true when the frame asks the user before signing orders above `limits.confirmOrdersAboveUsd`
-  ($25,000) in all (see `signAndSubmit`). Only then tell the user to confirm such an order in the signer window. Absent
-  in older frames, which sign them without asking.
+  ($25,000) in all (see `signAndSubmit`; with `setsConfirmLimit`, the key's master's own limit in
+  `status.confirmLimit`). Only then tell the user to confirm such an order in the signer window. Absent in older frames,
+  which sign them without asking.
 - `confirmsRecentOrders` is true when the frame also asks before orders that would take what it signed without a
   prompt in the last `limits.recentOrdersWindowMs` (10 minutes) above `limits.confirmRecentOrdersAboveUsd` ($100,000),
   or in the last 24 hours above `limits.confirmDailyOrdersAboveUsd` ($250,000; absent in frames before 2026-10-23)
-  (see `signAndSubmit`). Absent in older frames.
+  (see `signAndSubmit`; with `setsConfirmLimit`, 4 and 10 times the master's own limit). Absent in older frames.
 - `showsAgentApproval` is true when the frame shows its agent approval panel after `createAgent` (see there). Absent
   in older frames.
 - `status` is the frame's `SignerStatus` at the handshake (see `getStatus`), including the key's expiry state.
@@ -671,7 +672,8 @@ keys. Orders that would take the first above `hello.limits.confirmRecentOrdersAb
 `dailyUsd`, 4 and 10 times the master's limit), wait for the same `order` prompt, which then also says how much
 went out without a confirmation in that time; confirming it starts both totals again (confirming a large order whose
 prompt didn't show them leaves them). Confirmed orders never count. So a hijacked page can't trade large amounts as
-many orders just under $25,000, however it spreads them out: at most $250,000 a day without the user. A frame without a UI refuses them (`POLICY_DENIED`,
+many orders just under the limit, however it spreads them out: at most 10 times the limit a day without the user
+($250,000 at the default; up to $10,000,000 after a raise the user confirmed). A frame without a UI refuses them (`POLICY_DENIED`,
 `ORDER_NOTIONAL_EXCEEDED`). When another tab signed orders between the check and the signature, the call fails with
 `SIGNER_BUSY` (retryable, nothing sent): send it again and it asks.
 
@@ -818,19 +820,22 @@ The app should then ask the user to sign again. Another device can take the same
 old: after that frame's prompt, and a day later.
 
 Stored in its own record per network (`confirm/<network>`, with its own revision and compare-and-set, so it binds every
-tab, survives reloads and is left alone by builds that don't know it), **per master**, for at most 32 wallets (when
-full, the oldest at or above the default go first; a lowered one is never dropped). A key of another wallet in this
+tab, survives reloads and is left alone by builds that don't know it), **per master**, for at most 256 wallets (when
+full, the oldest at or above the default go first; a lowered one is never dropped, and a new wallet is then refused
+with `STORAGE_FAILED`, not retryable). A key of another wallet in this
 browser has its own, the default until it sets one. A stored limit above the default, and a waiting raise, count only
-with a valid signature of the master's wallet for at least that much, and from no sooner than a day after it; otherwise
-the default applies. The rest of the record (such as whether the user confirmed it) is trusted as the frame's storage
+with a valid signature of the master's wallet for at least that much, from no sooner than a day after it, and only
+once the frame checked its clock with HL in this load (until then, and for raises refused with `HL_UNAVAILABLE`, the
+device's own clock is never trusted with the day); otherwise the default applies. The rest of the record (such as whether the user confirmed it) is trusted as the frame's storage
 is for the other limits. `setLimits` leaves it as it is. Signing reads it again under the agent lock: orders a lowering
 made since now asks about are refused with `SIGNER_BUSY` (`limitsChanged`), and sent again they ask. The frame's own
 status line shows a limit of the user's own and a raise still waiting. When a waiting raise takes effect, the frame
 emits `statusChanged`. A frame without a user interface refuses every raise.
 
 Errors: `NO_KEY`, `LIMIT_LOOSENING_REJECTED` (above), `USER_CANCELLED` / `USER_TIMEOUT` (nothing changed), `PROMPT_BUSY`,
-`KEY_PENDING`, `KEY_EXPIRED`, `SIGNER_BUSY` (retryable: the stored limit changed in another tab while the user was
-confirming, `limitsChanged`, or the key changed, `keyChanged`),
+`KEY_PENDING`, `KEY_EXPIRED`, `HL_UNAVAILABLE` (retryable: a raise above the default before the frame could check its
+clock with HL), `SIGNER_BUSY` (retryable: the stored limit changed in another tab while the user was confirming,
+`limitsChanged`, or the key changed, `keyChanged`),
 `STORAGE_FAILED` (retryable), `INVALID_REQUEST`.
 
 ### `revoke`
@@ -940,7 +945,7 @@ The baseline is built into the frame and can't be loosened:
 | Leverage | **50x**, and never above each market's own maximum (`updateLeverage` above it is denied). Where a market allows more than the cap (the baseline's or the user's), the frame reads the account's leverage on HL itself and refuses new entries while it is set higher |
 | Rate | **60 orders per minute** per agent (TP/SL legs count; cancels don't). Persisted, so a reload doesn't reset it |
 | Notional | $250,000 per order, $25,000,000 per UTC day per key across every account (reduce-only orders exempt) |
-| Large orders | More than $25,000 of orders in one action (reduce-only included) only after the user confirms the frame's own prompt (`signAndSubmit`, "Large orders") |
+| Large orders | More than the master's confirmation limit ($25,000 unless the user set one with `setConfirmLimit`, at most $1,000,000) of orders in one action (reduce-only included) only after the user confirms the frame's own prompt (`signAndSubmit`, "Large orders") |
 | Stop-losses (with `requireStopLossForNewEntries`) | An entry's attached stop must cover it, sit on the losing side and be within **25%** of the entry. The frame reads the account's positions and resting orders on HL itself (`clearinghouseState`, `frontendOpenOrders`, and `orderStatus` for an order an action names that isn't among them) before a cancel, a modify or an entry, and refuses (`STOP_LOSS_REQUIRED`) one that would take stop-loss cover away from a position or, with `@kokoah/shared` from 2026-10-30, leave the position an entry adds to partly covered; setting a `scheduleCancel` is refused too (clearing one is allowed). Unreadable: `MARKET_DATA_UNAVAILABLE` (retryable) (2026-10-30) |
 | `expiresAfter` | Required; the frame uses now + 15 s (window ≤ 30 s) |
 | Origins | `manual`, `ai_ticket` |
