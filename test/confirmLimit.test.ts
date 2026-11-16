@@ -562,6 +562,29 @@ describe("the order confirmation limit", () => {
     expect(h.events("statusChanged").at(-1)?.confirmLimit).toEqual({ usd: 10_000, recentUsd: 40_000, dailyUsd: 100_000 });
   });
 
+  it("tries a first clock check that failed again by itself, and stops once it succeeds", async () => {
+    const clock = new Clock();
+    const hl = new MockHl(clock);
+    await ready({ clock, hl });
+    await h.ok("setConfirmLimit", { usd: 10_000 });
+    const idb = h.idb;
+    h.destroy();
+    hl.infoFailure = (body) => body.type === "exchangeStatus";
+    h = await FrameHarness.create({ clock, hl, idb });
+    await h.ok("hello", { protocolVersion: 1 });
+    expect((await status())?.clockUnchecked).toBe(true);
+    // HL answers again: the frame's own retry checks the clock, with no action from the parent.
+    hl.infoFailure = null;
+    const before = h.events("statusChanged").length;
+    await waitFor(() => h.events("statusChanged").length > before, 4_000);
+    expect(await status()).toEqual({ usd: 10_000, recentUsd: 40_000, dailyUsd: 100_000 });
+    // Checked: no more tries.
+    const asked = () => hl.infoCalls.filter((c) => c.type === "exchangeStatus").length;
+    const after = asked();
+    await new Promise((r) => setTimeout(r, 2_500));
+    expect(asked()).toBe(after);
+  });
+
   it("tells the parent its clock is checked even when the account has no limit of its own", async () => {
     const clock = new Clock();
     const hl = new MockHl(clock);
