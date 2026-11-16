@@ -822,9 +822,7 @@ export class FrameCore {
           this.log("clock.synced", { offsetMs: this.clockOffsetMs });
           // The confirmation limit in force may change with the new check (a raise whose time came), and the first check
           // settles what the status reports (`clockUnchecked`): tell the parent.
-          const k = this.key;
-          const own = k === null ? undefined : this.confirm.masters.get(k.meta.userAddress.toLowerCase());
-          if (stableStringify(this.confirmLimitNow()) !== shown || (first && own !== undefined)) this.confirmStatusChanged();
+          if (stableStringify(this.confirmLimitNow()) !== shown || (first && this.key !== null)) this.confirmStatusChanged();
           else this.scheduleConfirmTimer();
         }
       } catch {
