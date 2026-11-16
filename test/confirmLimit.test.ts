@@ -1,28 +1,38 @@
 /**
  * The order confirmation limit (setConfirmLimit): the user may lower the size above which orders wait for the frame's
  * prompt at once, raise it up to the default with the frame's own prompt, and above the default only with the master
- * wallet's signature, the frame's prompt and a day's wait. The rolling totals follow the limit in force.
+ * wallet's signature, the frame's prompt and a day's wait from that prompt. Kept per master; the rolling totals follow
+ * the limit in force.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { generatePrivateKey, privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
-import { IDBFactory } from "fake-indexeddb";
 import { CONFIRM_LIMIT, confirmLimitMessage, type NetworkName } from "../src/protocol/index.js";
-import { IdbSignerStore } from "../src/frame/storage.js";
-import { DAY, FrameHarness, limitOrder, waitFor, type HarnessOptions } from "./helpers.js";
+import { confirmSlot, IdbSignerStore, limitsSlot, type StoredConfirmLimit, type StoredConfirmRecord } from "../src/frame/storage.js";
+import { DAY, FakeBus, FakeLocks, FrameHarness, limitOrder, waitFor, type HarnessOptions } from "./helpers.js";
 
 let h: FrameHarness;
-afterEach(() => h?.destroy());
+const others: FrameHarness[] = [];
+afterEach(() => {
+  h?.destroy();
+  for (const o of others.splice(0)) o.destroy();
+});
 
 const owner = privateKeyToAccount(generatePrivateKey());
 const stranger = privateKeyToAccount(generatePrivateKey());
+const MINUTE = 60_000;
+
+/** An active key whose master is `master` in `frame`. */
+async function activeKey(frame: FrameHarness, master: PrivateKeyAccount, replaceExisting = false) {
+  const created = await frame.createAgent({ userAddress: master.address, validForDays: 30, storageMode: "device", ...(replaceExisting ? { replaceExisting } : {}) });
+  frame.hl.approve(master.address, created.agentAddress, created.agentName, created.validUntil);
+  await frame.ok("confirmAgent", {});
+}
 
 /** A frame with an active key whose master is `owner` (a wallet these tests can sign with). */
-async function ready(o: HarnessOptions = {}, master: PrivateKeyAccount = owner): Promise<FrameHarness> {
+async function ready(o: HarnessOptions = {}): Promise<FrameHarness> {
   h = await FrameHarness.create(o);
   await h.ok("hello", { protocolVersion: 1 });
-  const created = await h.createAgent({ userAddress: master.address, validForDays: 30, storageMode: "device" });
-  h.hl.approve(master.address, created.agentAddress, created.agentName, created.validUntil);
-  await h.ok("confirmAgent", {});
+  await activeKey(h, owner);
   return h;
 }
 
@@ -31,8 +41,8 @@ async function network(): Promise<NetworkName> {
 }
 
 /** The master wallet's signature of a raise to `usd`, made at `issuedAt` (default: now). */
-async function signed(usd: number, issuedAt = h.clock.now(), by: PrivateKeyAccount = owner) {
-  const message = confirmLimitMessage({ account: owner.address, usd, issuedAt, network: await network() });
+async function signed(usd: number, issuedAt = h.clock.now(), by: PrivateKeyAccount = owner, net?: NetworkName) {
+  const message = confirmLimitMessage({ account: owner.address, usd, issuedAt, network: net ?? (await network()) });
   return { usd, issuedAt, signature: await by.signMessage({ message }) };
 }
 
@@ -40,11 +50,12 @@ const status = async () => (await h.ok("getStatus", {})).confirmLimit;
 const prompts = (kind: string) => h.promptEvents().filter((e) => e.visible && e.kind === kind);
 /** A BTC buy at the mark (100,000): 0.3 is $30,000. */
 const btc = (size: string) => limitOrder({ coin: "BTC", size, price: "100000" });
+const idleText = () => h.root?.querySelector(".ks-idle-text")?.textContent ?? "";
 
 /** `setConfirmLimit` that waits for the frame's prompt and confirms it. */
-async function confirmed(params: Record<string, unknown>) {
-  const pending = h.request("setConfirmLimit", params);
-  await h.clickPrompt();
+async function confirmed(params: Record<string, unknown>, frame: FrameHarness = h) {
+  const pending = frame.request("setConfirmLimit", params);
+  await frame.clickPrompt();
   const r = await pending;
   if (!r.ok) throw new Error(`setConfirmLimit failed: ${r.error.code} ${r.error.message}`);
   return r.result;
@@ -65,6 +76,22 @@ async function asked(requestId: string, size: string): Promise<boolean> {
   return shown;
 }
 
+/** Rewrites the stored confirmation limits (as anything else on the signer origin could), then loads a new frame on them. */
+async function tampered(change: (masters: Record<string, StoredConfirmLimit>) => void) {
+  const net = await network();
+  const { clock, hl, idb } = h;
+  h.destroy();
+  const store = await IdbSignerStore.open(idb);
+  const rec = await store.getConfirm(net);
+  const masters = structuredClone(rec?.masters ?? {});
+  change(masters);
+  const next: StoredConfirmRecord = { slot: confirmSlot(net), v: 1, network: net, rev: (rec?.rev ?? 0) + 1, masters, updatedAt: clock.now() };
+  expect(await store.replaceConfirm(next, rec?.rev ?? 0)).toBe(true);
+  h = await FrameHarness.create({ idb, clock, hl });
+  await h.ok("hello", { protocolVersion: 1 });
+}
+const ownerKey = owner.address.toLowerCase();
+
 describe("the order confirmation limit", () => {
   it("is announced, and is the default until the user sets one", async () => {
     await ready();
@@ -72,12 +99,16 @@ describe("the order confirmation limit", () => {
     expect(hello.capabilities.setsConfirmLimit).toBe(true);
     expect(hello.limits.confirmOrdersAboveUsd).toBe(CONFIRM_LIMIT.defaultUsd);
     expect(await status()).toEqual({ usd: 25_000, recentUsd: 100_000, dailyUsd: 250_000 });
+    expect(idleText()).not.toContain("confirms orders");
   });
 
-  it("needs a key", async () => {
+  it("needs an active key: one HL lists for its master", async () => {
     h = await FrameHarness.create();
     await h.ok("hello", { protocolVersion: 1 });
     expect((await h.fail("setConfirmLimit", { usd: 10_000 })).code).toBe("NO_KEY");
+    // A key the page created for any address, not approved by that wallet.
+    await h.createAgent({ userAddress: owner.address, validForDays: 30, storageMode: "device" });
+    expect((await h.fail("setConfirmLimit", { usd: 10_000 })).code).toBe("KEY_PENDING");
   });
 
   it("takes whole dollars within its bounds", async () => {
@@ -89,6 +120,7 @@ describe("the order confirmation limit", () => {
     await ready();
     expect((await h.ok("setConfirmLimit", { usd: 10_000 })).confirmLimit).toEqual({ usd: 10_000, recentUsd: 40_000, dailyUsd: 100_000 });
     expect(h.promptEvents()).toHaveLength(0);
+    expect(idleText()).toContain("confirms orders above $10,000");
     const pending = h.request("signAndSubmit", { requestId: "a", intent: btc("0.12") });
     await waitFor(() => h.promptText() !== "");
     expect(h.promptText()).toContain("Orders above $10,000 need your confirmation.");
@@ -127,134 +159,269 @@ describe("the order confirmation limit", () => {
       expect(e.code).toBe("LIMIT_LOOSENING_REJECTED");
       return e.details?.reason;
     };
+    const otherNetwork: NetworkName = (await network()) === "mainnet" ? "testnet" : "mainnet";
     expect(await reason({ usd: 150_000 })).toBe("signature");
     expect(await reason({ usd: 150_000, authorization: await signed(150_000, h.clock.now(), stranger) })).toBe("signature");
+    expect(await reason({ usd: 150_000, authorization: await signed(150_000, h.clock.now(), owner, otherNetwork) })).toBe("signature");
     expect(await reason({ usd: 150_000, authorization: await signed(100_000) })).toBe("signature"); // signed for less
     const forged = await signed(100_000);
     expect(await reason({ usd: 150_000, authorization: { ...forged, usd: 150_000 } })).toBe("signature"); // not what was signed
     expect(await reason({ usd: 150_000, authorization: await signed(150_000, h.clock.now() - 8 * DAY) })).toBe("expired");
-    expect(await reason({ usd: 150_000, authorization: await signed(150_000, h.clock.now() + 10 * 60_000) })).toBe("expired");
+    expect(await reason({ usd: 150_000, authorization: await signed(150_000, h.clock.now() + 10 * MINUTE) })).toBe("expired");
     expect(h.promptEvents()).toHaveLength(0);
     expect((await status())?.usd).toBe(25_000);
   });
 
-  it("raises a day after the wallet signed, the old limit asking until then", async () => {
+  it("raises a day after the user confirms, however long ago the wallet signed, the old limit asking until then", async () => {
     await ready();
-    const signedAt = h.clock.now();
+    // Dated almost a week back (a page can ask the wallet for any date): the day still runs from the frame's prompt.
+    const signedAt = h.clock.now() - 6 * DAY - 23 * 60 * MINUTE;
     const pending = h.request("setConfirmLimit", { usd: 150_000, authorization: await signed(150_000, signedAt) });
     await waitFor(() => h.promptText() !== "");
     const text = h.promptText();
     expect(text).toContain("Raise your confirmation limit?");
-    expect(text).toContain("above $25,000 → above $150,000, from");
-    expect(text).toContain("a day after your wallet signed");
-    expect(text).toContain("Until then orders above $25,000 keep asking.");
+    expect(text).toContain("above $25,000 → above $150,000");
+    expect(text).toContain(`Your wallet signed it: ${new Date(signedAt).toISOString().slice(0, 16).replace("T", " ")} UTC`);
+    expect(text).toContain("It takes effect 24 hours after you confirm");
+    expect(text).toContain("Until then orders above $25,000 keep asking");
     await h.clickPrompt();
     expect((await pending).ok).toBe(true);
-    expect(await status()).toEqual({ usd: 25_000, recentUsd: 100_000, dailyUsd: 250_000, pending: { usd: 150_000, effectiveAt: signedAt + DAY } });
+    const confirmedAt = h.clock.now();
+    expect(await status()).toEqual({ usd: 25_000, recentUsd: 100_000, dailyUsd: 250_000, pending: { usd: 150_000, effectiveAt: confirmedAt + DAY } });
+    expect(idleText()).toContain("confirms orders above $25,000 (above $150,000 from");
     expect(await asked("before", "0.3")).toBe(true);
-    h.clock.advance(DAY);
+    h.clock.advance(DAY - MINUTE);
+    expect((await status())?.usd).toBe(25_000);
+    h.clock.advance(MINUTE);
     expect(await status()).toEqual({ usd: 150_000, recentUsd: 600_000, dailyUsd: 1_500_000 });
     expect(await asked("after", "1.4")).toBe(false); // $140,000 without a prompt
     expect(await asked("above", "1.6")).toBe(true); // $160,000 asks
   });
 
-  it("applies at once a raise the wallet signed more than a day ago, after the frame's prompt", async () => {
+  it("counts a day from the signing time for a signature dated a little ahead", async () => {
     await ready();
-    const old = h.clock.now() - 2 * DAY;
-    await confirmed({ usd: 150_000, authorization: await signed(150_000, old) });
-    expect(await status()).toEqual({ usd: 150_000, recentUsd: 600_000, dailyUsd: 1_500_000 });
+    const ahead = h.clock.now() + 4 * MINUTE;
+    await confirmed({ usd: 150_000, authorization: await signed(150_000, ahead) });
+    expect((await status())?.pending).toEqual({ usd: 150_000, effectiveAt: ahead + DAY });
   });
 
-  it("drops a waiting raise when the user lowers or keeps the limit, and refuses that signature afterwards", async () => {
+  it("drops a waiting raise when the user keeps the limit, and refuses that signature afterwards, even one dated ahead", async () => {
+    await ready();
+    const raise = await signed(150_000, h.clock.now() + 4 * MINUTE);
+    await confirmed({ usd: 150_000, authorization: raise });
+    h.clock.advance(MINUTE);
+    await h.ok("setConfirmLimit", { usd: 25_000 }); // the limit in force: cancels the raise, no prompt
+    expect(await status()).toEqual({ usd: 25_000, recentUsd: 100_000, dailyUsd: 250_000 });
+    const before = prompts("limits").length;
+    const e = await h.fail("setConfirmLimit", { usd: 150_000, authorization: raise });
+    expect(e.details?.reason).toBe("stale");
+    expect(prompts("limits")).toHaveLength(before);
+  });
+
+  it("makes every older signature stale once a raise is accepted (a larger one the user turned down included)", async () => {
+    await ready();
+    const big = await signed(1_000_000);
+    const declined = h.request("setConfirmLimit", { usd: 1_000_000, authorization: big });
+    await h.clickPrompt("cancel");
+    expect((await declined).ok).toBe(false);
+    h.clock.advance(MINUTE);
+    await confirmed({ usd: 150_000, authorization: await signed(150_000) });
+    expect((await h.fail("setConfirmLimit", { usd: 1_000_000, authorization: big })).details?.reason).toBe("stale");
+    expect((await status())?.pending?.usd).toBe(150_000);
+  });
+
+  it("sends the same waiting raise again as a no-op, which keeps its time", async () => {
     await ready();
     const raise = await signed(150_000);
     await confirmed({ usd: 150_000, authorization: raise });
-    h.clock.advance(60_000);
-    await h.ok("setConfirmLimit", { usd: 25_000 }); // the limit in force: cancels the raise, no prompt
-    expect(await status()).toEqual({ usd: 25_000, recentUsd: 100_000, dailyUsd: 250_000 });
-    const e = await h.fail("setConfirmLimit", { usd: 150_000, authorization: raise });
-    expect(e.details?.reason).toBe("stale");
+    const pending = (await status())?.pending;
+    h.clock.advance(60 * MINUTE);
+    const shown = prompts("limits").length;
+    await h.ok("setConfirmLimit", { usd: 150_000, authorization: raise });
+    expect(prompts("limits")).toHaveLength(shown);
+    expect((await status())?.pending).toEqual(pending);
   });
 
-  it("lowers within a raised limit without a new signature, and another device takes it with the raise's", async () => {
-    const idbA = new IDBFactory();
-    await ready({ idb: idbA });
-    const raise = await signed(150_000, h.clock.now() - 2 * DAY);
+  it("lowers within a raised limit without a new signature; another device takes it after its own prompt and day", async () => {
+    await ready();
+    const raise = await signed(150_000);
     await confirmed({ usd: 150_000, authorization: raise });
-    await h.ok("setConfirmLimit", { usd: 100_000 });
-    expect(h.promptEvents().filter((e) => e.visible)).toHaveLength(1); // only the raise asked
+    h.clock.advance(DAY);
+    await h.ok("setConfirmLimit", { usd: 100_000, authorization: raise });
+    expect(prompts("limits")).toHaveLength(1); // only the raise asked
     expect((await status())?.usd).toBe(100_000);
     // The app sends its setting at every handshake: here, a no-op.
     await h.ok("setConfirmLimit", { usd: 100_000, authorization: raise });
-    // Another device: the same setting and signature, confirmed in that frame's prompt.
+    // Another device: the same setting and signature, confirmed in that frame's prompt, in force a day later.
+    const clock = h.clock;
     h.destroy();
-    await ready();
+    await ready({ clock });
     await confirmed({ usd: 100_000, authorization: raise });
-    expect((await status())?.usd).toBe(100_000);
+    expect((await status())?.pending).toEqual({ usd: 100_000, effectiveAt: clock.now() + DAY });
     // A week after the wallet signed, a new device needs a new signature.
     h.destroy();
-    await ready();
-    h.clock.advance(6 * DAY);
+    await ready({ clock });
+    h.clock.advance(6 * DAY + MINUTE);
     expect((await h.fail("setConfirmLimit", { usd: 100_000, authorization: raise })).details?.reason).toBe("expired");
   });
 
-  it("keeps the confirmation limit when other limits change", async () => {
+  it("keeps the confirmation limit when other limits change, even when an older build rewrites the limits record", async () => {
     await ready();
     await h.ok("setConfirmLimit", { usd: 10_000 });
     await h.ok("setLimits", { maxLeverage: 5 });
     expect((await status())?.usd).toBe(10_000);
     await h.loosen({});
     expect((await status())?.usd).toBe(10_000);
+    // A build without confirmation limits writes the limits record as it knows it.
+    const net = await network();
+    const store = await IdbSignerStore.open(h.idb);
+    const rec = await store.getLimits(net);
+    const rev = rec?.rev ?? 0;
+    await store.replaceLimits({ slot: limitsSlot(net), v: 1, network: net, rev: rev + 1, master: null, accounts: {}, updatedAt: h.clock.now() }, rev);
+    expect((await status())?.usd).toBe(10_000);
   });
 
-  it("holds for the master that set it: for another wallet's key in this browser it is the default", async () => {
-    const idb = new IDBFactory();
-    await ready({ idb });
+  it("holds for the master that set it; another wallet's key has its own, and a pending key can't touch either", async () => {
+    await ready();
+    await h.ok("setConfirmLimit", { usd: 1_000 });
+    // Another wallet's key in this browser: the default, and its own limit.
+    await activeKey(h, stranger, true);
+    expect((await status())?.usd).toBe(25_000);
+    await h.ok("setConfirmLimit", { usd: 5_000 });
+    // A key the page made for the owner's address without the wallet: can't set anything.
+    await h.createAgent({ userAddress: owner.address, validForDays: 30, storageMode: "device", replaceExisting: true });
+    expect((await h.fail("setConfirmLimit", { usd: 24_999 })).code).toBe("KEY_PENDING");
+    // The owner's key again: their $1,000 holds, so a $20,000 order asks.
+    await activeKey(h, owner, true);
+    expect((await status())?.usd).toBe(1_000);
+    expect(await asked("x", "0.2")).toBe(true);
+    await activeKey(h, stranger, true);
+    expect((await status())?.usd).toBe(5_000);
+  });
+
+  it("binds orders already waiting to be signed when the user lowers it", async () => {
+    const locks = new FakeLocks();
+    await ready({ locks });
+    // Order A holds the agent lock (its HL call hangs).
+    let releaseA!: () => void;
+    const gate = new Promise<void>((r) => (releaseA = r));
+    let first = true;
+    h.hl.responder = async (call) => {
+      if (first) {
+        first = false;
+        await gate;
+      }
+      return h.hl.defaultExchange(call);
+    };
+    const a = h.request("signAndSubmit", { requestId: "a", intent: btc("0.01") });
+    await waitFor(() => h.hl.exchangeCalls.length === 1);
+    // Order B: $20,000, below the $25,000 in force when it was read; it then waits for the lock.
+    const b = h.request("signAndSubmit", { requestId: "b", intent: btc("0.2") });
+    await waitFor(() => locks.requests.filter((n) => n.includes("/sign/")).length >= 2);
+    expect((await h.ok("setConfirmLimit", { usd: 5_000 })).confirmLimit.usd).toBe(5_000);
+    releaseA();
+    expect((await a).ok).toBe(true);
+    const rb = await b;
+    expect(rb.ok).toBe(false);
+    if (!rb.ok) expect(rb.error).toMatchObject({ code: "SIGNER_BUSY", retryable: true, details: { reason: "limitsChanged" } });
+    expect(h.hl.exchangeCalls).toHaveLength(1);
+    // Sent again, it asks.
+    expect(await asked("b2", "0.2")).toBe(true);
+  });
+
+  it("scales the rolling totals with it: four times it in 10 minutes", async () => {
+    await ready();
+    await h.ok("setConfirmLimit", { usd: 1_000 });
+    for (const id of ["o1", "o2", "o3", "o4"]) expect(await asked(id, "0.009")).toBe(false); // $900 each: $3,600
+    expect(await asked("o5", "0.009")).toBe(true); // $4,500 would pass $4,000
+  });
+
+  it("refuses a raise the user confirmed while another tab changed the limit", async () => {
+    const bus = new FakeBus();
+    const locks = new FakeLocks();
+    await ready({ bus, locks });
+    const b = await FrameHarness.create({ idb: h.idb, clock: h.clock, hl: h.hl, locks, bus });
+    others.push(b);
+    await b.ok("hello", { protocolVersion: 1 });
+    const raise = h.request("setConfirmLimit", { usd: 150_000, authorization: await signed(150_000) });
+    await waitFor(() => h.promptText() !== "");
+    expect((await b.ok("setConfirmLimit", { usd: 10_000 })).confirmLimit.usd).toBe(10_000);
+    await h.clickPrompt();
+    const r = await raise;
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatchObject({ code: "SIGNER_BUSY", details: { reason: "limitsChanged" } });
+    expect(await status()).toEqual({ usd: 10_000, recentUsd: 40_000, dailyUsd: 100_000 });
+  });
+
+  it("refuses a raise the user confirmed after the key changed", async () => {
+    await ready();
     await h.ok("setConfirmLimit", { usd: 10_000 });
+    const raise = h.request("setConfirmLimit", { usd: 20_000 });
+    await waitFor(() => h.promptText() !== "");
+    await h.ok("revoke", {});
+    await h.clickPrompt();
+    const r = await raise;
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatchObject({ code: "SIGNER_BUSY", details: { reason: "keyChanged" } });
+  });
+
+  it("counts a stored limit above the default only with a valid signature, and a raise only a day after it", async () => {
+    await ready();
+    await confirmed({ usd: 150_000, authorization: await signed(150_000) });
+    h.clock.advance(DAY);
+    expect((await status())?.usd).toBe(150_000);
     const net = await network();
-    const { clock, hl } = h;
-    h.destroy();
-    // The same stored limit, named for another master: this key's master trades on the default.
-    const store = await IdbSignerStore.open(idb);
-    const rec = await store.getLimits(net);
-    if (!rec?.confirm) throw new Error("no stored limit");
-    await store.replaceLimits({ ...rec, rev: rec.rev + 1, confirm: { ...rec.confirm, master: stranger.address.toLowerCase() as `0x${string}` } }, rec.rev);
-    h = await FrameHarness.create({ idb, clock, hl });
-    await h.ok("hello", { protocolVersion: 1 });
+    const real = (await (await IdbSignerStore.open(h.idb)).getConfirm(net))!.masters[ownerKey]!;
+    const bad = await signed(150_000, real.raise!.issuedAt, stranger);
+    // Another wallet's signature: the default.
+    await tampered((m) => (m[ownerKey] = { ...real, raise: { ...real.raise!, signature: bad.signature } }));
+    expect((await status())?.usd).toBe(25_000);
+    // A raise moved to less than a day after the wallet signed: the default.
+    await tampered((m) => (m[ownerKey] = { ...real, raise: { ...real.raise!, effectiveAt: real.raise!.issuedAt + DAY - 1 } }));
+    expect((await status())?.usd).toBe(25_000);
+    // A raise above what the wallet signed: the default.
+    await tampered((m) => (m[ownerKey] = { ...real, raise: { ...real.raise!, usd: 200_000 } }));
+    expect((await status())?.usd).toBe(25_000);
+    // A limit above the default with no signature, or above the one it has: the default.
+    await tampered((m) => (m[ownerKey] = { usd: 900_000, since: 0, at: 0 }));
+    expect((await status())?.usd).toBe(25_000);
+    const { signedUsd, issuedAt, signature, effectiveAt } = real.raise!;
+    await tampered((m) => (m[ownerKey] = { usd: 200_000, since: 0, at: 0, granted: { signedUsd, issuedAt, signature, effectiveAt } }));
+    expect((await status())?.usd).toBe(25_000);
+    // The same grant for what it allows: counted.
+    await tampered((m) => (m[ownerKey] = { usd: 150_000, since: 0, at: 0, granted: { signedUsd, issuedAt, signature, effectiveAt } }));
+    expect((await status())?.usd).toBe(150_000);
+    // A malformed entry: dropped.
+    await tampered((m) => (m[ownerKey] = { usd: 1_000, since: -1, at: 0 }));
     expect((await status())?.usd).toBe(25_000);
   });
 
-  it("counts a stored raise only while its signature checks out", async () => {
-    const idb = new IDBFactory();
-    await ready({ idb });
-    const issuedAt = h.clock.now() - 2 * DAY;
-    await confirmed({ usd: 150_000, authorization: await signed(150_000, issuedAt) });
-    const bad = await signed(150_000, issuedAt, stranger);
-    const net = await network();
-    const { clock, hl } = h;
-    h.destroy();
-    // Something else on the signer origin rewrites the record: another wallet's signature, then a raised limit with none.
-    const store = await IdbSignerStore.open(idb);
-    const rec = await store.getLimits(net);
-    if (!rec?.confirm?.raise) throw new Error("no stored raise");
-    await store.replaceLimits({ ...rec, rev: rec.rev + 1, confirm: { ...rec.confirm, raise: { ...rec.confirm.raise, signature: bad.signature } } }, rec.rev);
-    h = await FrameHarness.create({ idb, clock, hl });
-    await h.ok("hello", { protocolVersion: 1 });
-    expect((await status())?.usd).toBe(25_000);
-    const now = await store.getLimits(net);
-    if (!now?.confirm) throw new Error("no stored limit");
-    await store.replaceLimits({ ...now, rev: now.rev + 1, confirm: { master: now.confirm.master, usd: 900_000, since: 0 } }, now.rev);
-    h.destroy();
-    h = await FrameHarness.create({ idb, clock, hl });
-    await h.ok("hello", { protocolVersion: 1 });
-    expect((await status())?.usd).toBe(25_000);
+  it("keeps at most 32 wallets, never dropping a lowered one", async () => {
+    await ready();
+    const filler = (m: Record<string, StoredConfirmLimit>) => {
+      for (let i = 0; i < 32; i++) m[`0x${i.toString(16).padStart(40, "0")}`] = { usd: 1_000, since: 0, at: i };
+    };
+    await tampered(filler);
+    expect((await h.fail("setConfirmLimit", { usd: 10_000 })).code).toBe("STORAGE_FAILED");
+    const atDefault = `0x${"0".repeat(39)}5`;
+    await tampered((m) => {
+      filler(m);
+      m[atDefault] = { usd: 25_000, since: 0, at: 5 };
+    });
+    await h.ok("setConfirmLimit", { usd: 10_000 });
+    const rec = await (await IdbSignerStore.open(h.idb)).getConfirm(await network());
+    expect(Object.keys(rec!.masters)).toHaveLength(32);
+    expect(rec!.masters[atDefault]).toBeUndefined();
+    expect(rec!.masters[ownerKey]?.usd).toBe(10_000);
   });
 
-  it("can't be raised in a frame with no user interface", async () => {
+  it("can't be raised in a frame with no user interface, which refuses orders above it in the user's numbers", async () => {
     await ready({ withUi: false });
     await h.ok("setConfirmLimit", { usd: 10_000 });
-    const e = await h.fail("setConfirmLimit", { usd: 20_000 });
-    expect(e.code).toBe("LIMIT_LOOSENING_REJECTED");
+    expect((await h.fail("setConfirmLimit", { usd: 20_000 })).code).toBe("LIMIT_LOOSENING_REJECTED");
+    const e = await h.fail("signAndSubmit", { requestId: "big", intent: btc("0.12") });
+    expect(e.code).toBe("POLICY_DENIED");
+    expect(JSON.stringify(e.details)).toContain("Orders of more than $10,000");
   });
 
   it("names the order's size as the reason, not an empty total of the last minutes", async () => {

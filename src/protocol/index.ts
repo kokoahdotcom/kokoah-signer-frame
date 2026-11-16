@@ -699,7 +699,7 @@ export interface SignerError {
      * it. `keyChanged`: the trading key changed during `setConfirmLimit`. Each time, sending the request again shows the
      * current state. LIMIT_LOOSENING_REJECTED from `setConfirmLimit`: `signature` (none, or not the master wallet's),
      * `expired` (older than a week, or ahead of the clock), `stale` (older than the last change on this device): ask the
-     * user to sign again.
+     * user to sign again. `keyChanged` and `limitsChanged` there: send it again.
      */
     reason?: "lock" | "ordersSigned" | "limitsChanged" | "marketMoved" | "leverageChanged" | "keyChanged" | "signature" | "expired" | "stale";
     /** Anything else worth showing (never secrets). */
@@ -809,8 +809,9 @@ export function isFrameToParentMessage(x: unknown): x is FrameToParentMessage {
 /**
  * The bounds of the order confirmation limit. `defaultUsd` is the frame's own (`hello.limits.confirmOrdersAboveUsd`);
  * the rolling totals follow from the limit in force: `recentFactor` times it in the last 10 minutes, `dailyFactor`
- * times it in 24 hours. A raise above the default takes effect `delayMs` after the master wallet signed it, and a
- * signature older than `signatureMaxAgeMs` (or more than `signatureFutureMs` ahead of the frame's clock) is refused.
+ * times it in 24 hours. A raise above the default takes effect `delayMs` after the user confirms it in the frame's
+ * prompt (on the frame's clock; never sooner than `delayMs` after the wallet signed), and a signature older than
+ * `signatureMaxAgeMs` (or more than `signatureFutureMs` ahead of the frame's clock) is refused.
  */
 export const CONFIRM_LIMIT = Object.freeze({
   defaultUsd: 25_000,
@@ -836,20 +837,21 @@ export interface ConfirmLimitStatus {
 }
 
 /**
- * Sets the order confirmation limit of the key's master (needs a key: `NO_KEY`). An integer from `CONFIRM_LIMIT.minUsd`
- * to `CONFIRM_LIMIT.maxUsd`.
+ * Sets the order confirmation limit of the key's master. Needs an active key, one HL lists for that master (`NO_KEY`,
+ * `KEY_PENDING`, `KEY_EXPIRED`). An integer from `CONFIRM_LIMIT.minUsd` to `CONFIRM_LIMIT.maxUsd`.
  * - Lower than the limit in force: applied at once, no prompt; it also drops a raise still waiting.
  * - The same limit (and the same waiting raise): nothing changes (send it again at every handshake).
  * - Higher, up to `CONFIRM_LIMIT.defaultUsd`: the frame's own prompt (`promptChanged` kind `limits`), then at once.
  * - Higher than the default: also `authorization`, the master wallet's signature (EIP-191 `personal_sign`) of
  *   {@link confirmLimitMessage} for this account, a limit at least `usd`, the network and `issuedAt` (ms since the
- *   epoch). The frame checks it, shows its prompt, and the raise takes effect `CONFIRM_LIMIT.delayMs` after `issuedAt`;
- *   the limit in force stays until then (`status.confirmLimit.pending`). A limit lowered after a raise but still above
- *   the default needs no new signature: send it with the raise's. Refused (`LIMIT_LOOSENING_REJECTED`, `details.reason`): no or a
- *   wrong signature (`signature`), one older than a week or ahead of the clock (`expired`), or one older than the last
- *   change of this limit on this device (`stale`).
- * The limit is kept per network and per master on the signer origin, like the other limits; another wallet's key in
- * this browser uses the defaults.
+ *   epoch). The frame checks it, shows its prompt, and the raise takes effect `CONFIRM_LIMIT.delayMs` after the user
+ *   confirms it there (on another device too: each frame waits its own day); the limit in force stays until then
+ *   (`status.confirmLimit.pending`). A limit lowered after a raise but still above the default needs no new signature:
+ *   send it with the raise's. Refused (`LIMIT_LOOSENING_REJECTED`, `details.reason`): no or a wrong signature
+ *   (`signature`), one older than a week or ahead of the clock (`expired`), or one older than the last change of this
+ *   limit on this device or than the raise it accepted last (`stale`).
+ * The limit is kept per network and per master on the signer origin, in its own record; another wallet's key in this
+ * browser has its own (the default until it sets one).
  */
 export interface SetConfirmLimitParams {
   usd: number;
@@ -873,7 +875,7 @@ export function confirmLimitMessage(p: { account: Hex; usd: number; issuedAt: nu
     `Network: ${network}`,
     `New limit: orders above $${p.usd.toLocaleString("en-US")} need my confirmation in the Kokoah signer`,
     `Signed at: ${new Date(p.issuedAt).toISOString()}`,
-    "Takes effect: 24 hours after the time above",
+    "Takes effect: 24 hours after I confirm it in the Kokoah signer",
     "",
     "Sign this only if you are raising this limit yourself.",
   ].join("\n");

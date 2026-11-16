@@ -787,8 +787,9 @@ last for this frame load only.
 ### `setConfirmLimit`
 
 The order confirmation limit (`hello.capabilities.setsConfirmLimit`, 2026-11-16): the size above which one
-`signAndSubmit`'s orders wait for the `order` prompt, for the key's master (needs a key: `NO_KEY`). The rolling totals
-follow it: 4 times it in the last 10 minutes, 10 times it in 24 hours.
+`signAndSubmit`'s orders wait for the `order` prompt, for the key's master. Needs an active key, one HL lists for that
+master (`NO_KEY`, `KEY_PENDING`, `KEY_EXPIRED`): a key the page made for any address can't change anyone's limit. The
+rolling totals follow it: 4 times it in the last 10 minutes, 10 times it in 24 hours.
 
 → `{ "usd": 150000, "authorization": { "usd": 150000, "issuedAt": 1794830400000, "signature": "0x…" } }`
 ← `{ "confirmLimit": { "usd": 25000, "recentUsd": 100000, "dailyUsd": 250000, "pending": { "usd": 150000, "effectiveAt": 1794916800000 } } }`
@@ -801,7 +802,7 @@ default is `CONFIRM_LIMIT.defaultUsd` ($25,000). Compared with the limit in forc
 | Lower, or the limit in force while a raise waits | Stored and applied at once, no prompt; a waiting raise is dropped |
 | The limit in force (no raise waiting), or the same waiting raise again | Nothing: no write, no `statusChanged`, no prompt (send the user's setting at every handshake) |
 | Higher, up to the default | The frame's own prompt (`promptChanged` kind `limits`, fixed styling, press and hold), then applied |
-| Higher than the default | `authorization` is checked first, then the frame's own prompt; the raise takes effect `CONFIRM_LIMIT.delayMs` (24 hours) after `issuedAt`, the limit in force applying until then (`confirmLimit.pending`) |
+| Higher than the default | `authorization` is checked first, then the frame's own prompt, which shows when the wallet signed; the raise takes effect `CONFIRM_LIMIT.delayMs` (24 hours) after the user confirms it, on the frame's own clock (never sooner than 24 hours after `issuedAt`), the limit in force applying until then (`confirmLimit.pending`) |
 
 `authorization` is the master wallet's EIP-191 `personal_sign` of `confirmLimitMessage({ account, usd, issuedAt, network })`
 (exported by the client, so the app shows the wallet the exact text the frame checks): `usd` is the limit signed, at
@@ -810,20 +811,26 @@ and needs no new one. Refused with `LIMIT_LOOSENING_REJECTED` and `details.reaso
 - `signature`: none, or not the master wallet's signature of that text (another wallet, another limit, another network);
 - `expired`: `issuedAt` more than `CONFIRM_LIMIT.signatureMaxAgeMs` (7 days) ago, or more than 5 minutes ahead of the
   frame's clock;
-- `stale`: older than the last change of this limit on this device (a lowering stops an older signature from raising
-  it again).
+- `stale`: older than the last change of this limit on this device, or than the raise it accepted last (a lowering,
+  or a newer raise, stops an older signature from raising it again; on this device only).
 
-The app should then ask the user to sign again. A raise the wallet signed more than a day before it reaches a frame
-(another device, say) applies there at once, after that frame's prompt.
+The app should then ask the user to sign again. Another device can take the same signature while it is at most a week
+old: after that frame's prompt, and a day later.
 
-Stored with the limits (the same record, revision and compare-and-set, so it binds every tab and survives reloads),
-per network, and **per master**: a key of another wallet in this browser has the default. Every signature is checked
-again whenever the record is read; a stored limit above the default without the signature that allowed it, or a raise
-whose signature doesn't check out, counts for nothing. `setLimits` leaves it as it is. When a waiting raise takes
-effect, the frame emits `statusChanged`. A frame without a user interface refuses every raise.
+Stored in its own record per network (`confirm/<network>`, with its own revision and compare-and-set, so it binds every
+tab, survives reloads and is left alone by builds that don't know it), **per master**, for at most 32 wallets (when
+full, the oldest at or above the default go first; a lowered one is never dropped). A key of another wallet in this
+browser has its own, the default until it sets one. A stored limit above the default, and a waiting raise, count only
+with a valid signature of the master's wallet for at least that much, and from no sooner than a day after it; otherwise
+the default applies. The rest of the record (such as whether the user confirmed it) is trusted as the frame's storage
+is for the other limits. `setLimits` leaves it as it is. Signing reads it again under the agent lock: orders a lowering
+made since now asks about are refused with `SIGNER_BUSY` (`limitsChanged`), and sent again they ask. The frame's own
+status line shows a limit of the user's own and a raise still waiting. When a waiting raise takes effect, the frame
+emits `statusChanged`. A frame without a user interface refuses every raise.
 
 Errors: `NO_KEY`, `LIMIT_LOOSENING_REJECTED` (above), `USER_CANCELLED` / `USER_TIMEOUT` (nothing changed), `PROMPT_BUSY`,
-`SIGNER_BUSY` (retryable: the stored limits changed in another tab while the user was confirming, or the key changed),
+`KEY_PENDING`, `KEY_EXPIRED`, `SIGNER_BUSY` (retryable: the stored limit changed in another tab while the user was
+confirming, `limitsChanged`, or the key changed, `keyChanged`),
 `STORAGE_FAILED` (retryable), `INVALID_REQUEST`.
 
 ### `revoke`
