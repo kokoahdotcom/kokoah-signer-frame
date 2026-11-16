@@ -544,6 +544,24 @@ describe("the order confirmation limit", () => {
     expect(idleText()).toContain("confirms orders above $150,000");
   });
 
+  it("says when its clock isn't checked yet, and tells the parent once it is", async () => {
+    const clock = new Clock();
+    const hl = new MockHl(clock);
+    await ready({ clock, hl });
+    await h.ok("setConfirmLimit", { usd: 10_000 });
+    const idb = h.idb;
+    h.destroy();
+    hl.infoFailure = (body) => body.type === "exchangeStatus";
+    h = await FrameHarness.create({ clock, hl, idb });
+    await h.ok("hello", { protocolVersion: 1 });
+    expect(await status()).toEqual({ usd: 10_000, recentUsd: 40_000, dailyUsd: 100_000, clockUnchecked: true });
+    hl.infoFailure = null;
+    const before = h.events("statusChanged").length;
+    await h.core.syncClock();
+    expect(h.events("statusChanged").length).toBeGreaterThan(before);
+    expect(h.events("statusChanged").at(-1)?.confirmLimit).toEqual({ usd: 10_000, recentUsd: 40_000, dailyUsd: 100_000 });
+  });
+
   it("doesn't wake up again and again before the clock is checked", async () => {
     const clock = new Clock();
     const hl = new MockHl(clock);

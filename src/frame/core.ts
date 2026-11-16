@@ -616,7 +616,7 @@ export class FrameCore {
       mainnetWritesEnabled: this.config.network.name === "mainnet" && this.config.network.allowMainnetWrites,
       clockOffsetMs: this.clockOffsetMs,
       policy: summarizeFramePolicy(this.limits.policy, this.limits.master, this.limits.accounts, this.market.tradingPairCoins),
-      confirmLimit: this.confirmLimitNow(now),
+      confirmLimit: this.clockSyncedMono === null ? { ...this.confirmLimitNow(now), clockUnchecked: true } : this.confirmLimitNow(now),
       metrics: { ...this.metrics },
     };
   }
@@ -812,6 +812,7 @@ export class FrameCore {
         const t1 = this.now();
         const m1 = this.monotonicNow();
         if (isRecord(r) && typeof r.time === "number" && Number.isFinite(r.time) && r.time > 0) {
+          const first = this.clockSyncedMono === null;
           const shown = stableStringify(this.confirmLimitNow());
           this.clockOffsetMs = Math.round(r.time - (t0 + t1) / 2);
           this.clockSyncedAt = t1;
@@ -819,8 +820,11 @@ export class FrameCore {
           this.clockSyncedHl = r.time;
           this.clockSyncedMono = m1;
           this.log("clock.synced", { offsetMs: this.clockOffsetMs });
-          // The confirmation limit in force may change with the new check (a raise whose time came): tell the parent.
-          if (stableStringify(this.confirmLimitNow()) !== shown) this.confirmStatusChanged();
+          // The confirmation limit in force may change with the new check (a raise whose time came), and the first check
+          // settles what the status reports (`clockUnchecked`): tell the parent.
+          const k = this.key;
+          const own = k === null ? undefined : this.confirm.masters.get(k.meta.userAddress.toLowerCase());
+          if (stableStringify(this.confirmLimitNow()) !== shown || (first && own !== undefined)) this.confirmStatusChanged();
           else this.scheduleConfirmTimer();
         }
       } catch {

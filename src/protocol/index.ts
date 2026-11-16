@@ -834,6 +834,11 @@ export interface ConfirmLimitStatus {
   dailyUsd: number;
   /** A raise the user confirmed, in force from `effectiveAt` (ms since the epoch): until then `usd` applies. */
   pending?: { usd: number; effectiveAt: number };
+  /**
+   * The frame hasn't checked its clock with HL in this load yet: nothing above the default counts until it has, so
+   * `usd` and `pending` aren't final (a statusChanged follows the check). Don't change the limit from them meanwhile.
+   */
+  clockUnchecked?: true;
 }
 
 /**
