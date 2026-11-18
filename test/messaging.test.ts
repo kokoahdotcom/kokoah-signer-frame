@@ -159,7 +159,7 @@ describe("hello and status", () => {
     expect(s.policy).toEqual({
       allowedActionTypes: ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop", "startFeeTrial", "vaultTransfer"],
       allowedCoins: "*",
-      maxOrderNotionalUsd: 250_000,
+      maxOrderNotionalUsd: 1_000_000,
       maxDailyNotionalUsd: 25_000_000,
       maxLeverage: 50,
       maxOrdersPerMinute: 60,

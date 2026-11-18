@@ -59,7 +59,7 @@ describe("limits stored by the frame", () => {
     const reset = await asking(h, {});
     expect(h.promptEvents().at(-1)).toEqual({ visible: true, kind: "limits" });
     expect(h.root?.querySelector(".ks-title")?.textContent).toBe("Loosen your trading limits?");
-    expect(h.promptText()).toContain("Largest order: $100 → $250,000");
+    expect(h.promptText()).toContain("Largest order: $100 → $1,000,000");
     // Shown in the frame's own fixed style, whatever theme the parent set, and confirmed by pressing and holding.
     expect(h.root?.querySelector(".ks-prompt")?.classList.contains("ks-prompt--fixed")).toBe(true);
     expect(h.root?.querySelector(".ks-primary")?.classList.contains("ks-hold")).toBe(true);
@@ -69,7 +69,7 @@ describe("limits stored by the frame", () => {
 
     await h.clickPrompt();
     const r = await reset.answer;
-    expect(r.ok && r.result.policy).toMatchObject({ maxOrderNotionalUsd: 250_000, userLimits: null });
+    expect(r.ok && r.result.policy).toMatchObject({ maxOrderNotionalUsd: 1_000_000, userLimits: null });
     expect((await h.ok("signAndSubmit", order("o2"))).status).toBe("ok");
   });
 
@@ -145,7 +145,7 @@ describe("limits stored by the frame", () => {
       [{ ...start, requireStopLossForNewEntries: false }, ["Stop-loss on new positions: required → not required"]],
       // A tightening next to a loosening: one prompt lists both.
       [{ ...start, maxOrderNotionalUsd: 100, maxLeverage: 10 }, ["Largest order: $500 → $100", "Leverage: up to 5x → up to 10x"]],
-      [{}, ["Largest order: $500 → $250,000", "Trading per day: $5,000 → $25,000,000", "Price distance from the market: 3% → 5%", "Markets: ETH, BTC → all", "Allowed actions: order, cancel → all"]],
+      [{}, ["Largest order: $500 → $1,000,000", "Trading per day: $5,000 → $25,000,000", "Price distance from the market: 3% → 5%", "Markets: ETH, BTC → all", "Allowed actions: order, cancel → all"]],
     ];
     for (const [limits, lines] of cases) {
       const pending = await asking(h, limits);
@@ -162,7 +162,7 @@ describe("limits stored by the frame", () => {
     const h = await frame();
     await h.ok("hello", { protocolVersion: 1 });
     await h.ok("setLimits", { maxOrderNotionalUsd: 100 });
-    const e = await h.fail("setLimits", { maxOrderNotionalUsd: 300_000, maxLeverage: 51, priceBandPct: 6 });
+    const e = await h.fail("setLimits", { maxOrderNotionalUsd: 1_200_000, maxLeverage: 51, priceBandPct: 6 });
     expect(e).toMatchObject({ code: "LIMIT_LOOSENING_REJECTED", details: { fields: ["maxOrderNotionalUsd", "priceBandPct", "maxLeverage"] } });
     expect(shownPrompts(h)).toHaveLength(0);
     expect((await h.ok("getStatus")).policy.maxOrderNotionalUsd).toBe(100);
@@ -226,7 +226,7 @@ describe("limits across reloads and tabs", () => {
     expect(codes(await b.fail("signAndSubmit", order("o1")))).toContain("ORDER_NOTIONAL_EXCEEDED");
     // Still the stored $100 the reset is compared with: it needs the click.
     const reset = await asking(b, {});
-    expect(b.promptText()).toContain("Largest order: $100 → $250,000");
+    expect(b.promptText()).toContain("Largest order: $100 → $1,000,000");
     await b.clickPrompt("cancel");
     expect((await reset.answer).ok).toBe(false);
   });

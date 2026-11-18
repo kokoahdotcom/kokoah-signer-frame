@@ -34,7 +34,7 @@ describe("baseline policy", () => {
     expect(baseline.maxExpiresAfterWindowMs).toBe(BASELINE_LIMITS.maxExpiresAfterWindowMs);
     expect(baseline.maxOrdersPerMinute).toBe(60);
     expect(baseline.priceBandPct).toBe(5);
-    expect(baseline.maxOrderNotionalUsd).toBe(250_000);
+    expect(baseline.maxOrderNotionalUsd).toBe(1_000_000);
     expect(baseline.maxDailyNotionalUsd).toBe(25_000_000);
     expect(baseline.maxLeverage).toBe(50);
   });
@@ -100,15 +100,15 @@ describe("policy through signAndSubmit", () => {
     expect((await h.ok("getStatus")).metrics.policyDenials).toBe(1);
   });
 
-  it("caps one order at the baseline's $250,000, reduce-only orders exempt", async () => {
+  it("caps one order at the baseline's $1,000,000, reduce-only orders exempt", async () => {
     h = await FrameHarness.create();
     await h.activeAgent("device");
     const btc = (size: string, o: Record<string, unknown> = {}) => limitOrder({ coin: "BTC", size, price: "100000", ...o });
-    const e = await h.fail("signAndSubmit", { requestId: "n1", intent: btc("2.6") });
+    const e = await h.fail("signAndSubmit", { requestId: "n1", intent: btc("10.1") });
     expect(e.details?.violations?.map((v) => v.code)).toEqual(["ORDER_NOTIONAL_EXCEEDED"]);
     expect(h.hl.exchangeCalls).toHaveLength(0);
     // Exempt from the cap, but above $25,000: it waits for the user's confirmation in the frame.
-    const close = h.ok("signAndSubmit", { requestId: "n2", intent: btc("2.6", { side: "sell", reduceOnly: true }) });
+    const close = h.ok("signAndSubmit", { requestId: "n2", intent: btc("10.1", { side: "sell", reduceOnly: true }) });
     await h.clickPrompt();
     expect((await close).status).toBe("ok");
   });
@@ -276,7 +276,7 @@ describe("setLimits", () => {
     // {} resets to the baseline, after the user's click in the frame.
     const reset = await h.loosen({});
     expect(reset.policy.userLimits).toBeNull();
-    expect(reset.policy.maxOrderNotionalUsd).toBe(250_000);
+    expect(reset.policy.maxOrderNotionalUsd).toBe(1_000_000);
   });
 
   it("tracks daily notional", async () => {

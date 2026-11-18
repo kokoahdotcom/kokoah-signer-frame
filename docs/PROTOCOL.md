@@ -949,7 +949,7 @@ The baseline is built into the frame and can't be loosened:
 | Price band | Orders that execute now (market, IOC, and marketable limits: a buy at or above min(mark, mid), a sell at or below max(mark, mid)) within **5%** of HL's mark, so a market order's slippage can use at most about 5% (the shared schema accepts up to 10%; the IOC limit it gives must still be in the band). Resting GTC/ALO limits that don't cross may sit up to **50%** from mark (shared `RESTING_PRICE_BAND_PCT`), which still stops typos like 8500 for 85000. Triggers: the limit within 10% of its trigger; an untriggered trigger up to 50% from mark; a trigger that would fire now banded at 5% from mark. Mark and mid come from the frame's own HL reads. `setLimits.priceBandPct` tightens the 5% band only |
 | Leverage | **50x**, and never above each market's own maximum (`updateLeverage` above it is denied). Where a market allows more than the cap (the baseline's or the user's), the frame reads the account's leverage on HL itself and refuses new entries while it is set higher |
 | Rate | **60 orders per minute** per agent (TP/SL legs count; cancels don't). Persisted, so a reload doesn't reset it |
-| Notional | $250,000 per order, $25,000,000 per UTC day per key across every account (reduce-only orders exempt) |
+| Notional | $1,000,000 per order, $25,000,000 per UTC day per key across every account (reduce-only orders exempt) |
 | Large orders | More than the master's confirmation limit ($25,000 unless the user set one with `setConfirmLimit`, at most $1,000,000) of orders in one action (reduce-only included) only after the user confirms the frame's own prompt (`signAndSubmit`, "Large orders") |
 | Stop-losses (with `requireStopLossForNewEntries`) | An entry's attached stop must cover it, sit on the losing side and be within **25%** of the entry. The frame reads the account's positions and resting orders on HL itself (`clearinghouseState`, `frontendOpenOrders`, and `orderStatus` for an order an action names that isn't among them) before a cancel, a modify or an entry, and refuses (`STOP_LOSS_REQUIRED`) one that would take stop-loss cover away from a position or, with `@kokoah/shared` from 2026-10-30, leave the position an entry adds to partly covered; setting a `scheduleCancel` is refused too (clearing one is allowed). Unreadable: `MARKET_DATA_UNAVAILABLE` (retryable) (2026-10-30) |
 | `expiresAfter` | Required; the frame uses now + 15 s (window ≤ 30 s) |
@@ -961,7 +961,7 @@ their own:
 ```json
 {
   "allowedActionTypes": ["order", "cancel", "cancelByCloid", "modify", "batchModify", "updateLeverage", "updateIsolatedMargin", "scheduleCancel", "noop", "startFeeTrial", "vaultTransfer"],
-  "allowedCoins": "*", "maxOrderNotionalUsd": 250000, "maxDailyNotionalUsd": 25000000, "maxLeverage": 50,
+  "allowedCoins": "*", "maxOrderNotionalUsd": 1000000, "maxDailyNotionalUsd": 25000000, "maxLeverage": 50,
   "maxOrdersPerMinute": 60, "priceBandPct": 5, "requireStopLossForNewEntries": false,
   "builder": { "address": "0x…builder", "feeTenthsBps": 45 }, "vaultAddressAllowed": false, "ownSubAccountsAllowed": true,
   "expiresAfterMs": 15000, "allowedOrigins": ["manual", "ai_ticket"], "spotCoins": ["@166", "@150"], "spotTrading": false, "spotTradingCoins": ["PURR/USDC", "@1", "…", "@107", "@142"], "referralCode": null,

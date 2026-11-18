@@ -59,7 +59,7 @@ import { PARAMS_SCHEMAS } from "./messages.js";
 export const BASELINE_LIMITS = Object.freeze({
   allowedActionTypes: [...BASELINE_ACTION_TYPES] as AllowedActionType[],
   allowedCoins: "*" as const,
-  maxOrderNotionalUsd: 250_000,
+  maxOrderNotionalUsd: 1_000_000,
   maxDailyNotionalUsd: 25_000_000,
   /** Each market's own maximum applies below it. */
   maxLeverage: 50,
