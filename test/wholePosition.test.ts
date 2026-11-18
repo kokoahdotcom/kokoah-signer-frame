@@ -8,7 +8,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { MarketRegistry } from "@kokoah/shared/markets";
 import { describeOrders, positionSizes, wholePositionCoins, wholePositionProblems } from "../src/frame/policy.js";
-import { FrameHarness, META0, openOrder, USER, waitFor } from "./helpers.js";
+import { FrameHarness, limitOrder, META0, openOrder, USER, waitFor } from "./helpers.js";
 
 let h: FrameHarness;
 afterEach(() => h?.destroy());
@@ -124,6 +124,32 @@ describe("signing a whole-position TP/SL", () => {
     // Counted at its limit (5% above the trigger, inside the band), the worst price it can fill at.
     expect(seen.title).toBe("Confirm: Close the whole BTC short, $110,250");
     expect(seen.text).toContain("Close the whole BTC short (1 BTC now, whatever it is when it triggers): buy stop-loss at $105,000");
+  });
+
+  it("shows the unconfirmed total too when it is due, so confirming it never resets an allowance unseen", async () => {
+    // 0.05 BTC: $96,000 unconfirmed plus this $5,000 passes the $100,000 of 10 minutes.
+    await ready("0.05");
+    const buy = (id: string) => h.ok("signAndSubmit", { requestId: id, intent: limitOrder({ coin: "BTC", size: "0.24", price: "100000" }) });
+    for (const id of ["a", "b", "c", "d"]) expect((await buy(id)).status).toBe("ok");
+    // $96,000 went out unconfirmed: the stop's prompt says so as well as why a whole-position stop always asks.
+    const seen = await confirmed("w", wholeStop());
+    expect(seen.text).toContain("Orders of about $96,000 went out without a confirmation in the last 10 minutes, so this one needs yours.");
+    expect(seen.text).toContain("so it always needs your confirmation.");
+  });
+
+  it("says nothing about an unconfirmed total that isn't due", async () => {
+    await ready("0.01");
+    const buy = (id: string) => h.ok("signAndSubmit", { requestId: id, intent: limitOrder({ coin: "BTC", size: "0.24", price: "100000" }) });
+    expect((await buy("a")).status).toBe("ok");
+    const seen = await confirmed("w", wholeStop());
+    expect(seen.text).not.toContain("without a confirmation");
+    // Confirming it didn't start the window again: three more small orders still add up to the next prompt.
+    for (const id of ["b", "c", "d"]) expect((await buy(id)).status).toBe("ok");
+    const asks = h.fail("signAndSubmit", { requestId: "e", intent: limitOrder({ coin: "BTC", size: "0.24", price: "100000" }) });
+    await shown();
+    expect(h.promptText()).toContain("Orders of about $96,000 went out without a confirmation in the last 10 minutes");
+    await h.clickPrompt("cancel");
+    expect((await asks).code).toBe("USER_CANCELLED");
   });
 
   it("is refused in a frame with no user interface", async () => {

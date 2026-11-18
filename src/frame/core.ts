@@ -2803,11 +2803,12 @@ export class FrameCore {
     // The reason that applies: the size itself (with what went out unconfirmed lately, when there was any), else the
     // total of the last 10 minutes or 24 hours.
     const lately = recent !== undefined && recent.usd >= 1 ? ` About ${dollars(recent.usd)} went out without a confirmation in the last ${window}.` : "";
-    // A whole-position TP/SL always asks, so that is its reason (after the size's, when that applies too).
+    // A whole-position TP/SL always asks, so that is its reason too (after the size's or the unconfirmed total's, when
+    // one applies: confirming starts that total again only when the prompt showed it).
     const why =
       (large
         ? ` Orders above ${dollars(limits.usd)} need your confirmation.${lately}`
-        : whole || recent === undefined
+        : recent === undefined
           ? ""
           : ` Orders of about ${dollars(recent.usd)} went out without a confirmation in the last ${window}, so ${one ? "this one needs" : "these need"} yours.`) +
       (whole ? " A TP/SL for the whole position closes whatever is open when it triggers, however large, so it always needs your confirmation." : "");

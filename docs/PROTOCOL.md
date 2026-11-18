@@ -664,8 +664,9 @@ without a confirmation lately when there was any), else the rolling total below 
   refused too. The prompt names it by the position, never by a size to buy or sell: `Close the whole BTC long (0.4 BTC
   now, whatever it is when it triggers): sell stop-loss at $95,000, then at market (down to $85,500) · reduce-only ·
   about $40,000`, title `Confirm: Close the whole BTC long, $40,000`; a short's reads `Close the whole BTC short (…): buy
-  stop-loss at …`. It counts toward the rolling totals below at the position's size read under the lock (the larger of
-  the two reads). Once confirmed, it is signed even if the position grew in between, as its line says; the residual
+  stop-loss at …`. Its value (in the prompt and the limits) is the position's size read under the lock (the larger of
+  the two reads); being always confirmed, it never counts toward the unconfirmed totals below, and a prompt that also
+  shows such a total starts it again, as any confirmation does. Once confirmed, it is signed even if the position grew in between, as its line says; the residual
   risk is in THREAT_MODEL.md A25. An unreadable account signs nothing (`MARKET_DATA_UNAVAILABLE`, retryable). A size-0
   modify is signed only for a whole-position TP/SL on the account (shared policy). There is no capability flag: a frame
   without this support refuses the intent (`INVALID_INTENT`, `wholePosition` is unknown there) and never signs size 0,
