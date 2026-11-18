@@ -34,7 +34,7 @@ This repo also ships **`KokoahSignerClient`**, the typed, dependency-free client
   - no `vaultAddress`;
   - price band against HL's mark: 5% for orders that execute now (market, IOC, marketable limits), 50% for resting limits and untriggered triggers;
   - leverage up to 50x, never above the market's maximum;
-  - $250,000 per order and $25,000,000 a day per key (reduce-only orders exempt);
+  - $1,000,000 per order and $25,000,000 a day per key (reduce-only orders exempt);
   - more than the user's confirmation limit of orders in one action (reduce-only included) only after the user presses and holds the button of the frame's own prompt, which names every order: $25,000 unless the user set one (`setConfirmLimit`: lower at once, higher only with the main wallet's signature, the frame's prompt and a day's wait, at most $1,000,000);
   - 60 orders a minute (persisted);
   - `expiresAfter` = now + 15 s.
@@ -288,7 +288,7 @@ Two more suites run on demand:
 ## Known gaps / TODO
 
 - **Out-of-policy orders are denied, not confirmed** (SECURITY_BASELINE §3 asks for a confirmation). Orders above the confirmation limit ($25,000 by default) in one action already need the user's press and hold in the frame.
-- **Tune the baseline limits.** $250,000 per order and a 5% band (since 2026-10-14) are still wide backstops, and $25M per day is unchanged.
+- **Tune the baseline limits.** $1,000,000 per order (since 2026-11-18, matching the highest confirmation limit) and a 5% band (since 2026-10-14) are still wide backstops, and $25M per day is unchanged.
 - **Clickjacking of the in-frame prompt is harder, not impossible.** The button needs the user's own pointer movement (from the keyboard: Tab onto it inside the frame, then Enter or Space held) and, for loosening, vault transfers, large orders and taking out margin, a press and hold; every prompt arms only while IntersectionObserver reports it wholly in view, and without IntersectionObserver v2 (Firefox, Safari, iOS), where a transparent frame under a decoy can't be detected, those prompts are confirmed in a top-level window of the signer's origin, by typing what they do (THREAT_MODEL §5 item 2).
 - **Loosening limits relies on the user reading the frame's prompt**; the clickjacking caveat above applies (THREAT_MODEL A23).
 - **Outcome markets aren't supported, nor unverified spot tokens** (`UNSUPPORTED_MARKET`): spot is limited to
