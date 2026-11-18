@@ -36,6 +36,7 @@ This repo also ships **`KokoahSignerClient`**, the typed, dependency-free client
   - leverage up to 50x, never above the market's maximum;
   - $1,000,000 per order and $25,000,000 a day per key (reduce-only orders exempt);
   - more than the user's confirmation limit of orders in one action (reduce-only included) only after the user presses and holds the button of the frame's own prompt, which names every order: $25,000 unless the user set one (`setConfirmLimit`: lower at once, higher only with the main wallet's signature, the frame's prompt and a day's wait, at most $1,000,000);
+  - a TP/SL for the whole position (Hyperliquid's own kind: size 0, grouping `positionTpsl`, shared `wholePosition`) counts at the account's position now, which the frame reads from HL itself before the prompt and again under the lock (unreadable: nothing is signed); the prompt says "Sell the whole BTC position (0.4 BTC now, whatever it is when it triggers)". Size 0 is signed only in an exit-only `positionTpsl` action or a modify of a whole-position TP/SL the frame finds on the account;
   - 60 orders a minute (persisted);
   - `expiresAfter` = now + 15 s.
 - **Keys.**

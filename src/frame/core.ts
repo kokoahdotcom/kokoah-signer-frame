@@ -114,6 +114,7 @@ import {
   CONFIRM_UNPROMPTED_DAY_ABOVE_USD,
   createBaselinePolicy,
   describeOrders,
+  wholePositionCoins,
   evaluateFrameAccountPolicy,
   evaluateFramePolicy,
   hip3PinnedLegs,
@@ -123,6 +124,7 @@ import {
   type LimitsSet,
   MAX_ACCOUNT_LIMITS,
   orderCount,
+  positionSizes,
   type OrdersDescription,
   policyForAccount,
   printable,
@@ -2282,7 +2284,11 @@ export class FrameCore {
     // can't leave the position it adds to partly covered (shared stopCoverage.ts).
     const touchesStops =
       intent.kind === "cancel" || intent.kind === "modify" || (intent.kind === "order" && !intent.reduceOnly && snapshot.registry.get(intent.coin)?.kind !== "spot");
-    const bookFor = async (accountPolicy: Policy) => (touchesStops && accountPolicy.requireStopLossForNewEntries ? await this.accountBook(account, intent) : undefined);
+    // A whole-position TP/SL (size 0) closes whatever is open when it fires: its position is read for the prompt and the
+    // confirmation totals, and the policy checks a size-0 modify's target and any cap it counts toward on that read.
+    const wholeCoins = wholePositionCoins(compiled.action as unknown as Record<string, unknown>, snapshot.registry);
+    const bookFor = async (accountPolicy: Policy) =>
+      (touchesStops && accountPolicy.requireStopLossForNewEntries) || wholeCoins.length > 0 ? await this.accountBook(account, intent) : undefined;
     // 4a'. A leverage change: the account's open isolated positions on that market's dex, read from HL by the frame
     // itself. Raising an isolated position's leverage takes margin out of it: the user confirms it like removing margin.
     const isolatedFor = async () => (intent.kind === "updateLeverage" ? await this.isolatedPositions(account, intent.coin) : undefined);
@@ -2329,7 +2335,7 @@ export class FrameCore {
         this.log("sign.denied", { actionType: decision.actionType, codes: decision.violations.map((v) => v.code).join(",") });
         throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: decision.violations } });
       }
-      return { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter };
+      return { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter, accountBook };
     };
 
     // 4b. Orders above the master's confirmation limit in all (reduce-only ones included; CONFIRM_ORDERS_ABOVE_USD
@@ -2338,7 +2344,8 @@ export class FrameCore {
     // description of them; so does taking margin out of an isolated position. Checked first, so the user is never asked
     // to confirm something the rules refuse; after the prompt (up to two minutes) the prices, dexes and leverage are read
     // again for the check under the lock.
-    const orders = describeOrders(action, snapshot.registry, snapshot.markPrices, compiled.marketOrder !== undefined);
+    const wholeAt = wholeCoins.length > 0 ? positionSizes(await this.accountBook(account, intent), wholeCoins) : undefined;
+    const orders = describeOrders(action, snapshot.registry, snapshot.markPrices, compiled.marketOrder !== undefined, wholeAt);
     const countedAt = this.correctedNow();
     const recent = orders.totalUsd > 0 ? await this.coordinator.usage(usageKey, countedAt) : undefined;
     const confirmLimit = confirmLimitOf(storedConfirm, this.confirmEarliest(countedAt));
@@ -2398,15 +2405,26 @@ export class FrameCore {
       if (leverageByCoin === undefined && needsLeverage(limits)) leverageByCoin = await this.accountLeverage(account, coins, snapshot);
       const now = this.correctedNow();
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
-      const { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter } = await evaluate(limits, now);
+      const { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter, accountBook } = await evaluate(limits, now);
+      // A whole-position TP/SL counts at the position read now, under the lock: grown since the first read, the larger
+      // total is what the limits and the rolling totals below see.
+      const signedUsd =
+        wholeCoins.length > 0 && accountBook !== undefined
+          ? Math.max(orders.totalUsd, describeOrders(action, snapshot.registry, snapshot.markPrices, compiled.marketOrder !== undefined, positionSizes(accountBook, wholeCoins)).totalUsd)
+          : orders.totalUsd;
       // The confirmation limit too: lowered since (in another tab, or while this waited for the lock), orders it now
       // asks about aren't signed without the user, and the rolling totals below take the lower of the two.
       const confirmNow = confirmLimitOf((await this.readConfirm()).masters.get(master), this.confirmEarliest(now));
-      if (!confirmed && orders.totalUsd > confirmNow.usd) {
-        throw new SignerFailure("SIGNER_BUSY", "Your confirmation limit changed before this was signed; nothing was signed. Send it again to confirm it in the signer window.", {
-          retryable: true,
-          details: { reason: "limitsChanged" },
-        });
+      if (!confirmed && signedUsd > confirmNow.usd) {
+        const grew = signedUsd > orders.totalUsd && !(orders.totalUsd > confirmNow.usd);
+        throw new SignerFailure(
+          "SIGNER_BUSY",
+          grew
+            ? "Your position grew before this was signed; nothing was signed. Send it again to confirm it in the signer window."
+            : "Your confirmation limit changed before this was signed; nothing was signed. Send it again to confirm it in the signer window.",
+          // Both mean "send it again" to the page (protocol `limitsChanged`).
+          { retryable: true, details: { reason: "limitsChanged" } },
+        );
       }
 
       let nonce: number;
@@ -2427,7 +2445,7 @@ export class FrameCore {
           // confirmation whose prompt showed the unconfirmed total of a window starts that window again (the orders in
           // it); one that didn't leaves it, and older orders stay counted in the 24 hours.
           unprompted: {
-            usd: orders.totalUsd,
+            usd: signedUsd,
             confirmed,
             clears: confirmed && addsUp !== undefined ? { windowMs: addsUp.windowMs, at: addsUp.at } : false,
             maxUsd: Math.min(confirmLimit.recentUsd, confirmNow.recentUsd),
