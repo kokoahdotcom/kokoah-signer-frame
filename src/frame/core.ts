@@ -114,6 +114,8 @@ import {
   CONFIRM_UNPROMPTED_DAY_ABOVE_USD,
   createBaselinePolicy,
   describeOrders,
+  wholePositionCoins,
+  wholePositionProblems,
   evaluateFrameAccountPolicy,
   evaluateFramePolicy,
   hip3PinnedLegs,
@@ -123,6 +125,7 @@ import {
   type LimitsSet,
   MAX_ACCOUNT_LIMITS,
   orderCount,
+  positionSizes,
   type OrdersDescription,
   policyForAccount,
   printable,
@@ -2282,7 +2285,21 @@ export class FrameCore {
     // can't leave the position it adds to partly covered (shared stopCoverage.ts).
     const touchesStops =
       intent.kind === "cancel" || intent.kind === "modify" || (intent.kind === "order" && !intent.reduceOnly && snapshot.registry.get(intent.coin)?.kind !== "spot");
-    const bookFor = async (accountPolicy: Policy) => (touchesStops && accountPolicy.requireStopLossForNewEntries ? await this.accountBook(account, intent) : undefined);
+    // A whole-position TP/SL (size 0) closes whatever is open when it fires, whatever size that is by then: it is always
+    // confirmed in the frame's prompt, and signed only while the frame's own read shows the position it closes (open, on
+    // the other side). That read also gives the prompt and the totals its size now, and the policy a size-0 modify's
+    // target and any cap it counts toward.
+    const wholeCoins = wholePositionCoins(compiled.action as unknown as Record<string, unknown>, snapshot.registry);
+    const whole = wholeCoins.length > 0;
+    const bookFor = async (accountPolicy: Policy) =>
+      (touchesStops && accountPolicy.requireStopLossForNewEntries) || whole ? await this.accountBook(account, intent, whole) : undefined;
+    const requireWholePositions = (positions: Readonly<Record<string, number>>) => {
+      const problems = wholePositionProblems(compiled.action as unknown as Record<string, unknown>, snapshot.registry, positions);
+      if (problems.length === 0) return;
+      this.metrics.policyDenials++;
+      this.log("sign.denied", { actionType: String((compiled.action as { type?: unknown }).type), codes: "INVALID_SUBJECT" });
+      throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: problems.map((message) => ({ code: "INVALID_SUBJECT", message })) } });
+    };
     // 4a'. A leverage change: the account's open isolated positions on that market's dex, read from HL by the frame
     // itself. Raising an isolated position's leverage takes margin out of it: the user confirms it like removing margin.
     const isolatedFor = async () => (intent.kind === "updateLeverage" ? await this.isolatedPositions(account, intent.coin) : undefined);
@@ -2329,7 +2346,7 @@ export class FrameCore {
         this.log("sign.denied", { actionType: decision.actionType, codes: decision.violations.map((v) => v.code).join(",") });
         throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: decision.violations } });
       }
-      return { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter };
+      return { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter, accountBook };
     };
 
     // 4b. Orders above the master's confirmation limit in all (reduce-only ones included; CONFIRM_ORDERS_ABOVE_USD
@@ -2338,7 +2355,9 @@ export class FrameCore {
     // description of them; so does taking margin out of an isolated position. Checked first, so the user is never asked
     // to confirm something the rules refuse; after the prompt (up to two minutes) the prices, dexes and leverage are read
     // again for the check under the lock.
-    const orders = describeOrders(action, snapshot.registry, snapshot.markPrices, compiled.marketOrder !== undefined);
+    const wholeAt = whole ? positionSizes(await this.accountBook(account, intent, true), wholeCoins) : undefined;
+    if (wholeAt) requireWholePositions(wholeAt);
+    const orders = describeOrders(action, snapshot.registry, snapshot.markPrices, compiled.marketOrder !== undefined, wholeAt);
     const countedAt = this.correctedNow();
     const recent = orders.totalUsd > 0 ? await this.coordinator.usage(usageKey, countedAt) : undefined;
     const confirmLimit = confirmLimitOf(storedConfirm, this.confirmEarliest(countedAt));
@@ -2359,11 +2378,11 @@ export class FrameCore {
         ? { coin: intent.coin, from: isolatedNow, to: intent.leverage }
         : undefined;
     let confirmed = false;
-    if (large || addsUp || marginOut || leverageUp) {
+    if (large || addsUp || marginOut || leverageUp || whole) {
       await evaluate(stored, this.correctedNow());
       if (marginOut) await this.confirmMarginRemoval(marginOut, snapshot, compiled.vaultAddress);
       else if (leverageUp) await this.confirmLeverageRaise(leverageUp, snapshot, compiled.vaultAddress);
-      else await this.confirmOrders(orders, compiled.vaultAddress, confirmLimit, large, addsUp);
+      else await this.confirmOrders(orders, compiled.vaultAddress, confirmLimit, large, addsUp, whole);
       confirmed = true;
       snapshot = await this.marketSnapshot(coins);
       requirePinnedDexes();
@@ -2398,11 +2417,21 @@ export class FrameCore {
       if (leverageByCoin === undefined && needsLeverage(limits)) leverageByCoin = await this.accountLeverage(account, coins, snapshot);
       const now = this.correctedNow();
       if (this.keyStateOf(current, now) !== "active") throw new SignerFailure("KEY_EXPIRED", "The trading key has expired; renew it to keep trading.");
-      const { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter } = await evaluate(limits, now);
+      const { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter, accountBook } = await evaluate(limits, now);
+      // A whole-position TP/SL needs its position still open on the other side under the lock (closed or flipped while
+      // the prompt was open: refused), and counts at the position read now: grown since, the larger total is what the
+      // rolling totals below see. The user confirmed "whatever it is when it triggers", so growth isn't asked again.
+      let signedUsd = orders.totalUsd;
+      if (whole) {
+        if (accountBook === undefined) throw new SignerFailure("INTERNAL_ERROR", "The position this TP/SL closes was not read; nothing was signed.");
+        const lockAt = positionSizes(accountBook, wholeCoins);
+        requireWholePositions(lockAt);
+        signedUsd = Math.max(orders.totalUsd, describeOrders(action, snapshot.registry, snapshot.markPrices, compiled.marketOrder !== undefined, lockAt).totalUsd);
+      }
       // The confirmation limit too: lowered since (in another tab, or while this waited for the lock), orders it now
       // asks about aren't signed without the user, and the rolling totals below take the lower of the two.
       const confirmNow = confirmLimitOf((await this.readConfirm()).masters.get(master), this.confirmEarliest(now));
-      if (!confirmed && orders.totalUsd > confirmNow.usd) {
+      if (!confirmed && signedUsd > confirmNow.usd) {
         throw new SignerFailure("SIGNER_BUSY", "Your confirmation limit changed before this was signed; nothing was signed. Send it again to confirm it in the signer window.", {
           retryable: true,
           details: { reason: "limitsChanged" },
@@ -2427,7 +2456,7 @@ export class FrameCore {
           // confirmation whose prompt showed the unconfirmed total of a window starts that window again (the orders in
           // it); one that didn't leaves it, and older orders stay counted in the 24 hours.
           unprompted: {
-            usd: orders.totalUsd,
+            usd: signedUsd,
             confirmed,
             clears: confirmed && addsUp !== undefined ? { windowMs: addsUp.windowMs, at: addsUp.at } : false,
             maxUsd: Math.min(confirmLimit.recentUsd, confirmNow.recentUsd),
@@ -2753,6 +2782,7 @@ export class FrameCore {
     limits: ConfirmLimitStatus,
     large: boolean,
     recent?: { usd: number; windowMs: number },
+    whole = false,
   ): Promise<void> {
     const total = dollars(orders.totalUsd);
     const day = recent !== undefined && recent.windowMs >= UNPROMPTED_DAY_MS;
@@ -2760,8 +2790,9 @@ export class FrameCore {
     const limit = day ? limits.dailyUsd : limits.recentUsd;
     if (!this.ui) {
       this.metrics.policyDenials++;
-      const message =
-        large || recent === undefined
+      const message = whole
+        ? "A TP/SL for the whole position closes whatever is open when it triggers, so it always needs your confirmation in the signer frame, which has no user interface here."
+        : large || recent === undefined
           ? `Orders of more than ${dollars(limits.usd)} (${total} here) need your confirmation in the signer frame, which has no user interface here.`
           : `Orders past ${dollars(limit)} in ${window} without a confirmation (${dollars(recent.usd)} so far, ${total} here) need your confirmation in the signer frame, which has no user interface here.`;
       throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: "ORDER_NOTIONAL_EXCEEDED", message }] } });
@@ -2772,11 +2803,15 @@ export class FrameCore {
     // The reason that applies: the size itself (with what went out unconfirmed lately, when there was any), else the
     // total of the last 10 minutes or 24 hours.
     const lately = recent !== undefined && recent.usd >= 1 ? ` About ${dollars(recent.usd)} went out without a confirmation in the last ${window}.` : "";
-    const why = large
-      ? ` Orders above ${dollars(limits.usd)} need your confirmation.${lately}`
-      : recent === undefined
-        ? ""
-        : ` Orders of about ${dollars(recent.usd)} went out without a confirmation in the last ${window}, so ${one ? "this one needs" : "these need"} yours.`;
+    // A whole-position TP/SL always asks, so that is its reason too (after the size's or the unconfirmed total's, when
+    // one applies: confirming starts that total again only when the prompt showed it).
+    const why =
+      (large
+        ? ` Orders above ${dollars(limits.usd)} need your confirmation.${lately}`
+        : recent === undefined
+          ? ""
+          : ` Orders of about ${dollars(recent.usd)} went out without a confirmation in the last ${window}, so ${one ? "this one needs" : "these need"} yours.`) +
+      (whole ? " A TP/SL for the whole position closes whatever is open when it triggers, however large, so it always needs your confirmation." : "");
     // Side, size and market of the first order, and the total, in the title and on the button too, which always show
     // whole: a parent that leaves the prompt little room can't hide what is confirmed.
     const first = orders.heads[0] ?? "";
@@ -2902,12 +2937,16 @@ export class FrameCore {
     return leverage;
   }
 
-  /** The account's book for the stop-loss check (accountBook.ts); unreadable: nothing is signed (retryable). */
-  private async accountBook(account: Hex, intent: ActionIntent): Promise<FrameAccountBook> {
+  /**
+   * The account's book for the stop-loss check, or for a whole-position TP/SL's position (`forPosition`; accountBook.ts);
+   * unreadable: nothing is signed (retryable).
+   */
+  private async accountBook(account: Hex, intent: ActionIntent, forPosition = false): Promise<FrameAccountBook> {
     try {
       return await readAccountBook((body) => this.hl.info(body), account, intent);
     } catch {
-      throw new SignerFailure("MARKET_DATA_UNAVAILABLE", "Could not read your positions and orders from Hyperliquid to check your stop-losses; nothing was signed. Try again shortly.", {
+      const what = forPosition ? "check the position this TP/SL closes" : "check your stop-losses";
+      throw new SignerFailure("MARKET_DATA_UNAVAILABLE", `Could not read your positions and orders from Hyperliquid to ${what}; nothing was signed. Try again shortly.`, {
         retryable: true,
       });
     }
