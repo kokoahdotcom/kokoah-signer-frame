@@ -521,9 +521,32 @@ export function wholePositionCoins(action: Record<string, unknown>, registry: Ma
   return [...coins];
 }
 
-/** The size (absolute, in coins) of the account's position on each of `coins`, 0 where it has none. */
+/** The signed size (in coins: positive long, negative short) of the account's position on each of `coins`, 0 where it has none. */
 export function positionSizes(book: AccountBook, coins: readonly string[]): Record<string, number> {
-  return Object.fromEntries(coins.map((c) => [c, Math.abs(book.positions.find((p) => p.coin === c)?.size ?? 0)]));
+  return Object.fromEntries(coins.map((c) => [c, book.positions.find((p) => p.coin === c)?.size ?? 0]));
+}
+
+/**
+ * Why the whole-position TP/SLs of an action can't be signed on the account as the frame read it (`positions`, from
+ * {@link positionSizes}), one message each: there is no open position on that market (one would sit unseen until a
+ * position opened, then close all of it), or the order's side doesn't close the position (a long's exit sells, a
+ * short's buys). Empty when every one closes an open position.
+ */
+export function wholePositionProblems(action: Record<string, unknown>, registry: MarketRegistry, positions: Readonly<Record<string, number>>): string[] {
+  const problems: string[] = [];
+  for (const o of wireOrders(action)) {
+    if (!isWholePositionWire(o)) continue;
+    const market = typeof o.a === "number" ? registry.getByAssetId(o.a) : undefined;
+    const coin = market?.coin ?? `asset ${String(o.a)}`;
+    const name = printable(market?.displayName ?? coin);
+    const size = Object.hasOwn(positions, coin) ? positions[coin] : undefined;
+    if (size === undefined || !Number.isFinite(size)) problems.push(`The ${name} position couldn't be read, so a TP/SL for the whole of it can't be signed.`);
+    else if (size === 0) problems.push(`There is no open ${name} position, so a TP/SL for the whole position can't be signed: place it once the position is open.`);
+    else if ((size > 0) === (o.b === true)) {
+      problems.push(`A TP/SL for the whole ${name} ${size > 0 ? "long" : "short"} must ${size > 0 ? "sell" : "buy"}: this one ${o.b === true ? "buys" : "sells"}, which can't close it.`);
+    }
+  }
+  return problems;
 }
 
 /** Number of orders an action creates (counts toward the per-minute limit; cancels count 0). */
@@ -599,9 +622,9 @@ const plain = (x: unknown): string => Number(x).toLocaleString("en-US", { maximu
 /**
  * What an action's orders do, from the exact wire action the frame signs: side, size and market, the limit price (a
  * market order's worst price) and trigger, reduce-only, and the notional of each. `marketOrder`: the first order is a
- * market order (compiled as IOC at its worst price). A whole-position TP/SL (size 0) says it closes the whole position,
- * with the position's size now from `positions` (the frame's own read, {@link positionSizes}), which its notional uses:
- * one whose market isn't in `positions` throws, so nothing is signed without it. Actions without orders describe
+ * market order (compiled as IOC at its worst price). A whole-position TP/SL (size 0) says it closes the whole long or
+ * short, with the position's size now from `positions` (the frame's own read, {@link positionSizes}), which its notional
+ * uses: one whose market isn't in `positions` throws, so nothing is signed without it. Actions without orders describe
  * nothing.
  */
 export function describeOrders(
@@ -629,20 +652,25 @@ export function describeOrders(
       const tif = t.limit?.tif === "Alo" ? "post-only limit" : t.limit?.tif === "Ioc" ? "limit, fill now or cancel" : "limit";
       how = `at $${plain(o.p)} (${tif})`;
     }
-    const whole = isWholePositionWire(o);
     let wholeSize: number | undefined;
-    if (whole) {
+    if (isWholePositionWire(o)) {
       const coin = market?.coin ?? `asset ${String(o.a)}`;
       wholeSize = positions !== undefined && Object.hasOwn(positions, coin) ? positions[coin] : undefined;
       if (wholeSize === undefined || !Number.isFinite(wholeSize)) throw new Error("The position this TP/SL closes was not read.");
     }
-    const notional = orderNotionalUsd(o, registry, markPrices, wholeSize);
+    const notional = orderNotionalUsd(o, registry, markPrices, wholeSize === undefined ? undefined : Math.abs(wholeSize));
     totalUsd += notional;
     const change = action.type === "order" ? "" : "Change an open order to: ";
-    const head = whole ? `${isBuy ? "Buy" : "Sell"} the whole ${name} position` : `${isBuy ? "Buy" : "Sell"} ${plain(o.s)} ${name}`;
+    if (wholeSize !== undefined) {
+      // Never "Buy the whole …": it closes what is open, which the side of the position says.
+      const head = `Close the whole ${name} ${wholeSize > 0 ? "long" : wholeSize < 0 ? "short" : "position"}`;
+      heads.push(head);
+      lines.push(`${change}${head} (${plain(Math.abs(wholeSize))} ${name} now, whatever it is when it triggers): ${isBuy ? "buy" : "sell"} ${how} · reduce-only · about ${usd(notional)}`);
+      continue;
+    }
+    const head = `${isBuy ? "Buy" : "Sell"} ${plain(o.s)} ${name}`;
     heads.push(head);
-    const now = whole ? ` (${plain(wholeSize)} ${name} now, whatever it is when it triggers)` : "";
-    lines.push(`${change}${head}${now} ${how}${o.r === true ? " · reduce-only" : ""} · about ${usd(notional)}`);
+    lines.push(`${change}${head} ${how}${o.r === true ? " · reduce-only" : ""} · about ${usd(notional)}`);
   }
   return { lines, heads, totalUsd, changes: action.type !== "order" };
 }

@@ -626,8 +626,12 @@ list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE`
 ```jsonc
 // Close all (market, reduce-only)
 { "kind": "order", "coin": "BTC", "side": "sell", "orderType": "market", "size": "0.01", "reduceOnly": true, "slippageBps": 100, "origin": "manual" }
-// Position TP/SL
+// Position TP/SL with a size of its own (fixed: it doesn't resize with the position)
 { "kind": "order", "coin": "BTC", "side": "sell", "orderType": "stopMarket", "size": "0.01", "triggerPrice": "95000", "reduceOnly": true, "positionTpsl": true, "origin": "manual" }
+// TP/SL for the whole position (Hyperliquid's own kind, sent with size 0; `size` is the position's now, not sent)
+{ "kind": "order", "coin": "BTC", "side": "sell", "orderType": "stopMarket", "size": "0.01", "triggerPrice": "95000", "reduceOnly": true, "positionTpsl": true, "wholePosition": true, "origin": "manual" }
+// Move a whole-position TP/SL (it stays one: size 0)
+{ "kind": "modify", "target": { "oid": 77738309 }, "order": { "coin": "BTC", "side": "sell", "orderType": "stopMarket", "size": "0.01", "triggerPrice": "96000", "reduceOnly": true, "wholePosition": true }, "origin": "manual" }
 // Edit an order
 { "kind": "modify", "target": { "oid": 77738308 }, "order": { "coin": "ETH", "side": "buy", "orderType": "limit", "size": "0.5", "price": "2490" }, "origin": "manual" }
 // Cancel by cloid
@@ -652,6 +656,20 @@ the first order's side, size and market and the total (`Confirm: Buy 0.3 BTC + 2
 same order (`Buy 0.3 BTC + 2`), so they show even when the parent leaves the prompt little room (2026-10-30). Its
 text gives the reason that applies: the size (`Orders above $25,000 need your confirmation.`, with what went out
 without a confirmation lately when there was any), else the rolling total below (2026-11-16).
+- **A TP/SL for the whole position** (`wholePosition`, 2026-11-18) always asks, whatever its size or the limit, because
+  it closes whatever is open when it triggers, however large the position is by then; a frame without a UI refuses it
+  (`POLICY_DENIED`). The frame reads the account's position itself before the prompt and again under the lock, and
+  refuses one (`POLICY_DENIED`, `INVALID_SUBJECT`, no prompt) when there is no open position on that market, or when its
+  side can't close it (a long's exit sells, a short's buys); a position closed or flipped while the prompt was open is
+  refused too. The prompt names it by the position, never by a size to buy or sell: `Close the whole BTC long (0.4 BTC
+  now, whatever it is when it triggers): sell stop-loss at $95,000, then at market (down to $85,500) · reduce-only ·
+  about $40,000`, title `Confirm: Close the whole BTC long, $40,000`; a short's reads `Close the whole BTC short (…): buy
+  stop-loss at …`. It counts toward the rolling totals below at the position's size read under the lock (the larger of
+  the two reads). Once confirmed, it is signed even if the position grew in between, as its line says; the residual
+  risk is in THREAT_MODEL.md A25. An unreadable account signs nothing (`MARKET_DATA_UNAVAILABLE`, retryable). A size-0
+  modify is signed only for a whole-position TP/SL on the account (shared policy). There is no capability flag: a frame
+  without this support refuses the intent (`INVALID_INTENT`, `wholePosition` is unknown there) and never signs size 0,
+  so the app can fall back to a position TP/SL with a size of its own.
 - It asks only about orders its rules allow (checked first) and doesn't hold up other requests meanwhile (a smaller
   order or a cancel signs at once; a second large order while one is asked about is `PROMPT_BUSY`).
 - After the user confirms, it reads prices, dexes and leverage again and checks everything again under the agent lock:
@@ -950,7 +968,7 @@ The baseline is built into the frame and can't be loosened:
 | Leverage | **50x**, and never above each market's own maximum (`updateLeverage` above it is denied). Where a market allows more than the cap (the baseline's or the user's), the frame reads the account's leverage on HL itself and refuses new entries while it is set higher |
 | Rate | **60 orders per minute** per agent (TP/SL legs count; cancels don't). Persisted, so a reload doesn't reset it |
 | Notional | $1,000,000 per order, $25,000,000 per UTC day per key across every account (reduce-only orders exempt) |
-| Large orders | More than the master's confirmation limit ($25,000 unless the user set one with `setConfirmLimit`, at most $1,000,000) of orders in one action (reduce-only included) only after the user confirms the frame's own prompt (`signAndSubmit`, "Large orders") |
+| Large orders | More than the master's confirmation limit ($25,000 unless the user set one with `setConfirmLimit`, at most $1,000,000) of orders in one action (reduce-only included) only after the user confirms the frame's own prompt (`signAndSubmit`, "Large orders"); a TP/SL for the whole position always, and only while the position it closes is open |
 | Stop-losses (with `requireStopLossForNewEntries`) | An entry's attached stop must cover it, sit on the losing side and be within **25%** of the entry. The frame reads the account's positions and resting orders on HL itself (`clearinghouseState`, `frontendOpenOrders`, and `orderStatus` for an order an action names that isn't among them) before a cancel, a modify or an entry, and refuses (`STOP_LOSS_REQUIRED`) one that would take stop-loss cover away from a position or, with `@kokoah/shared` from 2026-10-30, leave the position an entry adds to partly covered; setting a `scheduleCancel` is refused too (clearing one is allowed). Unreadable: `MARKET_DATA_UNAVAILABLE` (retryable) (2026-10-30) |
 | `expiresAfter` | Required; the frame uses now + 15 s (window ≤ 30 s) |
 | Origins | `manual`, `ai_ticket` |
