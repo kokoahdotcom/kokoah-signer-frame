@@ -2434,7 +2434,7 @@ export class FrameCore {
       if (!confirmed && whole && signedUsd > confirmLimit.usd) {
         throw new SignerFailure("SIGNER_BUSY", "The position this TP/SL closes grew past your confirmation limit before it was signed; nothing was signed. Send it again to confirm it in the signer window.", {
           retryable: true,
-          details: { reason: "positionGrew" },
+          details: { reason: "marketMoved" },
         });
       }
       if (!confirmed && signedUsd > confirmNow.usd) {
