@@ -166,10 +166,38 @@ describe("signing a whole-position TP/SL", () => {
     expect(none.code).toBe("POLICY_DENIED");
     expect(codes(none)).toEqual(["INVALID_SUBJECT"]);
     expect(messages(none)).toMatch(/no open BTC position/);
-    h.hl.positions[ACCOUNT] = [{ coin: "BTC", szi: "-0.1", entryPx: "100000.0" }];
+    // $30,000: a prompt would be due, so none showing proves the refusal comes first.
+    h.hl.positions[ACCOUNT] = [{ coin: "BTC", szi: "-0.3", entryPx: "100000.0" }];
     expect(messages(await h.fail("signAndSubmit", { requestId: "side", intent: wholeStop() }))).toMatch(/whole BTC short must buy/);
     expect(h.promptEvents()).toHaveLength(0);
     expect(h.hl.exchangeCalls).toHaveLength(0);
+  });
+
+  it("refuses one signed without a prompt whose position grew past the limit by the lock; the resend asks", async () => {
+    await ready("0.01");
+    let reads = 0;
+    // The second read of the position (under the lock) finds it grown to $30,000.
+    h.hl.infoFailure = (body) => {
+      if (body.type === "clearinghouseState" && ++reads === 2) h.hl.positions[ACCOUNT] = [{ coin: "BTC", szi: "0.3", entryPx: "100000.0" }];
+      return false;
+    };
+    const e = await h.fail("signAndSubmit", { requestId: "g", intent: wholeStop() });
+    expect(e.code).toBe("SIGNER_BUSY");
+    expect(e.retryable).toBe(true);
+    expect(e.details).toMatchObject({ reason: "marketMoved" });
+    expect(h.promptEvents()).toHaveLength(0);
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    h.hl.infoFailure = null;
+    const seen = await confirmed("g", wholeStop());
+    expect(seen.text).toContain("0.3 BTC now");
+    expect(h.hl.exchangeCalls).toHaveLength(1);
+  });
+
+  it("moves a small whole-position stop without a prompt", async () => {
+    await ready("0.01");
+    expect((await h.ok("signAndSubmit", { requestId: "m", intent: moveWhole({ oid: 80 }) })).status).toBe("ok");
+    expect(h.promptEvents()).toHaveLength(0);
+    expect(h.hl.exchangeCalls[0]?.body.action).toMatchObject({ type: "modify", oid: 80, order: { s: "0" } });
   });
 
   it("is refused when the position closed while the prompt was open", async () => {
@@ -204,7 +232,7 @@ describe("signing a whole-position TP/SL", () => {
   });
 
   it("refuses size 0 for a fixed position stop or a plain stop", async () => {
-    await ready("0.1");
+    await ready("0.3");
     for (const oid of [81, 77]) {
       const e = await h.fail("signAndSubmit", { requestId: `fixed${oid}`, intent: moveWhole({ oid }) });
       expect(e.code).toBe("POLICY_DENIED");

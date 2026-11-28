@@ -2420,7 +2420,8 @@ export class FrameCore {
       const { decision, accountPolicy, usageAccount, masterDailyLimitUsd, expiresAfter, accountBook } = await evaluate(limits, now);
       // A whole-position TP/SL needs its position still open on the other side under the lock (closed or flipped while
       // the prompt was open: refused), and counts at the position read now: grown since, the larger total is what the
-      // rolling totals below see. The user confirmed "whatever it is when it triggers", so growth isn't asked again.
+      // rolling totals below see. After a prompt the user confirmed "whatever it is when it triggers", so growth isn't asked
+      // again; without one, growth past the confirmation limit is refused so the resend asks.
       let signedUsd = orders.totalUsd;
       if (whole) {
         if (accountBook === undefined) throw new SignerFailure("INTERNAL_ERROR", "The position this TP/SL closes was not read; nothing was signed.");
