@@ -613,7 +613,8 @@ list can't be read nothing is signed and the answer is `MARKET_DATA_UNAVAILABLE`
   - `SIGNER_BUSY` (retryable, nothing sent; `details.reason` says why): `lock`, the signing lock wasn't free within
     20 s; `ordersSigned`, another tab signed orders in between and this one now needs the `order` prompt;
     `marketMoved`, the mark moved toward a confirmed order's market trigger while the user confirmed, so its slippage
-    (compiled from the earlier mark) would now be refused; `leverageChanged`, the position's leverage changed while the
+    (compiled from the earlier mark) would now be refused, or a whole-position TP/SL signed without a prompt found its
+    position grown past the confirmation limit under the lock; `leverageChanged`, the position's leverage changed while the
     user confirmed raising it. Send it again: it is checked, and asked, against the new state. Show something like "The
     price moved while you confirmed. Nothing was sent; confirm again.";
   - `USER_CANCELLED`, `USER_TIMEOUT`, `PROMPT_BUSY` (an HLP deposit or a large order the user didn't confirm; nothing sent);
@@ -656,18 +657,19 @@ the first order's side, size and market and the total (`Confirm: Buy 0.3 BTC + 2
 same order (`Buy 0.3 BTC + 2`), so they show even when the parent leaves the prompt little room (2026-10-30). Its
 text gives the reason that applies: the size (`Orders above $25,000 need your confirmation.`, with what went out
 without a confirmation lately when there was any), else the rolling total below (2026-11-16).
-- **A TP/SL for the whole position** (`wholePosition`, 2026-11-18) always asks, whatever its size or the limit, because
-  it closes whatever is open when it triggers, however large the position is by then; a frame without a UI refuses it
-  (`POLICY_DENIED`). The frame reads the account's position itself before the prompt and again under the lock, and
+- **A TP/SL for the whole position** (`wholePosition`, 2026-11-18; since 2026-11-28 like any order) is valued at the
+  position's size from the frame's own read and asks only as any order does: above the confirmation limit or past the
+  rolling totals below (a frame without a UI refuses only those). The frame reads the account's position itself before the prompt and again under the lock, and
   refuses one (`POLICY_DENIED`, `INVALID_SUBJECT`, no prompt) when there is no open position on that market, or when its
   side can't close it (a long's exit sells, a short's buys); a position closed or flipped while the prompt was open is
   refused too. The prompt names it by the position, never by a size to buy or sell: `Close the whole BTC long (0.4 BTC
   now, whatever it is when it triggers): sell stop-loss at $95,000, then at market (down to $85,500) · reduce-only ·
   about $40,000`, title `Confirm: Close the whole BTC long, $40,000`; a short's reads `Close the whole BTC short (…): buy
   stop-loss at …`. Its value (in the prompt and the limits) is the position's size read under the lock (the larger of
-  the two reads); being always confirmed, it never counts toward the unconfirmed totals below, and a prompt that also
-  shows such a total starts it again, as any confirmation does. Once confirmed, it is signed even if the position grew in between, as its line says; the residual
-  risk is in THREAT_MODEL.md A25. An unreadable account signs nothing (`MARKET_DATA_UNAVAILABLE`, retryable). A size-0
+  the two reads); signed without a prompt it counts toward the unconfirmed totals below like any order, and one whose
+  position grew past the confirmation limit by the lock is refused (`SIGNER_BUSY`, `marketMoved`) so the resend asks.
+  Once confirmed, it is signed even if the position grew in between, as its line says; the residual risk is in
+  THREAT_MODEL.md A25. An unreadable account signs nothing (`MARKET_DATA_UNAVAILABLE`, retryable). A size-0
   modify is signed only for a whole-position TP/SL on the account (shared policy). There is no capability flag: a frame
   without this support refuses the intent (`INVALID_INTENT`, `wholePosition` is unknown there) and never signs size 0,
   so the app can fall back to a position TP/SL with a size of its own.
@@ -969,7 +971,7 @@ The baseline is built into the frame and can't be loosened:
 | Leverage | **50x**, and never above each market's own maximum (`updateLeverage` above it is denied). Where a market allows more than the cap (the baseline's or the user's), the frame reads the account's leverage on HL itself and refuses new entries while it is set higher |
 | Rate | **60 orders per minute** per agent (TP/SL legs count; cancels don't). Persisted, so a reload doesn't reset it |
 | Notional | $1,000,000 per order, $25,000,000 per UTC day per key across every account (reduce-only orders exempt) |
-| Large orders | More than the master's confirmation limit ($25,000 unless the user set one with `setConfirmLimit`, at most $1,000,000) of orders in one action (reduce-only included) only after the user confirms the frame's own prompt (`signAndSubmit`, "Large orders"); a TP/SL for the whole position always, and only while the position it closes is open |
+| Large orders | More than the master's confirmation limit ($25,000 unless the user set one with `setConfirmLimit`, at most $1,000,000) of orders in one action (reduce-only included) only after the user confirms the frame's own prompt (`signAndSubmit`, "Large orders"); a TP/SL for the whole position likewise, valued at the position's size now, and only while the position it closes is open |
 | Stop-losses (with `requireStopLossForNewEntries`) | An entry's attached stop must cover it, sit on the losing side and be within **25%** of the entry. The frame reads the account's positions and resting orders on HL itself (`clearinghouseState`, `frontendOpenOrders`, and `orderStatus` for an order an action names that isn't among them) before a cancel, a modify or an entry, and refuses (`STOP_LOSS_REQUIRED`) one that would take stop-loss cover away from a position or, with `@kokoah/shared` from 2026-10-30, leave the position an entry adds to partly covered; setting a `scheduleCancel` is refused too (clearing one is allowed). Unreadable: `MARKET_DATA_UNAVAILABLE` (retryable) (2026-10-30) |
 | `expiresAfter` | Required; the frame uses now + 15 s (window ≤ 30 s) |
 | Origins | `manual`, `ai_ticket` |

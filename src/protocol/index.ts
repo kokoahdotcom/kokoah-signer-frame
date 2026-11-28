@@ -695,7 +695,8 @@ export interface SignerError {
      * SIGNER_BUSY: why nothing was signed or changed. `lock`: the signing lock wasn't free within 20 s. `ordersSigned`:
      * another tab signed orders in between, so this one now needs the `order` prompt. `limitsChanged`: the stored limits
      * changed while the user confirmed. `marketMoved`: the mark moved toward a confirmed order's market trigger, so its
-     * slippage would now be refused. `leverageChanged`: the position's leverage changed while the user confirmed raising
+     * slippage would now be refused, or a whole-position TP/SL signed without a prompt found its position grown past the
+     * confirmation limit. `leverageChanged`: the position's leverage changed while the user confirmed raising
      * it. `keyChanged`: the trading key changed during `setConfirmLimit`. Each time, sending the request again shows the
      * current state. LIMIT_LOOSENING_REJECTED from `setConfirmLimit`: `signature` (none, or not the master wallet's),
      * `expired` (older than a week, or ahead of the clock), `stale` (older than the last change on this device): ask the

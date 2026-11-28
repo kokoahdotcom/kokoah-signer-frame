@@ -1,8 +1,8 @@
 /**
  * Hyperliquid's TP/SL for the whole position (shared `wholePosition`: size 0 in a `positionTpsl` action): it closes
- * whatever is open when it fires, whatever size that is by then. The frame always asks before signing one (a frame
- * without a UI refuses it), signs it only while its own read of the account shows the position it closes (open, on the
- * other side), says "Close the whole BTC long" instead of a size, counts it at the position's size now, and signs size 0
+ * whatever is open when it fires, whatever size that is by then. The frame counts it at the position's size like any
+ * order (a prompt only above the confirmation limit or past the unprompted totals), signs it only while its own read of
+ * the account shows the position it closes (open, on the other side), says "Close the whole BTC long" instead of a size, counts it at the position's size now, and signs size 0
  * in a modify only of a whole-position TP/SL it finds on the account.
  */
 import { afterEach, describe, expect, it } from "vitest";
@@ -108,12 +108,10 @@ describe("whole-position TP/SL in plain words", () => {
 });
 
 describe("signing a whole-position TP/SL", () => {
-  it("always asks, even for a small position, and sends size 0 after the hold", async () => {
+  it("signs a small one at once, without a prompt, and sends size 0", async () => {
     await ready("0.01");
-    const seen = await confirmed("a", wholeStop());
-    expect(seen.title).toBe("Confirm: Close the whole BTC long, $1,000");
-    expect(seen.text).toContain("A TP/SL for the whole position closes whatever is open when it triggers, however large, so it always needs your confirmation.");
-    expect(seen.text).toContain("Close the whole BTC long (0.01 BTC now, whatever it is when it triggers): sell stop-loss at $95,000");
+    expect((await h.ok("signAndSubmit", { requestId: "a", intent: wholeStop() })).status).toBe("ok");
+    expect(h.promptEvents()).toHaveLength(0);
     expect(positionReads().length).toBeGreaterThan(0);
     expect(h.hl.exchangeCalls[0]?.body.action).toMatchObject({ type: "order", grouping: "positionTpsl", orders: [{ a: 0, b: false, s: "0", r: true, t: { trigger: { tpsl: "sl", triggerPx: "95000" } } }] });
   });
@@ -134,30 +132,32 @@ describe("signing a whole-position TP/SL", () => {
     // $96,000 went out unconfirmed: the stop's prompt says so as well as why a whole-position stop always asks.
     const seen = await confirmed("w", wholeStop());
     expect(seen.text).toContain("Orders of about $96,000 went out without a confirmation in the last 10 minutes, so this one needs yours.");
-    expect(seen.text).toContain("so it always needs your confirmation.");
+    expect(seen.text).toContain("A TP/SL for the whole position closes whatever is open when it triggers.");
   });
 
-  it("says nothing about an unconfirmed total that isn't due", async () => {
+  it("counts toward the unconfirmed total like any order", async () => {
     await ready("0.01");
     const buy = (id: string) => h.ok("signAndSubmit", { requestId: id, intent: limitOrder({ coin: "BTC", size: "0.24", price: "100000" }) });
     expect((await buy("a")).status).toBe("ok");
-    const seen = await confirmed("w", wholeStop());
-    expect(seen.text).not.toContain("without a confirmation");
-    // Confirming it didn't start the window again: three more small orders still add up to the next prompt.
+    // $1,000 at the position's size now: no prompt, and counted.
+    expect((await h.ok("signAndSubmit", { requestId: "w", intent: wholeStop() })).status).toBe("ok");
     for (const id of ["b", "c", "d"]) expect((await buy(id)).status).toBe("ok");
+    expect(h.promptEvents()).toHaveLength(0);
     const asks = h.fail("signAndSubmit", { requestId: "e", intent: limitOrder({ coin: "BTC", size: "0.24", price: "100000" }) });
     await shown();
-    expect(h.promptText()).toContain("Orders of about $96,000 went out without a confirmation in the last 10 minutes");
+    expect(h.promptText()).toContain("Orders of about $97,000 went out without a confirmation in the last 10 minutes");
     await h.clickPrompt("cancel");
     expect((await asks).code).toBe("USER_CANCELLED");
   });
 
-  it("is refused in a frame with no user interface", async () => {
+  it("signs a small one in a frame with no user interface, and refuses one over the confirmation limit there", async () => {
     await ready("0.01", { withUi: false });
-    const e = await h.fail("signAndSubmit", { requestId: "x", intent: wholeStop() });
+    expect((await h.ok("signAndSubmit", { requestId: "small", intent: wholeStop() })).status).toBe("ok");
+    h.hl.positions[ACCOUNT] = [{ coin: "BTC", szi: "0.3", entryPx: "100000.0" }];
+    const e = await h.fail("signAndSubmit", { requestId: "large", intent: wholeStop() });
     expect(e.code).toBe("POLICY_DENIED");
-    expect(messages(e)).toMatch(/always needs your confirmation in the signer frame, which has no user interface/);
-    expect(h.hl.exchangeCalls).toHaveLength(0);
+    expect(messages(e)).toMatch(/Orders of more than \$25,000 \(\$30,000 here\) need your confirmation in the signer frame, which has no user interface/);
+    expect(h.hl.exchangeCalls).toHaveLength(1);
   });
 
   it("is refused, without a prompt, with no open position or on the side that can't close it", async () => {
@@ -166,14 +166,43 @@ describe("signing a whole-position TP/SL", () => {
     expect(none.code).toBe("POLICY_DENIED");
     expect(codes(none)).toEqual(["INVALID_SUBJECT"]);
     expect(messages(none)).toMatch(/no open BTC position/);
-    h.hl.positions[ACCOUNT] = [{ coin: "BTC", szi: "-0.1", entryPx: "100000.0" }];
+    // $30,000: a prompt would be due, so none showing proves the refusal comes first.
+    h.hl.positions[ACCOUNT] = [{ coin: "BTC", szi: "-0.3", entryPx: "100000.0" }];
     expect(messages(await h.fail("signAndSubmit", { requestId: "side", intent: wholeStop() }))).toMatch(/whole BTC short must buy/);
     expect(h.promptEvents()).toHaveLength(0);
     expect(h.hl.exchangeCalls).toHaveLength(0);
   });
 
+  it("refuses one signed without a prompt whose position grew past the limit by the lock; the resend asks", async () => {
+    await ready("0.01");
+    let reads = 0;
+    // The second read of the position (under the lock) finds it grown to $30,000.
+    h.hl.infoFailure = (body) => {
+      if (body.type === "clearinghouseState" && ++reads === 2) h.hl.positions[ACCOUNT] = [{ coin: "BTC", szi: "0.3", entryPx: "100000.0" }];
+      return false;
+    };
+    const e = await h.fail("signAndSubmit", { requestId: "g", intent: wholeStop() });
+    expect(e.code).toBe("SIGNER_BUSY");
+    expect(e.retryable).toBe(true);
+    expect(e.details).toMatchObject({ reason: "marketMoved" });
+    expect(h.promptEvents()).toHaveLength(0);
+    expect(h.hl.exchangeCalls).toHaveLength(0);
+    h.hl.infoFailure = null;
+    const seen = await confirmed("g", wholeStop());
+    expect(seen.text).toContain("0.3 BTC now");
+    expect(h.hl.exchangeCalls).toHaveLength(1);
+  });
+
+  it("moves a small whole-position stop without a prompt", async () => {
+    await ready("0.01");
+    expect((await h.ok("signAndSubmit", { requestId: "m", intent: moveWhole({ oid: 80 }) })).status).toBe("ok");
+    expect(h.promptEvents()).toHaveLength(0);
+    expect(h.hl.exchangeCalls[0]?.body.action).toMatchObject({ type: "modify", oid: 80, order: { s: "0" } });
+  });
+
   it("is refused when the position closed while the prompt was open", async () => {
-    await ready("0.1");
+    // $30,000: above the $25,000 confirmation limit, so it asks.
+    await ready("0.3");
     const pending = h.fail("signAndSubmit", { requestId: "c", intent: wholeStop() });
     await shown();
     h.hl.positions[ACCOUNT] = [];
@@ -191,11 +220,11 @@ describe("signing a whole-position TP/SL", () => {
     expect(h.hl.exchangeCalls).toHaveLength(0);
   });
 
-  it("moves a whole-position stop with size 0, by oid or cloid, after asking", async () => {
-    await ready("0.1");
+  it("moves a whole-position stop with size 0, by oid or cloid, asking above the confirmation limit", async () => {
+    await ready("0.3");
     const byOid = await confirmed("oid", moveWhole({ oid: 80 }));
-    expect(byOid.title).toBe("Confirm change: Close the whole BTC long, $10,000");
-    expect(byOid.text).toContain("Change an open order to: Close the whole BTC long (0.1 BTC now, whatever it is when it triggers): sell stop-loss at $96,000");
+    expect(byOid.title).toBe("Confirm change: Close the whole BTC long, $30,000");
+    expect(byOid.text).toContain("Change an open order to: Close the whole BTC long (0.3 BTC now, whatever it is when it triggers): sell stop-loss at $96,000");
     await confirmed("cloid", moveWhole({ cloid: CLOID }));
     const sent = h.hl.exchangeCalls.map((c) => c.body.action);
     expect(sent[0]).toMatchObject({ type: "modify", oid: 80, order: { s: "0", t: { trigger: { triggerPx: "96000" } } } });
@@ -203,7 +232,7 @@ describe("signing a whole-position TP/SL", () => {
   });
 
   it("refuses size 0 for a fixed position stop or a plain stop", async () => {
-    await ready("0.1");
+    await ready("0.3");
     for (const oid of [81, 77]) {
       const e = await h.fail("signAndSubmit", { requestId: `fixed${oid}`, intent: moveWhole({ oid }) });
       expect(e.code).toBe("POLICY_DENIED");
