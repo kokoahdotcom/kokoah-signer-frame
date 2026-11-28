@@ -2285,9 +2285,9 @@ export class FrameCore {
     // can't leave the position it adds to partly covered (shared stopCoverage.ts).
     const touchesStops =
       intent.kind === "cancel" || intent.kind === "modify" || (intent.kind === "order" && !intent.reduceOnly && snapshot.registry.get(intent.coin)?.kind !== "spot");
-    // A whole-position TP/SL (size 0) closes whatever is open when it fires, whatever size that is by then: it is always
-    // confirmed in the frame's prompt, and signed only while the frame's own read shows the position it closes (open, on
-    // the other side). That read also gives the prompt and the totals its size now, and the policy a size-0 modify's
+    // A whole-position TP/SL (size 0) closes whatever is open when it fires, whatever size that is by then: it is signed
+    // only while the frame's own read shows the position it closes (open, on the other side), and counts at that
+    // position's size like any order (a prompt above the confirmation limit or past the unprompted totals). That read also gives the prompt and the totals its size now, and the policy a size-0 modify's
     // target and any cap it counts toward.
     const wholeCoins = wholePositionCoins(compiled.action as unknown as Record<string, unknown>, snapshot.registry);
     const whole = wholeCoins.length > 0;
@@ -2378,7 +2378,7 @@ export class FrameCore {
         ? { coin: intent.coin, from: isolatedNow, to: intent.leverage }
         : undefined;
     let confirmed = false;
-    if (large || addsUp || marginOut || leverageUp || whole) {
+    if (large || addsUp || marginOut || leverageUp) {
       await evaluate(stored, this.correctedNow());
       if (marginOut) await this.confirmMarginRemoval(marginOut, snapshot, compiled.vaultAddress);
       else if (leverageUp) await this.confirmLeverageRaise(leverageUp, snapshot, compiled.vaultAddress);
@@ -2431,6 +2431,12 @@ export class FrameCore {
       // The confirmation limit too: lowered since (in another tab, or while this waited for the lock), orders it now
       // asks about aren't signed without the user, and the rolling totals below take the lower of the two.
       const confirmNow = confirmLimitOf((await this.readConfirm()).masters.get(master), this.confirmEarliest(now));
+      if (!confirmed && whole && signedUsd > confirmLimit.usd) {
+        throw new SignerFailure("SIGNER_BUSY", "The position this TP/SL closes grew past your confirmation limit before it was signed; nothing was signed. Send it again to confirm it in the signer window.", {
+          retryable: true,
+          details: { reason: "positionGrew" },
+        });
+      }
       if (!confirmed && signedUsd > confirmNow.usd) {
         throw new SignerFailure("SIGNER_BUSY", "Your confirmation limit changed before this was signed; nothing was signed. Send it again to confirm it in the signer window.", {
           retryable: true,
@@ -2790,9 +2796,8 @@ export class FrameCore {
     const limit = day ? limits.dailyUsd : limits.recentUsd;
     if (!this.ui) {
       this.metrics.policyDenials++;
-      const message = whole
-        ? "A TP/SL for the whole position closes whatever is open when it triggers, so it always needs your confirmation in the signer frame, which has no user interface here."
-        : large || recent === undefined
+      const message =
+        large || recent === undefined
           ? `Orders of more than ${dollars(limits.usd)} (${total} here) need your confirmation in the signer frame, which has no user interface here.`
           : `Orders past ${dollars(limit)} in ${window} without a confirmation (${dollars(recent.usd)} so far, ${total} here) need your confirmation in the signer frame, which has no user interface here.`;
       throw new SignerFailure("POLICY_DENIED", "The action is not allowed by the signer policy.", { details: { violations: [{ code: "ORDER_NOTIONAL_EXCEEDED", message }] } });
@@ -2803,15 +2808,14 @@ export class FrameCore {
     // The reason that applies: the size itself (with what went out unconfirmed lately, when there was any), else the
     // total of the last 10 minutes or 24 hours.
     const lately = recent !== undefined && recent.usd >= 1 ? ` About ${dollars(recent.usd)} went out without a confirmation in the last ${window}.` : "";
-    // A whole-position TP/SL always asks, so that is its reason too (after the size's or the unconfirmed total's, when
-    // one applies: confirming starts that total again only when the prompt showed it).
+    // A whole-position TP/SL says what it closes (after the size's or the unconfirmed total's reason).
     const why =
       (large
         ? ` Orders above ${dollars(limits.usd)} need your confirmation.${lately}`
         : recent === undefined
           ? ""
           : ` Orders of about ${dollars(recent.usd)} went out without a confirmation in the last ${window}, so ${one ? "this one needs" : "these need"} yours.`) +
-      (whole ? " A TP/SL for the whole position closes whatever is open when it triggers, however large, so it always needs your confirmation." : "");
+      (whole ? " A TP/SL for the whole position closes whatever is open when it triggers." : "");
     // Side, size and market of the first order, and the total, in the title and on the button too, which always show
     // whole: a parent that leaves the prompt little room can't hide what is confirmed.
     const first = orders.heads[0] ?? "";
